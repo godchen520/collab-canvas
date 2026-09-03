@@ -493,7 +493,7 @@ window.__ModuleLoader__.load({
             .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
             .replace(/\*([^*]+)\*/g, "<em>$1</em>")
             .replace(/~~([^~]+)~~/g, "<del>$1</del>")
-            .replace(/\[\^([^\]]+)\](?!:)/g, '<sup><a href="#fn-$1" id="fnref-$1">[$1]</a></sup>');
+            .replace(/\[\^([^\]]+)\](?!:)/g, '<span style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer" id="fnref-$1">[$1]</span>');
         }
         var lines = String(src).split("\n"), out = [], i = 0, inCode = false, codeBuf = [];
         var footnotes = {}, fnOrder = [], fnIndex = 0;
@@ -699,7 +699,7 @@ window.__ModuleLoader__.load({
             var label = prompt("脚注标签（如 1、2、a）：", "")
             if (label) {
               // 插入脚注引用
-              var html = '<sup><a href="#fn-' + label + '" id="fnref-' + label + '" style="color:#3b82f6;cursor:pointer">[^' + label + ']</a></sup>'
+              var html = '<span style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer" id="fnref-' + label + '">[^' + label + ']</span>'
               document.execCommand("insertHTML", false, html)
               // 在编辑器末尾追加脚注定义（如果不存在）
               var ed = editorRef.current
