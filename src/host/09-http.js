@@ -102,5 +102,56 @@ function initCanvasHttpEndpoints(ctx, webServer) {
       }
     } catch (e) { error(res, 500, { ok: false, error: e.message }) }
   }}))
+  // ─── 打开文档所在文件夹 ─────────────────────────────
+  // 客户端「📁」按钮调用；host 是 Node 主进程，用 explorer/open/xdg-open
+  // 在系统文件管理器里打开当前画布文档所在的目录。
+  // 注意：不要用 fs.resolve —— 它返回的是沙箱内部标记，不是文件系统路径，
+  // explorer 收到无效参数会默认打开「文档」库。这里用 path 模块自己归一化。
+  ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/open-folder', handler: async (req, res) => {
+    const c = activeId ? canvases.get(activeId) : null
+    const raw = (c && c.filePath) ? path.dirname(c.filePath) : docsDir()
+    let dir = path.isAbsolute(raw) ? raw : path.join(docsDirBase(), raw)
+    dir = dir.replace(/[\\/]+$/, '')
+    const plat = process.platform
+    // explorer 对 / 与 \ 混用的路径解析不可靠（session cwd 常带正斜杠），
+    // Windows 下一律归一成反斜杠 + path.win32.normalize
+    if (plat === 'win32') dir = path.win32.normalize(dir.replace(/\//g, '\\'))
+    const info = { dir: dir, raw: raw, exists: null, cwd: null, platform: plat, strategy: null, pid: null, err: null, exit: null }
+    try { info.exists = nodefs.existsSync(dir) } catch (e) { info.err = 'existsSync: ' + (e && e.message) }
+    try { info.cwd = process.cwd() } catch (e) { info.err = 'cwd: ' + (e && e.message) }
+    try {
+      if (plat === 'win32') {
+        // explorer 从带 stdio 管道的子进程里启动时，偶尔会忽略参数、打开默认目录。
+        // 用 detached + stdio:'ignore' 起，是最稳的传法。
+        const child = spawn('explorer', [dir], { detached: true, stdio: 'ignore' })
+        child.unref()
+        info.strategy = 'spawn-explorer-detached'
+        info.pid = child.pid
+        child.on('error', function (e) { info.err = 'spawn error: ' + (e && e.message) })
+        child.on('exit', function (code) { info.exit = code })
+      } else {
+        const child = spawn(plat === 'darwin' ? 'open' : 'xdg-open', [dir], { detached: true, stdio: 'ignore' })
+        child.unref()
+        info.strategy = 'spawn-open'
+        info.pid = child.pid
+        child.on('error', function (e) { info.err = 'spawn error: ' + (e && e.message) })
+      }
+    } catch (e) {
+      info.err = 'spawn throw: ' + (e && e.message)
+      try {
+        exec(plat === 'win32' ? 'cmd /c start "" "' + dir + '"' : 'xdg-open "' + dir + '"', function (e2) {
+          info.strategy = 'cmd-start-fallback'
+          info.err = e2 ? ('cmd start: ' + e2.message) : null
+        })
+      } catch (e3) { info.err = 'fallback throw: ' + (e3 && e3.message) }
+    }
+    setTimeout(function () {
+      _dbg.push(ts() + ' open-folder ' + JSON.stringify(info))
+      if (_dbg.length > DBG_MAX) _dbg = _dbg.slice(_dbg.length - DBG_MAX)
+      dbgWrite()
+    }, 1200)
+    console.log('[collab-canvas] open-folder', JSON.stringify(info))
+    json(res, { ok: true, dir: dir, raw: raw, exists: info.exists, pid: info.pid, strategy: info.strategy })
+  }}))
   console.log('[collab-canvas] HTTP endpoints registered: /api/canvas/* (debug log -> ' + DEBUG_LOG + ')')
 }

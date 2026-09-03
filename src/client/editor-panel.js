@@ -365,6 +365,14 @@ window.__ModuleLoader__.load({
         }).then(r => r.json()).then(d => { if (d.ok) setVersion(d.version); }).catch(() => {});
       }
 
+      // 在系统文件管理器里打开当前文档所在的文件夹（host 端调 explorer/open/xdg-open）
+      function openFolder() {
+        fetch("/api/canvas/open-folder", { method: "POST" })
+          .then(r => r.json())
+          .then(d => { ccvLog("open-folder 响应: " + JSON.stringify(d)); })
+          .catch(e => { ccvLog("open-folder 请求失败: " + e); });
+      }
+
       // ─── 顶栏：新建话布（行内输入框，替掉原生 prompt）──
       function startCreate() { setDropOpen(false); setNewTitle(""); setCreating(true); }
       function cancelCreate() { setCreating(false); setNewTitle(""); }
@@ -439,6 +447,31 @@ window.__ModuleLoader__.load({
         function w(n) {
           if (n.nodeType === 3) return n.nodeValue.replace(/\u00a0/g, " ");
           if (n.nodeType !== 1) return "";
+          // ⚠️ 脚注区域必须在 switch 之前拦截：.footnotes 是 <div>，
+          // 走 case "div" 会把它当普通正文输出，脚注定义就退化成
+          // "脚注 1 的内容 [↩](#fnref-1)" 这种半 markdown 的残渣。
+          if (n.classList && n.classList.contains('footnotes')) {
+            var lis = n.querySelectorAll('li');
+            for (var li2 = 0; li2 < lis.length; li2++) {
+              var liId = lis[li2].getAttribute('id') || '';
+              var liLabel = liId.indexOf('fn-') === 0 ? liId.slice(3) : '';
+              if (!liLabel) continue;
+              // 逐子节点序列化，跳过返回链接 ↩（href="#fnref-*"），保留其余行内格式
+              var parts = [];
+              var kids = lis[li2].childNodes || [];
+              for (var ki = 0; ki < kids.length; ki++) {
+                var kid = kids[ki];
+                if (kid.nodeType === 1) {
+                  var kh = (kid.getAttribute && kid.getAttribute('href')) || '';
+                  if (kh.indexOf('#fnref-') === 0) continue;
+                }
+                parts.push(w(kid));
+              }
+              var liContent = parts.join('').replace(/\s*↩\s*$/, '').trim();
+              fnDefs.push('[^' + liLabel + ']: ' + liContent);
+            }
+            return '';
+          }
           var t = n.tagName ? n.tagName.toLowerCase() : "";
           if (t === "br") return "\n";
           var inner = Array.prototype.map.call(n.childNodes || [], w).join("");
@@ -486,21 +519,6 @@ window.__ModuleLoader__.load({
               // 脚注引用 span：<span id="fnref-label">...</span> → [^label]
               if (n.id && n.id.indexOf("fnref-") === 0) {
                 return "[^" + n.id.replace("fnref-", "") + "]";
-              }
-              // 检查是否是脚注区域
-              if (n.classList && n.classList.contains('footnotes')) {
-                // 收集脚注定义，稍后输出
-                var lis = n.querySelectorAll('li');
-                for (var li = 0; li < lis.length; li++) {
-                  var liId = lis[li].getAttribute('id') || '';
-                  var liLabel = liId.replace('fn-', '');
-                  if (liLabel) {
-                    // 去掉末尾的 ↩ 链接
-                    var liContent = lis[li].textContent.replace(/↩$/, '').trim();
-                    fnDefs.push('[^' + liLabel + ']: ' + liContent);
-                  }
-                }
-                return '';
               }
               return inner;
           }
@@ -963,6 +981,8 @@ window.__ModuleLoader__.load({
           h("div", { className: "ccv-row ccv-row-doc" },
             h("button", { className: "ccv-tbtn", onClick: saveCanvas, disabled: !activeId, title: "保存到服务端（停止输入 1.5 秒后也会自动存）" }, "保存"),
             h("button", { className: "ccv-tbtn", onClick: () => { if (activeId) loadCanvas(activeId); }, disabled: !activeId, title: "从服务端拉取最新内容 —— AI 在对话里改过话布后用它同步" }, "重载"),
+            h("button", { className: "ccv-ibtn", onClick: openFolder, title: "在文件管理器中打开本文档所在的文件夹",
+              dangerouslySetInnerHTML: { __html: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:auto"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>' } }),
             h("div", { className: "ccv-spacer" }),
             h("span", {
               ref: meterRef, className: "ccv-meter",

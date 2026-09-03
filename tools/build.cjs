@@ -65,7 +65,9 @@ function build(kind, name, inject, imports) {
 // Host 插件：注册 canvas 工具 + 持久化；用 ctx.tools 而非 harness
 build('host', 'collab-canvas-host', ['timer', 'tools', 'fs', 'webServer', 'systemPrompt'], [
   'import { defineTool } from "@deepseek-ai/dsh-tools"',
-  'import nodefs from "node:fs"'
+  'import nodefs from "node:fs"',
+  'import path from "node:path"',
+  'import { exec, execFile, spawn } from "node:child_process"'
 ])
 // Client 插件：WYSIWYG 编辑 + Slot 注册（Phase 2）
 build('client', 'collab-canvas-client', ['slots', 'timer'], [])
