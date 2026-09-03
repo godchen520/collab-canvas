@@ -793,7 +793,6 @@ window.__ModuleLoader__.load({
                 })
               : h("div", { className: "ccv-chipwrap" },
                   h("div", { className: "ccv-chip", onClick: toggleDrop, title: "点击切换话布" },
-                    h("span", { className: "ccv-chip-icon" }, "📝"),
                     h("span", { className: "ccv-chip-title", title: curTitle || "未选话布" }, curTitle || "未选话布"),
                     h("span", { className: "ccv-chip-caret" }, "▾")
                   ),
@@ -811,9 +810,10 @@ window.__ModuleLoader__.load({
                 ),
             h("div", { className: "ccv-spacer" }),
             // 窄屏始终全屏，没有可切换的余地，隐藏这个按钮
-            narrow ? null : h("button", { className: "ccv-ibtn", onClick: toggleFullscreen, title: isFull ? "退出全屏" : "全屏" }, isFull ? "❐" : "⛶")
+            narrow ? null : h("button", { className: "ccv-ibtn", onClick: toggleFullscreen, title: isFull ? "退出全屏" : "全屏" }, isFull ? "❐" : "⛶"),
+            h("button", { className: "ccv-ibtn", onClick: onclose, title: "关闭话布" }, "×")
           ),
-          // ─── 第二行：管当前文档（保存 / 重载 / 关闭）───
+          // ─── 第二行：管当前文档（保存 / 重载）───
           h("div", { className: "ccv-row ccv-row-doc" },
             h("button", { className: "ccv-tbtn", onClick: saveCanvas, disabled: !activeId, title: "保存到服务端（停止输入 1.5 秒后也会自动存）" }, "保存"),
             h("button", { className: "ccv-tbtn", onClick: () => { if (activeId) loadCanvas(activeId); }, disabled: !activeId, title: "从服务端拉取最新内容 —— AI 在对话里改过话布后用它同步" }, "重载"),
@@ -821,8 +821,7 @@ window.__ModuleLoader__.load({
             h("span", {
               ref: meterRef, className: "ccv-meter",
               title: "话布宽度 /（会话区 + 话布）可用宽度 —— 左侧栏不计入"
-            }, isFull ? "全屏" : (width || 500) + " / ?px"),
-            h("button", { className: "ccv-ibtn", onClick: onclose, title: "关闭话布" }, "×")
+            }, isFull ? "全屏" : (width || 500) + " / ?px")
           )
         ),
         h("div", {
@@ -1001,7 +1000,6 @@ window.__ModuleLoader__.load({
             '#collab-canvas-panel .ccv-chip{display:flex;align-items:center;gap:6px;padding:4px 6px 4px 8px;background:var(--dsw-alias-interactive-bg-active,rgba(59,130,246,.16));border:1px solid var(--dsw-alias-brand-primary,rgba(59,130,246,.4));border-radius:7px;max-width:240px;min-width:56px;flex:0 1 auto;font-size:13px;color:inherit;cursor:pointer;user-select:none}',
             '#collab-canvas-panel .ccv-chip:hover{filter:brightness(1.06)}',
             '#collab-canvas-panel .ccv-chipwrap{position:relative;display:flex;min-width:0;flex:0 1 auto}',
-            '#collab-canvas-panel .ccv-chip-icon{flex:0 0 auto;font-size:12px;line-height:1;opacity:.85}',
             '#collab-canvas-panel .ccv-chip-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}',
             '#collab-canvas-panel .ccv-chip-caret{flex:0 0 auto;font-size:10px;line-height:1;opacity:.65}',
             '#collab-canvas-panel .ccv-spacer{flex:1 1 0%;min-width:6px}',
