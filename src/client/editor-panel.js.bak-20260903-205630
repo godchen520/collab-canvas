@@ -284,26 +284,6 @@ window.__ModuleLoader__.load({
         return function () { clearTimeout(t) }
       }, [])
 
-      // contentEditable 中的 <a href="#fn-..."> 默认不会跳转（浏览器只把光标移进去），
-      // 用 capture 阶段捕获点击，阻止默认行为后手动 scrollIntoView。
-      useEffect(function () {
-        var ed = editorRef.current;
-        if (!ed) return;
-        function onClick(e) {
-          var a = e.target.closest && e.target.closest('a[href^="#fn"]');
-          if (!a) return;
-          var href = a.getAttribute('href') || '';
-          if (href.indexOf('#fn') !== 0) return;
-          e.preventDefault();
-          e.stopPropagation();
-          var id = href.slice(1);
-          var target = document.getElementById(id) || ed.querySelector('[id="' + id + '"]');
-          if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-        ed.addEventListener('click', onClick, true);
-        return function () { ed.removeEventListener('click', onClick, true); };
-      }, []);
-
       // 兜底触发：编辑区的 React onMouseUp 不是每次都生效（拖选结束时指针落在
       // 编辑区外、选区在 mouseup 之后才定型等）。用 selectionchange 补一次，
       // 只在「选区确实落在编辑区内」时才接管，避免污染会话区的划词。
@@ -455,13 +435,7 @@ window.__ModuleLoader__.load({
             case "code": return "`" + inner + "`";
             case "pre": return "\n```\n" + (n.textContent || "") + "\n```\n";
             case "blockquote": return inner.trim() ? inner.trim().split("\n").map(l => "> " + l).join("\n") + "\n" : "";
-            case "a":
-              var href = n.getAttribute && n.getAttribute("href") || "";
-              // 脚注引用链接：<a href="#fn-label">...</a> → [^label]
-              if (href.indexOf("#fn-") === 0) {
-                return "[^" + href.replace("#fn-", "") + "]";
-              }
-              return "[" + inner + "](" + href + ")";
+            case "a": var href = n.getAttribute && n.getAttribute("href"); return "[" + inner + "](" + (href || "") + ")";
             case "hr": return "\n---\n";
             case "sup":
               // 脚注引用：<sup><a href="#fn-label">[label]</a></sup>
@@ -483,10 +457,6 @@ window.__ModuleLoader__.load({
               }
               return inner;
             default:
-              // 脚注引用 span：<span id="fnref-label">...</span> → [^label]
-              if (n.id && n.id.indexOf("fnref-") === 0) {
-                return "[^" + n.id.replace("fnref-", "") + "]";
-              }
               // 检查是否是脚注区域
               if (n.classList && n.classList.contains('footnotes')) {
                 // 收集脚注定义，稍后输出
@@ -518,14 +488,12 @@ window.__ModuleLoader__.load({
         function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
         function im(s) {
           return esc(s)
-            // 兼容旧版 htmlToMd 产生的 [[label]](#fn-label) 手写链接 → 转成规范脚注引用
-            .replace(/\[\[([^\]]+)\]\]\(#fn-([^)]+)\)/g, '<a href="#fn-$2" id="fnref-$2" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$2]</a>')
             .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
             .replace(/`([^`]+)`/g, "<code>$1</code>")
             .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
             .replace(/\*([^*]+)\*/g, "<em>$1</em>")
             .replace(/~~([^~]+)~~/g, "<del>$1</del>")
-            .replace(/\[\^([^\]]+)\](?!:)/g, '<a href="#fn-$1" id="fnref-$1" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$1]</a>');
+            .replace(/\[\^([^\]]+)\](?!:)/g, '<span style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer" id="fnref-$1">[$1]</span>');
         }
         var lines = String(src).split("\n"), out = [], i = 0, inCode = false, codeBuf = [];
         var footnotes = {}, fnOrder = [], fnIndex = 0;
@@ -569,7 +537,7 @@ window.__ModuleLoader__.load({
           out.push('<div class="footnotes"><hr/><ol>');
           fnKeys.forEach(function(label, idx) {
             var num = idx + 1;
-            out.push('<li id="fn-' + label + '">' + im(footnotes[label]) + ' <a href="#fnref-' + label + '" contenteditable="false">↩</a></li>');
+            out.push('<li id="fn-' + label + '">' + im(footnotes[label]) + ' <a href="#fnref-' + label + '">↩</a></li>');
           });
           out.push('</ol></div>');
         }
@@ -730,8 +698,8 @@ window.__ModuleLoader__.load({
             // 脚注：自动生成编号，插入引用标记，并在文末添加定义
             var label = prompt("脚注标签（如 1、2、a）：", "")
             if (label) {
-              // 插入脚注引用：显示 [label]，点击跳到脚注
-              var html = '<a href="#fn-' + label + '" id="fnref-' + label + '" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[' + label + ']</a>'
+              // 插入脚注引用
+              var html = '<span style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer" id="fnref-' + label + '">[^' + label + ']</span>'
               document.execCommand("insertHTML", false, html)
               // 在编辑器末尾追加脚注定义（如果不存在）
               var ed = editorRef.current
@@ -751,7 +719,7 @@ window.__ModuleLoader__.load({
                   var ol = fnDiv.querySelector('ol')
                   var li = document.createElement('li')
                   li.id = 'fn-' + label
-                  li.innerHTML = '脚注 ' + label + ' 的内容 <a href="#fnref-' + label + '" contenteditable="false" style="color:#3b82f6;text-decoration:none">↩</a>'
+                  li.innerHTML = '脚注 ' + label + ' 的内容 <a href="#fnref-' + label + '" style="color:#3b82f6">↩</a>'
                   ol.appendChild(li)
                   // 滚动到脚注区域
                   li.scrollIntoView({ behavior: 'smooth', block: 'center' })
@@ -1155,13 +1123,7 @@ window.__ModuleLoader__.load({
             '#collab-canvas-panel .ccv-drop-item:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(59,130,246,.16))}',
             '#collab-canvas-panel .ccv-drop-item[data-on="1"]{font-weight:600;background:var(--dsw-alias-interactive-bg-active,rgba(59,130,246,.2))}',
             '#collab-canvas-panel .ccv-drop-empty{padding:8px;opacity:.6;font-size:12px;text-align:center}',
-            '#collab-canvas-panel .ccv-meter{font-size:11px;opacity:0;transition:opacity .15s ease;white-space:nowrap;user-select:none;font-variant-numeric:tabular-nums;flex:0 0 auto}',
-            // 脚注区域样式
-            '#collab-canvas-panel .ccv-editor .footnotes{margin-top:16px;padding-top:8px;font-size:13px;color:var(--dsw-alias-label-secondary,rgba(128,128,128,.85))}',
-            '#collab-canvas-panel .ccv-editor .footnotes hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));margin:0 0 8px}',
-            '#collab-canvas-panel .ccv-editor .footnotes ol{margin:0;padding-left:20px}',
-            '#collab-canvas-panel .ccv-editor .footnotes li{margin:4px 0;line-height:1.6}',
-            '#collab-canvas-panel .ccv-editor .footnotes a{color:#3b82f6;text-decoration:none}'
+            '#collab-canvas-panel .ccv-meter{font-size:11px;opacity:0;transition:opacity .15s ease;white-space:nowrap;user-select:none;font-variant-numeric:tabular-nums;flex:0 0 auto}'
           ].join('\n');
           document.head.appendChild(hs);
         }
