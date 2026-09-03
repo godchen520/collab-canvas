@@ -481,6 +481,19 @@ window.__ModuleLoader__.load({
             case "h2": return "## " + inner + "\n";
             case "h3": return "### " + inner + "\n";
             case "h4": return "#### " + inner + "\n";
+            case "h5": return "##### " + inner + "\n";
+            case "h6": return "###### " + inner + "\n";
+            case "img": {
+              var iSrc = n.getAttribute && n.getAttribute("src") || "";
+              var iAlt = n.getAttribute && n.getAttribute("alt") || "";
+              return iSrc ? "![" + iAlt + "](" + iSrc + ")" : "";
+            }
+            case "ul": case "ol": return renderListMd(n, "");
+            case "li": {
+              var pN = n.parentNode;
+              var pOrdered = pN && pN.tagName && pN.tagName.toLowerCase() === "ol";
+              return serializeLi(n, pOrdered ? "1. " : "- ", "", pOrdered ? "   " : "  ");
+            }
             case "strong": case "b": return inner ? "**" + inner + "**" : "";
             case "em": case "i": return inner ? "*" + inner + "*" : "";
             case "u": return inner ? "<u>" + inner + "</u>" : "";
@@ -488,6 +501,37 @@ window.__ModuleLoader__.load({
             case "code": return "`" + inner + "`";
             case "pre": return "\n```\n" + (n.textContent || "") + "\n```\n";
             case "blockquote": return inner.trim() ? inner.trim().split("\n").map(l => "> " + l).join("\n") + "\n" : "";
+            case "table": {
+              // <table> 必须显式序列化成 markdown 表格；走 default 会把单元格文本
+              // 压成一坨（含 ` 的 code 单元格混在一起），重新打开就没格式了
+              var tblTrs = n.querySelectorAll ? n.querySelectorAll("tr") : [];
+              if (!tblTrs.length) return "";
+              var tblRows = [], tblW = 0;
+              for (var trI = 0; trI < tblTrs.length; trI++) {
+                var tds = tblTrs[trI].querySelectorAll("th,td");
+                if (!tds.length) continue;
+                var rowArr = [];
+                for (var tdI = 0; tdI < tds.length; tdI++) {
+                  var cellMd = Array.prototype.map.call(tds[tdI].childNodes || [], w).join("");
+                  cellMd = cellMd.replace(/\s*\n\s*/g, " ").replace(/\|/g, "\\|").trim();
+                  rowArr.push(cellMd);
+                }
+                if (rowArr.length > tblW) tblW = rowArr.length;
+                tblRows.push(rowArr);
+              }
+              if (!tblRows.length) return "";
+              var tblOut = [];
+              for (var trJ = 0; trJ < tblRows.length; trJ++) {
+                while (tblRows[trJ].length < tblW) tblRows[trJ].push("");
+                tblOut.push("| " + tblRows[trJ].join(" | ") + " |");
+                if (trJ === 0) {
+                  var sepArr = [];
+                  for (var scI = 0; scI < tblW; scI++) sepArr.push("---");
+                  tblOut.push("| " + sepArr.join(" | ") + " |");
+                }
+              }
+              return "\n" + tblOut.join("\n") + "\n";
+            }
             case "a":
               var href = n.getAttribute && n.getAttribute("href") || "";
               // 脚注引用链接：<a href="#fn-label">...</a> → [^label]
@@ -523,6 +567,57 @@ window.__ModuleLoader__.load({
               return inner;
           }
         }
+        // 列表递归序列化：把 <ul>/<ol>（含嵌套子列表、任务列表复选框）还原成带缩进的 Markdown
+        function renderListMd(node, pad) {
+          var isOl = node.tagName.toLowerCase() === "ol";
+          var unit = isOl ? "   " : "  ";
+          var childPad = pad + unit;
+          var liOut = [];
+          var liNum = 0;
+          var kids = node.childNodes || [];
+          for (var x = 0; x < kids.length; x++) {
+            var el = kids[x];
+            if (!el || el.nodeType !== 1) continue;
+            var lt = el.tagName.toLowerCase();
+            if (lt === "ul" || lt === "ol") {
+              // 子列表作为兄弟节点（contentEditable 偶尔这样存）→ 整体缩进并入上一级
+              var sub = renderListMd(el, childPad).replace(/^\n+/, "").replace(/\n+$/, "");
+              if (sub) liOut.push(sub);
+              continue;
+            }
+            if (lt !== "li") continue;
+            liNum++;
+            var marker = isOl ? (liNum + ". ") : "- ";
+            liOut.push(serializeLi(el, marker, pad, childPad));
+          }
+          if (!liOut.length) return "";
+          return "\n" + liOut.join("\n") + "\n";
+        }
+        function serializeLi(liEl, marker, pad, childPad) {
+          // 任务列表：<li> 内含 <input type="checkbox"> → 还原成 - [ ] / - [x]
+          var cb = liEl.querySelector ? liEl.querySelector('input[type="checkbox"],input[type=checkbox]') : null;
+          var isTask = !!cb;
+          var checked = isTask && (cb.hasAttribute("checked") || cb.checked);
+          var parts = [];
+          var kids = liEl.childNodes || [];
+          for (var k = 0; k < kids.length; k++) {
+            var kid = kids[k];
+            if (kid.nodeType === 1) {
+              var kn = kid.tagName.toLowerCase();
+              if (kn === "input") continue; // 跳过复选框本身
+              if (kn === "ul" || kn === "ol") {
+                parts.push("\n" + renderListMd(kid, childPad).replace(/^\n+/, "").replace(/\n+$/, ""));
+                continue;
+              }
+            }
+            parts.push(w(kid));
+          }
+          var inner = parts.join("").replace(/^\n+/, "").replace(/\n+$/, "");
+          var lns = inner.split("\n");
+          var out = pad + (isTask ? ("- [" + (checked ? "x" : " ") + "] ") : marker) + lns[0];
+          for (var j = 1; j < lns.length; j++) out += "\n" + pad + lns[j];
+          return out;
+        }
         var md = w(root).replace(/\n{3,}/g, "\n\n").trim();
         // 追加脚注定义
         if (fnDefs.length > 0) {
@@ -538,6 +633,9 @@ window.__ModuleLoader__.load({
           return esc(s)
             // 兼容旧版 htmlToMd 产生的 [[label]](#fn-label) 手写链接 → 转成规范脚注引用
             .replace(/\[\[([^\]]+)\]\]\(#fn-([^)]+)\)/g, '<a href="#fn-$2" id="fnref-$2" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$2]</a>')
+            // ⚠️ 图片必须先于链接规则处理：!\[alt\](src) 里的 [alt](src) 会被链接
+            // 规则啃掉，渲染成 !<a href="src">alt</a> 这种残骸
+            .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%;height:auto;vertical-align:middle"/>')
             .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
             .replace(/`([^`]+)`/g, "<code>$1</code>")
             .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
@@ -545,53 +643,144 @@ window.__ModuleLoader__.load({
             .replace(/~~([^~]+)~~/g, "<del>$1</del>")
             .replace(/\[\^([^\]]+)\](?!:)/g, '<a href="#fn-$1" id="fnref-$1" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$1]</a>');
         }
-        var lines = String(src).split("\n"), out = [], i = 0, inCode = false, codeBuf = [];
-        var footnotes = {}, fnOrder = [], fnIndex = 0;
-        // 第一遍：收集脚注定义
-        var mainLines = [];
-        while (i < lines.length) {
-          var l = lines[i];
-          var fnDef = l.match(/^\[\^([^\]]+)\]:\s*(.*)$/);
-          if (fnDef) {
-            var label = fnDef[1], content = fnDef[2];
-            // 多行脚注定义：后续缩进行属于同一脚注
-            while (i + 1 < lines.length && /^\s+/.test(lines[i + 1]) && !/^\[\^/.test(lines[i + 1].trim())) {
-              i++;
-              content += " " + lines[i].trim();
+        // 块级渲染（可递归：blockquote 内部再走一遍同样的块解析，支持引用里套表格/列表）
+        function buildTable(ls) {
+          var rows = [];
+          for (var k = 0; k < ls.length; k++) {
+            if (k === 1) continue; // 第二行是 |---|---| 分隔行
+            var raw = ls[k].trim().replace(/^\|/, "").replace(/\|$/, "");
+            var cells = raw.split("|").map(function (c) { return im(c.trim()); });
+            rows.push(cells);
+          }
+          var tbl = "<table>";
+          for (var k2 = 0; k2 < rows.length; k2++) {
+            var tag = k2 === 0 ? "th" : "td";
+            tbl += "<tr>" + rows[k2].map(function (c) { return "<" + tag + ">" + c + "</" + tag + ">"; }).join("") + "</tr>";
+          }
+          return tbl + "</table>";
+        }
+        function renderBlocks(src2) {
+          var lines = String(src2).split("\n"), out = [], i = 0, inCode = false, codeBuf = [];
+          while (i < lines.length) {
+            var l = lines[i];
+            if (/^```/.test(l)) { if (!inCode) { inCode = true; codeBuf = []; } else { out.push("<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>"); inCode = false; } i++; continue; }
+            if (inCode) { codeBuf.push(l); i++; continue; }
+            var t = l.trim(); if (!t) { i++; continue; }
+            var h2 = t.match(/^(#{1,6})\s+(.*)$/); if (h2) { out.push("<h" + h2[1].length + ">" + im(h2[2]) + "</h" + h2[1].length + ">"); i++; continue; }
+            if (/^(-{3,}|\*{3,})$/.test(t)) { out.push("<hr/>"); i++; continue; }
+            // 表格：本行含 |，且下一行是 |---|---| 形式的分隔行 → 收集连续 | 行成表
+            if (t.indexOf("|") >= 0 && i + 1 < lines.length) {
+              var next = lines[i + 1].trim();
+              if (next.indexOf("|") >= 0 && next.indexOf("-") >= 0 && /^\|?[\s:|-]+\|?$/.test(next)) {
+                var tblLines = [t];
+                // ⚠️ 只 i+=1：分隔行也要进 tblLines（buildTable 靠 ls[1] 是分隔行来跳过它），
+                // 若在这里 i+=2 跳过分隔行，第一行正文会被 buildTable 当分隔行吃掉
+                i += 1;
+                while (i < lines.length && lines[i].trim() && lines[i].indexOf("|") >= 0) { tblLines.push(lines[i].trim()); i++; }
+                out.push(buildTable(tblLines));
+                continue;
+              }
             }
-            footnotes[label] = content;
-            i++;
+            // 引用：连续 > 行合并为一个 blockquote，内部递归块渲染
+            if (/^>\s?/.test(t)) {
+              var bqLines = [];
+              while (i < lines.length && /^\s*>\s?/.test(lines[i])) { bqLines.push(lines[i].replace(/^\s*>\s?/, "")); i++; }
+              out.push("<blockquote>" + renderBlocks(bqLines.join("\n")) + "</blockquote>");
+              continue;
+            }
+            // 列表（支持嵌套缩进 + 任务列表 - [ ]/- [x]）：连续列表项（含缩进子项）合成嵌套 <ul>/<ol>
+            if (/^\s*[-*+]\s+/.test(t) || /^\s*\d+[.)]\s+/.test(t)) {
+              var listLines = [];
+              while (i < lines.length) {
+                var lm = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+                if (lm) { listLines.push(lines[i]); i++; continue; }
+                break;
+              }
+              out.push(parseList(listLines));
+              continue;
+            }
+            out.push("<p>" + im(t) + "</p>"); i++;
+          }
+        if (inCode) out.push("<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>");
+        return out.join("\n");
+      }
+      // 列表解析：把一组列表行（含缩进子项）解析成嵌套树，再渲染成 <ul>/<ol>。
+      // 支持 - * + 无序、1. 有序、以及任务列表 - [ ] / - [x]（渲染成复选框）。
+      function parseList(listLines) {
+        var items = [];
+        for (var k = 0; k < listLines.length; k++) {
+          var m = listLines[k].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+          if (!m) continue;
+          var indent = m[1].replace(/\t/g, "  ").length;
+          items.push({ indent: indent, ordered: /\d/.test(m[2]), content: m[3] });
+        }
+        if (!items.length) return "";
+        // 栈式嵌套：indent 严格大于栈顶才作为子项
+        var root = { children: [] };
+        var stack = [{ indent: -1, node: root }];
+        for (var a = 0; a < items.length; a++) {
+          var it = items[a];
+          while (stack.length > 1 && it.indent <= stack[stack.length - 1].indent) stack.pop();
+          var parent = stack[stack.length - 1].node;
+          var node = { ordered: it.ordered, content: it.content, children: [] };
+          parent.children.push(node);
+          stack.push({ indent: it.indent, node: node });
+        }
+        function renderNodes(ns) {
+          if (!ns.length) return "";
+          var tag = ns[0].ordered ? "ol" : "ul";
+          var html = "<" + tag + ">";
+          for (var i = 0; i < ns.length; i++) html += "<li>" + renderItem(ns[i]) + "</li>";
+          return html + "</" + tag + ">";
+        }
+        function renderItem(n) {
+          var inner = renderItemContent(n.content);
+          if (n.children && n.children.length) inner += renderNodes(n.children);
+          return inner;
+        }
+        function renderItemContent(content) {
+          var tm = content.match(/^\[([ xX])\]\s+(.*)$/);
+          if (tm) {
+            var ck = tm[1].toLowerCase() === "x" ? " checked" : "";
+            return '<input type="checkbox" disabled' + ck + '> ' + im(tm[2]);
+          }
+          return im(content);
+        }
+        return renderNodes(root.children);
+      }
+        // 第一遍：收集脚注定义（[^label]: 内容），不进正文
+        var lines0 = String(src).split("\n");
+        var footnotes = {}, mainLines = [];
+        var i0 = 0;
+        while (i0 < lines0.length) {
+          var l0 = lines0[i0];
+          var fnDef = l0.match(/^\[\^([^\]]+)\]:\s*(.*)$/);
+          if (fnDef) {
+            var label0 = fnDef[1], content0 = fnDef[2];
+            // 多行脚注定义：后续缩进行属于同一脚注
+            while (i0 + 1 < lines0.length && /^\s+/.test(lines0[i0 + 1]) && !/^\[\^/.test(lines0[i0 + 1].trim())) {
+              i0++;
+              content0 += " " + lines0[i0].trim();
+            }
+            footnotes[label0] = content0;
+            i0++;
             continue;
           }
-          mainLines.push(l);
-          i++;
+          mainLines.push(l0);
+          i0++;
         }
-        // 第二遍：渲染正文
-        i = 0; inCode = false; codeBuf = [];
-        while (i < mainLines.length) {
-          var l = mainLines[i];
-          if (/^```/.test(l)) { if (!inCode) { inCode = true; codeBuf = []; } else { out.push("<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>"); inCode = false; } i++; continue; }
-          if (inCode) { codeBuf.push(l); i++; continue; }
-          var t = l.trim(); if (!t) { i++; continue; }
-          var h2 = t.match(/^(#{1,6})\s+(.*)$/); if (h2) { out.push("<h" + h2[1].length + ">" + im(h2[2]) + "</h" + h2[1].length + ">"); i++; continue; }
-          if (/^(-{3,}|\*{3,})$/.test(t)) { out.push("<hr/>"); i++; continue; }
-          var bq = t.match(/^>\s?(.*)$/); if (bq) { out.push("<blockquote>" + im(bq[1]) + "</blockquote>"); i++; continue; }
-          var ul = t.match(/^[-*]\s+(.*)$/); if (ul) { out.push("<ul><li>" + im(ul[1]) + "</li></ul>"); i++; continue; }
-          var ol = t.match(/^(\d+)[.)]\s+(.*)$/); if (ol) { out.push("<ol><li>" + im(ol[2]) + "</li></ol>"); i++; continue; }
-          out.push("<p>" + im(t) + "</p>"); i++;
-        }
-        if (inCode) out.push("<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>");
+        var bodyHtml = renderBlocks(mainLines.join("\n"));
         // 渲染脚注区域
         var fnKeys = Object.keys(footnotes);
         if (fnKeys.length > 0) {
-          out.push('<div class="footnotes"><hr/><ol>');
+          var fnOut = ['<div class="footnotes"><hr/><ol>'];
           fnKeys.forEach(function(label, idx) {
-            var num = idx + 1;
-            out.push('<li id="fn-' + label + '">' + im(footnotes[label]) + ' <a href="#fnref-' + label + '" contenteditable="false">↩</a></li>');
+            fnOut.push('<li id="fn-' + label + '">' + im(footnotes[label]) + ' <a href="#fnref-' + label + '" contenteditable="false">↩</a></li>');
           });
-          out.push('</ol></div>');
+          fnOut.push('</ol></div>');
+          bodyHtml += "\n" + fnOut.join("\n");
         }
-        return out.join("\n");
+        return bodyHtml;
       }
 
       // ─── 划词栏（参考豆包样式）──────────────────────
@@ -991,7 +1180,7 @@ window.__ModuleLoader__.load({
           )
         ),
         h("div", {
-          ref: editorRef, contentEditable: true, suppressContentEditableWarning: true, style: S.editor,
+          ref: editorRef, className: "ccv-editor", contentEditable: true, suppressContentEditableWarning: true, style: S.editor,
           dangerouslySetInnerHTML: { __html: mdToHtml(content) },
           onInput: () => { clearTimeout(saveTimer.current); saveTimer.current = setTimeout(saveCanvas, 1500); },
           onMouseUp: onEditorMouseUp
@@ -1184,6 +1373,45 @@ window.__ModuleLoader__.load({
             '#collab-canvas-panel .ccv-editor .footnotes a{color:#3b82f6;text-decoration:none}'
           ].join('\n');
           document.head.appendChild(hs);
+        }
+        // ─── Markdown 渲染样式（新 editor 用 .ccv-editor；旧 03-styles.js 的 .ccv-wysiwyg 已弃用）
+        if (typeof document !== 'undefined' && !document.getElementById('ccv-md-style')) {
+          var ms = document.createElement('style');
+          ms.id = 'ccv-md-style';
+          ms.textContent = [
+            '#collab-canvas-panel .ccv-editor > *:first-child{margin-top:0}',
+            '#collab-canvas-panel .ccv-editor > *:last-child{margin-bottom:0}',
+            '#collab-canvas-panel .ccv-editor h1{font-size:1.6em;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));padding-bottom:.2em;margin:.6em 0 .4em;font-weight:600;line-height:1.3}',
+            '#collab-canvas-panel .ccv-editor h2{font-size:1.35em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+            '#collab-canvas-panel .ccv-editor h3{font-size:1.18em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+            '#collab-canvas-panel .ccv-editor h4{font-size:1.05em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+            '#collab-canvas-panel .ccv-editor h5{font-size:1em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+            '#collab-canvas-panel .ccv-editor h6{font-size:.95em;margin:.7em 0 .45em;font-weight:600;line-height:1.35;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.65))}',
+            '#collab-canvas-panel .ccv-editor p{margin:.5em 0}',
+            '#collab-canvas-panel .ccv-editor blockquote{border-left:3px solid var(--dsw-alias-border-l2,rgba(128,128,128,.4));margin:.6em 0;padding:4px 12px;opacity:.9;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.7))}',
+            '#collab-canvas-panel .ccv-editor blockquote > *:first-child{margin-top:0}',
+            '#collab-canvas-panel .ccv-editor blockquote > *:last-child{margin-bottom:0}',
+            '#collab-canvas-panel .ccv-editor pre{background:var(--dsw-alias-markdown-code-block,rgba(128,128,128,.12));padding:10px 12px;border-radius:6px;overflow-x:auto;white-space:pre-wrap;margin:.6em 0;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
+            '#collab-canvas-panel .ccv-editor code{background:var(--dsw-alias-markdown-inline-code,rgba(128,128,128,.16));padding:1px 4px;border-radius:3px;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
+            '#collab-canvas-panel .ccv-editor pre code{background:transparent;padding:0;border-radius:0}',
+            '#collab-canvas-panel .ccv-editor ul,#collab-canvas-panel .ccv-editor ol{padding-left:1.6em;margin:.5em 0}',
+            '#collab-canvas-panel .ccv-editor li{margin:.25em 0}',
+            '#collab-canvas-panel .ccv-editor ul ul,#collab-canvas-panel .ccv-editor ol ol,#collab-canvas-panel .ccv-editor ul ol,#collab-canvas-panel .ccv-editor ol ul{margin:.2em 0}',
+            '#collab-canvas-panel .ccv-editor li input[type="checkbox"]{margin-right:.45em;vertical-align:middle;width:1em;height:1em}',
+            '#collab-canvas-panel .ccv-editor li:has(> input[type="checkbox"]){list-style:none;margin-left:-.2em}',
+            '#collab-canvas-panel .ccv-editor table{border-collapse:separate;border-spacing:0;margin:.8em 0;width:100%;max-width:100%;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));border-radius:6px;overflow:hidden}',
+            '#collab-canvas-panel .ccv-editor th,#collab-canvas-panel .ccv-editor td{border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));padding:8px 12px;text-align:left;vertical-align:top}',
+            '#collab-canvas-panel .ccv-editor th{background:var(--dsw-alias-interactive-bg-active,rgba(128,128,128,.18));font-weight:600}',
+            '#collab-canvas-panel .ccv-editor tr:nth-child(even){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08))}',
+            '#collab-canvas-panel .ccv-editor tr:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(59,130,246,.08))}',
+            '#collab-canvas-panel .ccv-editor hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));margin:1em 0}',
+            '#collab-canvas-panel .ccv-editor a{color:var(--dsw-alias-brand-primary,#3b82f6);text-decoration:none}',
+            '#collab-canvas-panel .ccv-editor img{max-width:100%;height:auto;vertical-align:middle}',
+            '#collab-canvas-panel .ccv-editor strong{font-weight:600}',
+            '#collab-canvas-panel .ccv-editor em{font-style:italic}',
+            '#collab-canvas-panel .ccv-editor del{text-decoration:line-through;opacity:.75}'
+          ].join('\n');
+          document.head.appendChild(ms);
         }
         // ─── JS 终极兜底 ──────────────────────────────
 // 即使 CSS 选择器漏、即使 inline style 用了 !important (CSS 覆盖不了
