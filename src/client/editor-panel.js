@@ -415,6 +415,7 @@ window.__ModuleLoader__.load({
 
       // ─── Markdown ↔ HTML ──────────────────────────
       function htmlToMd(root) {
+        var fnDefs = [];
         function w(n) {
           if (n.nodeType === 3) return n.nodeValue.replace(/\u00a0/g, " ");
           if (n.nodeType !== 1) return "";
@@ -436,19 +437,89 @@ window.__ModuleLoader__.load({
             case "blockquote": return inner.trim() ? inner.trim().split("\n").map(l => "> " + l).join("\n") + "\n" : "";
             case "a": var href = n.getAttribute && n.getAttribute("href"); return "[" + inner + "](" + (href || "") + ")";
             case "hr": return "\n---\n";
-            default: return inner;
+            case "sup":
+              // 脚注引用：<sup><a href="#fn-label">[label]</a></sup>
+              var aTag = n.querySelector ? n.querySelector('a[href^="#fn-"]') : null;
+              if (!aTag) {
+                // 兼容：遍历子节点找 a
+                var children = Array.prototype.slice.call(n.childNodes);
+                for (var ci = 0; ci < children.length; ci++) {
+                  if (children[ci].nodeType === 1 && children[ci].tagName.toLowerCase() === 'a') {
+                    var h = children[ci].getAttribute('href') || '';
+                    if (h.indexOf('#fn-') === 0) { aTag = children[ci]; break; }
+                  }
+                }
+              }
+              if (aTag) {
+                var href2 = aTag.getAttribute('href') || '';
+                var label = href2.replace('#fn-', '');
+                return '[^' + label + ']';
+              }
+              return inner;
+            default:
+              // 检查是否是脚注区域
+              if (n.classList && n.classList.contains('footnotes')) {
+                // 收集脚注定义，稍后输出
+                var lis = n.querySelectorAll('li');
+                for (var li = 0; li < lis.length; li++) {
+                  var liId = lis[li].getAttribute('id') || '';
+                  var liLabel = liId.replace('fn-', '');
+                  if (liLabel) {
+                    // 去掉末尾的 ↩ 链接
+                    var liContent = lis[li].textContent.replace(/↩$/, '').trim();
+                    fnDefs.push('[^' + liLabel + ']: ' + liContent);
+                  }
+                }
+                return '';
+              }
+              return inner;
           }
         }
-        return w(root).replace(/\n{3,}/g, "\n\n").trim();
+        var md = w(root).replace(/\n{3,}/g, "\n\n").trim();
+        // 追加脚注定义
+        if (fnDefs.length > 0) {
+          md += '\n\n' + fnDefs.join('\n');
+        }
+        return md;
       }
 
       function mdToHtml(src) {
         if (!src) return "";
         function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-        function im(s) { return esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/\*([^*]+)\*/g, "<em>$1</em>"); }
+        function im(s) {
+          return esc(s)
+            .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
+            .replace(/`([^`]+)`/g, "<code>$1</code>")
+            .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+            .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+            .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+            .replace(/\[\^([^\]]+)\](?!:)/g, '<sup><a href="#fn-$1" id="fnref-$1">[$1]</a></sup>');
+        }
         var lines = String(src).split("\n"), out = [], i = 0, inCode = false, codeBuf = [];
+        var footnotes = {}, fnOrder = [], fnIndex = 0;
+        // 第一遍：收集脚注定义
+        var mainLines = [];
         while (i < lines.length) {
           var l = lines[i];
+          var fnDef = l.match(/^\[\^([^\]]+)\]:\s*(.*)$/);
+          if (fnDef) {
+            var label = fnDef[1], content = fnDef[2];
+            // 多行脚注定义：后续缩进行属于同一脚注
+            while (i + 1 < lines.length && /^\s+/.test(lines[i + 1]) && !/^\[\^/.test(lines[i + 1].trim())) {
+              i++;
+              content += " " + lines[i].trim();
+            }
+            footnotes[label] = content;
+            i++;
+            continue;
+          }
+          mainLines.push(l);
+          i++;
+        }
+        // 第二遍：渲染正文
+        i = 0; inCode = false; codeBuf = [];
+        while (i < mainLines.length) {
+          var l = mainLines[i];
           if (/^```/.test(l)) { if (!inCode) { inCode = true; codeBuf = []; } else { out.push("<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>"); inCode = false; } i++; continue; }
           if (inCode) { codeBuf.push(l); i++; continue; }
           var t = l.trim(); if (!t) { i++; continue; }
@@ -460,6 +531,16 @@ window.__ModuleLoader__.load({
           out.push("<p>" + im(t) + "</p>"); i++;
         }
         if (inCode) out.push("<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>");
+        // 渲染脚注区域
+        var fnKeys = Object.keys(footnotes);
+        if (fnKeys.length > 0) {
+          out.push('<div class="footnotes"><hr/><ol>');
+          fnKeys.forEach(function(label, idx) {
+            var num = idx + 1;
+            out.push('<li id="fn-' + label + '">' + im(footnotes[label]) + ' <a href="#fnref-' + label + '">↩</a></li>');
+          });
+          out.push('</ol></div>');
+        }
         return out.join("\n");
       }
 
@@ -585,6 +666,7 @@ window.__ModuleLoader__.load({
           { label: "行内代码", cmd: "inlineCode", icon: "`" },
           { label: "代码块", cmd: "codeBlock", icon: "{}" },
           { label: "引用", cmd: "blockquote", icon: "「」" },
+          { label: "脚注", cmd: "footnote", icon: "¹" },
           { type: "sep" },
           { label: "无序列表", cmd: "insertUnorderedList", icon: "≡" },
           { label: "有序列表", cmd: "insertOrderedList", icon: "1." },
@@ -612,6 +694,38 @@ window.__ModuleLoader__.load({
           } else if (item.cmd === "link") {
             var url = prompt("请输入链接地址：", "https://")
             if (url) document.execCommand("createLink", false, url)
+          } else if (item.cmd === "footnote") {
+            // 脚注：自动生成编号，插入引用标记，并在文末添加定义
+            var label = prompt("脚注标签（如 1、2、a）：", "")
+            if (label) {
+              // 插入脚注引用
+              var html = '<sup><a href="#fn-' + label + '" id="fnref-' + label + '" style="color:#3b82f6;cursor:pointer">[^' + label + ']</a></sup>'
+              document.execCommand("insertHTML", false, html)
+              // 在编辑器末尾追加脚注定义（如果不存在）
+              var ed = editorRef.current
+              if (ed) {
+                var existing = ed.querySelector('#fn-' + label)
+                if (!existing) {
+                  // 找到或创建 .footnotes 容器
+                  var fnDiv = ed.querySelector('.footnotes')
+                  if (!fnDiv) {
+                    fnDiv = document.createElement('div')
+                    fnDiv.className = 'footnotes'
+                    fnDiv.innerHTML = '<hr/>'
+                    var ol = document.createElement('ol')
+                    fnDiv.appendChild(ol)
+                    ed.appendChild(fnDiv)
+                  }
+                  var ol = fnDiv.querySelector('ol')
+                  var li = document.createElement('li')
+                  li.id = 'fn-' + label
+                  li.innerHTML = '脚注 ' + label + ' 的内容 <a href="#fnref-' + label + '" style="color:#3b82f6">↩</a>'
+                  ol.appendChild(li)
+                  // 滚动到脚注区域
+                  li.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                }
+              }
+            }
           } else {
             document.execCommand(item.cmd, false, item.val)
           }
