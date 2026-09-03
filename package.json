@@ -1,0 +1,21 @@
+{
+  "name": "collab-canvas",
+  "version": "0.1.0",
+  "description": "DSH 协作画布插件：Markdown 渲染/编辑/序列化 + 状态管理 + RPC + 工具注册",
+  "type": "module",
+  "main": "dist/host.js",
+  "exports": {
+    ".": "./dist/host.js",
+    "./client": "./dist/client.js"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

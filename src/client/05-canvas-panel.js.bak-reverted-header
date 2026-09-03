@@ -1,0 +1,447 @@
+// 话布主面板组件（WYSIWYG contentEditable + 格式菜单 + 画布标签管理）
+function CanvasPanel() {
+  const [list, setList] = React.useState([])
+  const [curId, setCurId] = React.useState(null)
+  const [curTitle, setCurTitle] = React.useState('')
+  const [ver, setVer] = React.useState(0)
+  const [status, setStatus] = React.useState({ msg: '就绪', kind: 'info' })
+  const [newTitle, setNewTitle] = React.useState('')
+  const [armDelete, setArmDelete] = React.useState(null)
+  const [menu, setMenu] = React.useState(null)
+  const [selbar, setSelbar] = React.useState(null)
+  // ─── 顶栏弹层（list/new/more）；{ kind, x, y } 形式 ───
+  const [popover, setPopover] = React.useState(null)
+  const editorRef = (typeof React.useRef === 'function') ? React.useRef(null) : { current: null }
+  const savedRangeRef = (typeof React.useRef === 'function') ? React.useRef(null) : { current: null }
+  const formatStateRef = (typeof React.useRef === 'function') ? React.useRef({ bold: false, italic: false, underline: false, heading: null }) : { current: { bold: false, italic: false, underline: false, heading: null } }
+
+  function openPopover(kind, anchorEl) {
+    if (!anchorEl) return
+    const r = anchorEl.getBoundingClientRect()
+    setPopover({ kind: kind, x: r.left, y: r.bottom + 4 })
+  }
+  function closePopover() { setPopover(null) }
+
+  function refreshList(pickId) {
+    host.call('canvas.list').then(function (r) {
+      if (!r || !r.ok) return
+      setList(r.canvases)
+      const want = pickId || r.activeId || (r.canvases[0] && r.canvases[0].id)
+      if (want) openCanvas(want)
+      else setStatus({ msg: '就绪 · 无画布', kind: 'info' })
+    }).catch(function (e) { setStatus({ msg: '加载列表失败: ' + e.message, kind: 'error' }) })
+  }
+
+  function setEditorHtml(html) {
+    if (editorRef.current) editorRef.current.innerHTML = html
+  }
+
+  function openCanvas(id) {
+    setArmDelete(null); setMenu(null); setSelbar(null)
+    host.call('canvas.open', { canvasId: id }).then(function (r) {
+      if (!r.ok) { setStatus({ msg: r.error.message, kind: 'error' }); return }
+      setCurId(r.id); setCurTitle(r.title); setVer(r.version)
+      setEditorHtml(mdToHtml(r.content))
+      setStatus({ msg: '已打开「' + r.title + '」v' + r.version, kind: 'info' })
+    }).catch(function (e) { setStatus({ msg: '打开失败: ' + e.message, kind: 'error' }) })
+  }
+
+  function sendEditNow(cid, md, knownVer) {
+    if (!cid) return Promise.resolve()
+    const args = { canvasId: cid, content: md }
+    if (typeof knownVer === 'number') args.knownVer = knownVer
+    return host.call('canvas.edit', args).then(function (r) {
+      if (r && r.ok) {
+        setVer(r.version)
+        if (r.othersAfter > 0) {
+          setStatus({ msg: '⚠ 你编辑期间话布有 ' + r.othersAfter + ' 次外部修改（如 AI 写入）已被覆盖，点「重载」查看最新', kind: 'error' })
+        }
+      }
+      else { setStatus({ msg: '✗ 编辑失败: ' + ((r && r.error && r.error.message) || JSON.stringify(r)), kind: 'error' }) }
+    }).catch(function (e) {
+      setStatus({ msg: '✗ 编辑发送异常: ' + (e && e.message), kind: 'error' })
+    })
+  }
+
+  function onEditorInput() {
+    if (!curId || !editorRef.current) return
+    setSelbar(null)
+    const md = htmlToMd(editorRef.current)
+    sendEditNow(curId, md, ver)
+  }
+
+  // 鼠标划选结束：选区非空则在其上方弹横向工具栏
+  function onEditorMouseUp() {
+    try {
+      const sel = document.getSelection()
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { setSelbar(null); return }
+      const rect = sel.getRangeAt(0).getBoundingClientRect()
+      if (!rect || (!rect.width && !rect.height)) { setSelbar(null); return }
+      const vw = document.documentElement.clientWidth || 1200
+      const vh = document.documentElement.clientHeight || 800
+      const bx = Math.max(8, Math.min(rect.left, vw - 250))
+      const by = rect.top - 46
+      setSelbar(by < 8 ? { x: bx, y: Math.min(rect.bottom + 10, vh - 60) } : { x: bx, y: by })
+      // 查询当前选区的格式状态，供划词栏高亮
+      formatStateRef.current = queryFormatState()
+    } catch (_) { setSelbar(null) }
+  }
+
+  function reload() {
+    if (!curId) return
+    openCanvas(curId)
+  }
+
+  function stepBack(method) {
+    if (!curId) return
+    host.call(method, { canvasId: curId }).then(function (r) {
+      if (!r.ok) { setStatus({ msg: r.error.message, kind: 'error' }); return }
+      if (!r.noop) {
+        setVer(r.version)
+        setEditorHtml(mdToHtml(r.content))
+        setStatus({ msg: '已' + (method === 'canvas.undo' ? '撤销' : '重做'), kind: 'info' })
+      }
+    }).catch(function (e) { setStatus({ msg: '操作失败: ' + e.message, kind: 'error' }) })
+  }
+
+  function doSave() {
+    if (!curId) return
+    host.call('canvas.save', { canvasId: curId }).then(function (r) {
+      if (r.ok) setStatus({ msg: (r.relocated ? '⚠ 目标目录被沙箱拒绝，已改存：' : '已保存到 ') + r.filePath, kind: r.relocated ? 'error' : 'info' })
+      else setStatus({ msg: r.error.message, kind: 'error' })
+    }).catch(function (e) { setStatus({ msg: '保存失败: ' + e.message, kind: 'error' }) })
+  }
+
+  function doCreate() {
+    const t = newTitle.trim()
+    if (!t) return
+    host.call('canvas.create', { title: t }).then(function (r) {
+      if (r.ok) { setNewTitle(''); refreshList(r.id) }
+      else setStatus({ msg: r.error.message, kind: 'error' })
+    }).catch(function (e) { setStatus({ msg: '创建失败: ' + e.message, kind: 'error' }) })
+  }
+
+  function askDelete(c) {
+    if (armDelete === c.id) {
+      setArmDelete(null)
+      doDelete(c.id)
+      return
+    }
+    setArmDelete(c.id)
+    setStatus({ msg: '再次点击「' + c.title + '」旁的 ✕ 确认删除（点其他画布取消）', kind: 'info' })
+  }
+
+  function doDelete(id) {
+    const wasCur = id === curId
+    host.call('canvas.delete', { canvasId: id }).then(function (r) {
+      if (!r.ok) { setStatus({ msg: r.error.message, kind: 'error' }); return }
+      setStatus({ msg: '已删除画布（' + r.note + '）', kind: 'info' })
+      if (wasCur) { setCurId(null); setCurTitle(''); setVer(0); setEditorHtml('') }
+      refreshList(r.activeId || null)
+    }).catch(function (e) { setStatus({ msg: '删除失败: ' + e.message, kind: 'error' }) })
+  }
+
+  React.useEffect(function () {
+    refreshList(null)
+    function dmu() { onEditorMouseUp() }
+    document.addEventListener('mouseup', dmu)
+    // 桌面 + 触摸都监听 selectionchange：选中文字即弹出划词栏（唯一交互入口）
+    document.addEventListener('selectionchange', dmu)
+    return function () {
+      document.removeEventListener('mouseup', dmu)
+      document.removeEventListener('selectionchange', dmu)
+    }
+  }, [])
+
+  // ─── 顶栏弹层：点击 popover 外部自动关闭 ───
+  React.useEffect(function () {
+    if (!popover) return
+    function onDocDown(e) {
+      const tg = e.target
+      // popover 自身和触发按钮内部都不算"外部"
+      if (tg && tg.closest && (tg.closest('.ccv-popover') || tg.closest('.ccv-tab-active') || tg.closest('.ccv-icon-btn'))) return
+      closePopover()
+    }
+    function onKey(e) { if (e.key === 'Escape') closePopover() }
+    document.addEventListener('mousedown', onDocDown)
+    document.addEventListener('keydown', onKey)
+    return function () {
+      document.removeEventListener('mousedown', onDocDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [popover])
+
+  // ---------- 格式菜单（桌面完整菜单 / 移动迷你栏） ----------
+  function saveSelection() {
+    try {
+      const sel = document.getSelection()
+      if (sel && sel.rangeCount > 0) savedRangeRef.current = sel.getRangeAt(0).cloneRange()
+    } catch (_) {}
+  }
+  function restoreSelection() {
+    try {
+      if (!savedRangeRef.current) return
+      const sel = document.getSelection()
+      sel.removeAllRanges()
+      sel.addRange(savedRangeRef.current)
+    } catch (_) {}
+  }
+  function ensureSelection() {
+    // 优先使用当前实时选区（用户可能拖手柄扩展了选区），否则回退到菜单打开时的快照
+    if (editorRef.current) editorRef.current.focus()
+    try {
+      const sel = document.getSelection()
+      if (sel && sel.rangeCount > 0 && !sel.getRangeAt(0).collapsed) return
+    } catch (_) {}
+    restoreSelection()
+  }
+  function exec(cmd, val) {
+    ensureSelection()
+    try { document.execCommand('styleWithCSS', false, 'false') } catch (_) {}
+    document.execCommand(cmd, false, val)
+    setMenu(null)
+    onEditorInput()
+  }
+  function wrapInline(mark) {
+    ensureSelection()
+    const sel = document.getSelection()
+    const text = sel && sel.toString()
+    if (sel && text) document.execCommand('insertText', false, mark + text + mark)
+    setMenu(null)
+    onEditorInput()
+  }
+  function onEditorContextMenu(e) {
+    e.preventDefault()
+    saveSelection()
+    // 已取消右键/长按菜单，统一用「选中文字 → 划词栏」交互；
+    // 完整格式菜单通过划词栏上的 ⋯ 展开，不再由右键触发。
+  }
+  function runMenuItem(item) {
+    if (item.type === 'wrap') wrapInline(item.mark)
+    else exec(item.cmd, item.val)
+  }
+  function menuItem(item) {
+    return React.createElement('button', {
+      className: 'ccv-menu-item', title: item.title || item.label,
+      onMouseDown: function (e) { e.preventDefault() },
+      onClick: function (e) { e.stopPropagation(); runMenuItem(item) },
+    }, item.label)
+  }
+  function menuSep() { return React.createElement('div', { className: 'ccv-menu-sep' }) }
+
+  const menuItems = menu ? CANVAS_MENU_SPEC.map(function (item) {
+    return item.type === 'sep' ? menuSep() : menuItem(item)
+  }) : null
+
+  function selBtn(item) {
+    // 查询当前格式状态，决定按钮是否高亮
+    var fs = formatStateRef.current
+    var isActive = false
+    if (item.cmd === 'bold') isActive = fs.bold
+    else if (item.cmd === 'italic') isActive = fs.italic
+    else if (item.cmd === 'underline') isActive = fs.underline
+    else if (item.cmd === 'formatBlock' && item.val && fs.heading) isActive = item.val === '<' + fs.heading + '>'
+    return React.createElement('button', {
+      title: item.title, style: item.style || null,
+      'data-active': isActive ? '1' : undefined,
+      onMouseDown: function (e) { e.preventDefault() },
+      onClick: function (e) { e.stopPropagation(); runMenuItem(item); onEditorMouseUp() },
+    }, item.label)
+  }
+  function expandFromSelbar() {
+    if (!selbar) return
+    setMenu({ kind: 'full', x: selbar.x, y: Math.min(selbar.y + 46, (document.documentElement.clientHeight || 800) - 320), delayed: false })
+    setSelbar(null)
+  }
+
+  const menuEl = !menu ? null : React.createElement('div', { className: 'ccv-menu', 'data-delayed': menu.delayed ? '1' : '0', style: { left: menu.x, top: menu.y }, onMouseLeave: function () { setMenu(null) }, onClick: function (e) { e.stopPropagation() } },
+    React.createElement('div', { className: 'ccv-menu-head' },
+      React.createElement('span', { className: 'ccv-menu-title' }, '格式'),
+      React.createElement('button', { className: 'ccv-menu-close', title: '关闭', onClick: function () { setMenu(null) } }, '✕'),
+    ),
+    menuItems,
+  )
+
+  const selbarEl = !selbar ? null : React.createElement('div', { className: 'ccv-selbar', style: { left: selbar.x, top: selbar.y }, onMouseDown: function (e) { e.preventDefault() }, onClick: function (e) { e.stopPropagation() } },
+    CANVAS_SELBAR_SPEC.map(selBtn),
+    React.createElement('div', { style: { width: '1px', height: '18px', background: 'var(--dsw-alias-border-l1,rgba(128,128,128,.3))', margin: '0 2px' } }),
+    React.createElement('button', { className: 'ccv-minibar-more', title: '更多格式', onClick: function (e) { e.stopPropagation(); expandFromSelbar() } }, '⋯'),
+  )
+
+  const tabs = list.map(function (c) {
+    return React.createElement('div', { key: c.id, className: 'ccv-tabwrap' },
+      React.createElement('button', {
+        className: 'ccv-tab',
+        'data-active': c.id === curId ? '1' : '0',
+        title: c.title,
+        onClick: function () { openCanvas(c.id) },
+      }, c.title),
+      React.createElement('button', {
+        className: 'ccv-tabx',
+        'data-armed': armDelete === c.id ? '1' : '0',
+        title: '删除画布「' + c.title + '」（二次点击确认；磁盘文件保留）',
+        onClick: function (e) { e.stopPropagation(); askDelete(c) },
+      }, '✕'),
+    )
+  })
+
+  return React.createElement('div', { className: 'ccv-root', onClick: function () {
+    if (menu) setMenu(null)
+    // 只有当选区塌缩（真正的取消选择点击）才关闭划词栏，
+    // 避免拖选文字松手时的 click 事件误关它
+    try { const s = document.getSelection(); if (!s || s.isCollapsed) setSelbar(null) } catch (_) {}
+  } },
+    React.createElement('div', { className: 'ccv-bar' },
+      // === 左侧：仿 WorkBuddy 文件 tab 风格的「📝 当前画布 ×」激活态 ===
+      React.createElement('div', {
+        className: 'ccv-tab-active',
+        onClick: function (e) { openPopover('list', e.currentTarget) },
+        title: '点击切换画布',
+      },
+        React.createElement('span', { className: 'ccv-tab-active-icon' }, '📝'),
+        React.createElement('span', { className: 'ccv-tab-active-title', title: curTitle || '未选画布' }, curTitle ? curTitle : '未选画布'),
+        React.createElement('button', {
+          className: 'ccv-tab-active-toggle',
+          title: '切换画布',
+          onClick: function (e) { e.stopPropagation(); openPopover('list', e.currentTarget) },
+        }, '▾'),
+      ),
+      // === spacer ===
+      React.createElement('div', { className: 'ccv-bar-spacer' }),
+      // === 右侧：紧凑图标按钮 ===
+      React.createElement('button', {
+        className: 'ccv-icon-btn', onClick: function () { stepBack('canvas.undo') },
+        disabled: !curId, title: '撤销 (Ctrl+Z)'
+      }, '↶'),
+      React.createElement('button', {
+        className: 'ccv-icon-btn', onClick: function () { stepBack('canvas.redo') },
+        disabled: !curId, title: '重做 (Ctrl+Y)'
+      }, '↷'),
+      React.createElement('span', { className: 'ccv-bar-sep' }),
+      React.createElement('button', {
+        className: 'ccv-icon-btn', onClick: doSave,
+        disabled: !curId, title: '保存 (Ctrl+S)'
+      }, '💾'),
+      React.createElement('button', {
+        className: 'ccv-icon-btn', onClick: reload,
+        disabled: !curId, title: '从服务端拉取最新内容（AI 在对话里修改话布后用它同步）'
+      }, '↻'),
+      React.createElement('span', { className: 'ccv-bar-sep' }),
+      React.createElement('button', {
+        className: 'ccv-icon-btn',
+        'data-active': popover && popover.kind === 'new' ? '1' : undefined,
+        onClick: function (e) { openPopover('new', e.currentTarget) },
+        title: '新建话布'
+      }, '＋'),
+      React.createElement('button', {
+        className: 'ccv-icon-btn',
+        'data-active': popover && popover.kind === 'more' ? '1' : undefined,
+        onClick: function (e) { openPopover('more', e.currentTarget) },
+        title: '更多'
+      }, '⋯'),
+      React.createElement('span', { className: 'ccv-badge', title: '客户端构建版本' }, VERSION),
+    ),
+    React.createElement('div', {
+      ref: editorRef,
+      className: 'ccv-wysiwyg',
+      contentEditable: true,
+      suppressContentEditableWarning: true,
+      'data-placeholder': curId ? '开始输入，或选中文字后设置样式…' : '← 新建或选择一个话布开始',
+      onInput: onEditorInput,
+      onContextMenu: onEditorContextMenu,
+      onMouseUp: onEditorMouseUp,
+      onScroll: function () { if (menu) setMenu(null); if (selbar) setSelbar(null) },
+      onKeyDown: function (e) {
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); doSave() }
+      },
+    }),
+    selbarEl,
+    menuEl,
+    React.createElement('div', { className: 'ccv-status', 'data-kind': status.kind }, status.msg),
+
+    // ─── 顶栏弹层（list / new / more） ─────────────────────
+    // list —— 画布列表（含删除）
+    popover && popover.kind === 'list' ? React.createElement('div', {
+      className: 'ccv-popover',
+      style: { left: popover.x, top: popover.y },
+      onClick: function (e) { e.stopPropagation() },
+    },
+      React.createElement('div', { className: 'ccv-popover-head' }, '画布列表'),
+      list.length === 0
+        ? React.createElement('div', { className: 'ccv-popover-empty' }, '还没有画布，点 ➕ 新建一个')
+        : list.map(function (c) {
+          return React.createElement('div', {
+            className: 'ccv-popover-item',
+            'data-active': c.id === curId ? '1' : '0',
+            key: c.id,
+          },
+            React.createElement('button', {
+              className: 'ccv-popover-item-title',
+              title: c.title,
+              onClick: function () { openCanvas(c.id); closePopover() },
+            }, c.title),
+            React.createElement('button', {
+              className: 'ccv-popover-item-del',
+              title: '删除「' + c.title + '」（二次点击确认；磁盘文件保留）',
+              onClick: function (e) { e.stopPropagation(); askDelete(c); closePopover() },
+            }, '✕'),
+          )
+        }),
+    ) : null,
+
+    // new —— 新建表单
+    popover && popover.kind === 'new' ? React.createElement('div', {
+      className: 'ccv-popover',
+      style: { left: popover.x, top: popover.y },
+      onClick: function (e) { e.stopPropagation() },
+    },
+      React.createElement('div', { className: 'ccv-popover-head' }, '新建话布'),
+      React.createElement('input', {
+        className: 'ccv-popover-input',
+        placeholder: '话布标题…',
+        value: newTitle, autoFocus: true,
+        onChange: function (e) { setNewTitle(e.target.value) },
+        onKeyDown: function (e) {
+          if (e.key === 'Enter' && newTitle.trim()) { doCreate(); closePopover() }
+          else if (e.key === 'Escape') closePopover()
+        },
+      }),
+      React.createElement('button', {
+        className: 'ccv-popover-btn',
+        disabled: !newTitle.trim(),
+        onClick: function () { if (newTitle.trim()) { doCreate(); closePopover() } },
+      }, '创建'),
+    ) : null,
+
+    // more —— 占位菜单（后续可加：诊断 / 全屏 / 关于 等）
+    popover && popover.kind === 'more' ? React.createElement('div', {
+      className: 'ccv-popover',
+      style: { left: popover.x, top: popover.y },
+      onClick: function (e) { e.stopPropagation() },
+    },
+      React.createElement('div', { className: 'ccv-popover-head' }, '更多'),
+      React.createElement('button', {
+        className: 'ccv-popover-item',
+        onClick: function () {
+          // 触发一条诊断日志：包含当前画布/版本/列表长度，便于排查
+          ccvLog('more-诊断触发: curId=' + curId + ' curTitle=' + curTitle + ' ver=' + ver + ' listLen=' + list.length)
+          closePopover()
+        },
+      }, '诊断日志（写入 %TEMP%/ccv-selbar.log）'),
+      React.createElement('button', {
+        className: 'ccv-popover-item',
+        onClick: function () {
+          // 复制版本信息到剪贴板，方便升级/反馈时引用
+          try {
+            var txt = 'collab-canvas ' + VERSION + ' | 客户端版本'
+            if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(txt)
+              setStatus({ msg: '已复制版本信息：' + txt, kind: 'info' })
+            }
+          } catch (_) {}
+          closePopover()
+        },
+      }, '复制版本号'),
+    ) : null,
+  )
+}
