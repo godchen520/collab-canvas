@@ -7,6 +7,9 @@ function pushHistory(c, before, after, source, version) {
 }
 
 function createCanvasDoc(title) {
+  // 标题净化：AI/导入可能把 "xxx.md" 当标题传入，canvas_save 落盘时会变成
+  // "xxx.md.md" 双扩展名文件——这里统一剥掉尾扩展名
+  title = String(title || '').replace(/\.(md|markdown)$/i, '') || '未命名话布'
   const id = 'cv-' + Date.now().toString(36) + '-' + (++idSeq)
   const c = { id: id, title: title, type: 'document', content: '', version: 1, filePath: null, history: [], redoStack: [], dirty: true, updatedAt: Date.now() }
   canvases.set(id, c)

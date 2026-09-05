@@ -8,6 +8,7 @@
     const webServer = ctx.get('webServer')
     if (webServer) {
       initCanvasHttpEndpoints(ctx, webServer)
+      initCanvasExtraEndpoints(ctx, webServer)   // 11-canvas-extras.js：拖拽/登记表/删除/模块服务
     } else {
       console.warn('[collab-canvas]', 'webServer 服务未找到，跳过')
     }

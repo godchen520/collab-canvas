@@ -133,3 +133,26 @@ ctx.tools.register(defineTool({
     return toolOutput({ ok: true, root: docsDirBase(), docsDir: docsDir(), hint: '当前存储根如上；传 root 参数可固定到其他目录。' })
   },
 }))
+
+ctx.tools.register(defineTool({
+  name: 'canvas_delete',
+  description: '删除一个画布记录（内存 + meta 落盘）。删除后文件保留在磁盘可手动清理；用户说"删除/清理某个画布"时调用。',
+  parameters: {
+    canvasId: { type: 'string', required: true, description: '要删除的画布 id（来自 canvas_list）' },
+  },
+  output: { schema: { type: 'string' }, render: function (_a, v) { return [{ type: 'text', text: v }] } },
+  execute: async function (args) {
+    const id = args && typeof args.canvasId === 'string' ? args.canvasId : ''
+    if (!id) return toolOutput(err('E_BAD_ARGS', 'canvasId 必须为字符串'))
+    const c = canvases.get(id)
+    if (!c) return toolOutput(err('E_NOT_FOUND', '画布不存在：' + id))
+    canvases.delete(id)
+    if (activeId === id) {
+      const first = canvases.keys().next()
+      activeId = first.done ? null : first.value
+    }
+    emit && emit(EV.CANVAS_CLOSED, { canvasId: id })
+    try { await persistMeta() } catch (e) { console.error('[collab-canvas] delete persist failed:', e.message) }
+    return toolOutput({ ok: true, canvasId: id, activeId: activeId, note: '文件保留在磁盘' + (c.filePath ? '：' + c.filePath : '（未落盘）') + '，可手动清理' })
+  },
+}))
