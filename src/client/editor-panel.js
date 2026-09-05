@@ -932,7 +932,12 @@ window.__ModuleLoader__.load({
             document.execCommand("insertHTML", false, html)
           } else if (item.cmd === "link") {
             var url = prompt("请输入链接地址：", "https://")
-            if (url) document.execCommand("createLink", false, url)
+            if (url) {
+              var sel = document.getSelection()
+              var text = sel ? sel.toString().trim() : "链接文字"
+              var html = '<a href="' + url + '" style="color:#3b82f6;text-decoration:underline">' + text + '</a>'
+              document.execCommand("insertHTML", false, html)
+            }
           } else if (item.cmd === "footnote") {
             // 脚注：自动生成编号，插入引用标记，并在文末添加定义
             var label = prompt("脚注标签（如 1、2、a）：", "")
