@@ -1064,15 +1064,19 @@ window.__ModuleLoader__.load({
                   nativeInputValueSetter.call(input, quote + input.value)
                   input.dispatchEvent(new Event('input', { bubbles: true }))
                 } else {
-                  // contentEditable: 直接拼 innerHTML 保留原有内容，开头加引用 + 两个空行
-                  var escTxt = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-                  var quoteHtml = '<div>> ' + escTxt + '</div><div><br></div><div><br></div>'
-                  if (typeof input.innerHTML === 'string') {
-                    input.innerHTML = quoteHtml + input.innerHTML
+                  // 新版 DSH 用 Lexical 编辑器：优先走官方 inputActions.setDraft（能保留换行）
+                  var draftState = window.__ccvInputState
+                  var curDraft = (draftState && draftState.draft) ? draftState.draft : ''
+                  var newDraft = '> ' + text + '\n\n' + curDraft
+                  if (window.__ccvInputActions && window.__ccvInputActions.setDraft) {
+                    window.__ccvInputActions.setDraft(newDraft)
                   } else {
-                    input.innerText = '> ' + text + '\n\n' + (input.innerText || '')
+                    // fallback: 直接写 DOM + 派发 input
+                    var escTxt = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                    var quoteHtml = '<div>> ' + escTxt + '</div><div><br></div><div><br></div>'
+                    input.innerHTML = quoteHtml + input.innerHTML
+                    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '> ' + text }))
                   }
-                  input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '> ' + text }))
                 }
                 input.focus()
               }
@@ -1310,6 +1314,21 @@ window.__ModuleLoader__.load({
       }, "话布");
     }
 
+    // ─── 输入桥组件：把官方 inputActions / draft 暴露给划词栏 ──
+    // 新版 DSH 输入框是 Lexical 编辑器，直接改 DOM 无法可靠同步；
+    // slot 组件能拿到 inputActions.setDraft（官方接口），存到全局供「问AI」调用。
+    function InputBridge(props) {
+      var inputState = null
+      try { inputState = props.useInput ? props.useInput(function(s) { return s }) : null } catch (e) { inputState = null }
+      React.useEffect(function() {
+        if (props.inputActions) window.__ccvInputActions = props.inputActions
+      }, [])
+      React.useEffect(function() {
+        window.__ccvInputState = inputState
+      }, [inputState])
+      return null
+    }
+
     // ─── 插件注册 ──────────────────────────────────────
     const inject = ["slots", "conversation"];
 
@@ -1487,6 +1506,15 @@ if (!document.getElementById('ccv-cc-constrain-js')) {
           order: 50,
           label: () => "话布"
         }, CanvasToggle)
+      );
+      // 注册输入桥（隐藏组件，暴露 inputActions.setDraft 给划词栏）
+      ctx.slots.inject("conversation.input.dock", () =>
+        ctx.slots.register({
+          name: "conversation.input.dock",
+          id: "collab-canvas-input-bridge",
+          order: 999,
+          label: () => "画布输入桥"
+        }, InputBridge)
       );
     }
 
