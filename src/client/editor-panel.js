@@ -1058,15 +1058,14 @@ window.__ModuleLoader__.load({
                 document.querySelector('textarea[placeholder*="输入"]') ||
                 document.querySelector('[contenteditable="true"][role="textbox"]')
               if (input) {
-                var quote = '> ' + text + '\n\n'
                 if (input.tagName === 'TEXTAREA') {
+                  var quote = '> ' + text + '\n\n'
                   var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
                   nativeInputValueSetter.call(input, quote + input.value)
                   input.dispatchEvent(new Event('input', { bubbles: true }))
                 } else {
-                  // contentEditable: 用原生编辑 API 插入，确保 React 状态同步
+                  // contentEditable: 用 HTML 结构插入，换行用 <div> 块实现
                   input.focus()
-                  // 先把光标移动到开头
                   var range = document.createRange()
                   range.setStart(input, 0)
                   range.collapse(true)
@@ -1075,7 +1074,9 @@ window.__ModuleLoader__.load({
                     sel.removeAllRanges()
                     sel.addRange(range)
                   }
-                  document.execCommand('insertText', false, quote)
+                  var escTxt = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                  var quoteHtml = '<div>> ' + escTxt + '</div><div><br></div><div><br></div>'
+                  document.execCommand('insertHTML', false, quoteHtml)
                 }
                 input.focus()
               }
