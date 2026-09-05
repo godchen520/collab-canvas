@@ -1045,8 +1045,9 @@ window.__ModuleLoader__.load({
               var text = sel ? sel.toString().trim() : ''
               if (!text) { alert('请先选中要问 AI 的文本'); return }
               hideSelbar()
-              // 插入到输入框（引用块格式）—— 多选择器兼容 DSH 不同版本
+              // 插入到输入框（引用块格式）—— 兼容新旧版 DSH
               var input =
+                document.querySelector('div[data-composer-input="true"]') ||
                 document.querySelector('[data-slot="conversation.input"] textarea') ||
                 document.querySelector('[data-slot="conversation.composer"] textarea') ||
                 document.querySelector('[data-slot="conversation.composer.bar"] textarea') ||
@@ -1055,8 +1056,7 @@ window.__ModuleLoader__.load({
                 document.querySelector('textarea[placeholder*="说话"]') ||
                 document.querySelector('textarea[placeholder*="消息"]') ||
                 document.querySelector('textarea[placeholder*="输入"]') ||
-                document.querySelector('[contenteditable="true"][role="textbox"]') ||
-                document.querySelector('[data-slot="conversation"] [contenteditable="true"]')
+                document.querySelector('[contenteditable="true"][role="textbox"]')
               if (input) {
                 var quote = '> ' + text + '\n\n'
                 // 兼容 textarea 和 contentEditable 两种输入方式
