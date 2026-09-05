@@ -1064,19 +1064,15 @@ window.__ModuleLoader__.load({
                   nativeInputValueSetter.call(input, quote + input.value)
                   input.dispatchEvent(new Event('input', { bubbles: true }))
                 } else {
-                  // contentEditable: 用 HTML 结构插入，换行用 <div> 块实现
-                  input.focus()
-                  var range = document.createRange()
-                  range.setStart(input, 0)
-                  range.collapse(true)
-                  var sel = window.getSelection()
-                  if (sel) {
-                    sel.removeAllRanges()
-                    sel.addRange(range)
-                  }
+                  // contentEditable: 直接拼 innerHTML 保留原有内容，开头加引用 + 两个空行
                   var escTxt = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
                   var quoteHtml = '<div>> ' + escTxt + '</div><div><br></div><div><br></div>'
-                  document.execCommand('insertHTML', false, quoteHtml)
+                  if (typeof input.innerHTML === 'string') {
+                    input.innerHTML = quoteHtml + input.innerHTML
+                  } else {
+                    input.innerText = '> ' + text + '\n\n' + (input.innerText || '')
+                  }
+                  input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '> ' + text }))
                 }
                 input.focus()
               }
