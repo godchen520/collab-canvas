@@ -1059,15 +1059,23 @@ window.__ModuleLoader__.load({
                 document.querySelector('[contenteditable="true"][role="textbox"]')
               if (input) {
                 var quote = '> ' + text + '\n\n'
-                // 兼容 textarea 和 contentEditable 两种输入方式
                 if (input.tagName === 'TEXTAREA') {
                   var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
                   nativeInputValueSetter.call(input, quote + input.value)
                   input.dispatchEvent(new Event('input', { bubbles: true }))
                 } else {
-                  // contentEditable: 直接设置 innerText 并触发 input 事件
-                  input.innerText = quote + input.innerText
-                  input.dispatchEvent(new Event('input', { bubbles: true }))
+                  // contentEditable: 用原生编辑 API 插入，确保 React 状态同步
+                  input.focus()
+                  // 先把光标移动到开头
+                  var range = document.createRange()
+                  range.setStart(input, 0)
+                  range.collapse(true)
+                  var sel = window.getSelection()
+                  if (sel) {
+                    sel.removeAllRanges()
+                    sel.addRange(range)
+                  }
+                  document.execCommand('insertText', false, quote)
                 }
                 input.focus()
               }
