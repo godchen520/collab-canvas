@@ -284,24 +284,103 @@ window.__ModuleLoader__.load({
         return function () { clearTimeout(t) }
       }, [])
 
-      // contentEditable 中的 <a href="#fn-..."> 默认不会跳转（浏览器只把光标移进去），
-      // 用 capture 阶段捕获点击，阻止默认行为后手动 scrollIntoView。
+      // contentEditable 里的 <a> 浏览器默认不跳转（单击只把光标移进去）：
+      // - 脚注引用 [1]：capture 拦截，手动 scrollIntoView 跳到文末
+      // - 普通链接：单击直接新标签页打开，两端行为一致（外链开网页，
+      //   attachments/ 附件链接触发下载）。要改链接文字/地址：选中新链接文字后
+      //   重新「插入链接」即可覆盖
       useEffect(function () {
         var ed = editorRef.current;
         if (!ed) return;
         function onClick(e) {
-          var a = e.target.closest && e.target.closest('a[href^="#fn"]');
+          var a = e.target.closest && e.target.closest('a[href]');
           if (!a) return;
           var href = a.getAttribute('href') || '';
-          if (href.indexOf('#fn') !== 0) return;
+          if (!href) return;
+          if (href.indexOf('#fn') === 0) {
+            e.preventDefault();
+            e.stopPropagation();
+            var id = href.slice(1);
+            var target = document.getElementById(id) || ed.querySelector('[id="' + id + '"]');
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return;
+          }
+          // 单击直接新标签页打开（外链开网页，attachments/ 附件链接触发下载）。
+          // 两端行为一致：手机端本来就没有 Ctrl 键，桌面端跟随。
+          // 只放行 http(s) 和站内路径（附件接口），防 javascript: 之类的注入
+          var openable = /^https?:\/\//i.test(href) || href.charAt(0) === '/';
+          ccvLog('链接点击: href=' + href + ' openable=' + openable);
+          if (!openable) return;
           e.preventDefault();
           e.stopPropagation();
-          var id = href.slice(1);
-          var target = document.getElementById(id) || ed.querySelector('[id="' + id + '"]');
-          if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          window.open(href, '_blank', 'noopener');
         }
         ed.addEventListener('click', onClick, true);
         return function () { ed.removeEventListener('click', onClick, true); };
+      }, []);
+
+      // 编辑区增强：粘贴截图自动上传、Tab/Shift+Tab 列表缩进
+      useEffect(function () {
+        var ed = editorRef.current;
+        if (!ed) return;
+        function inListItem() {
+          var sel = document.getSelection()
+          if (!sel || sel.rangeCount === 0) return false
+          var node = sel.getRangeAt(0).startContainer
+          if (node.nodeType === 3) node = node.parentNode
+          while (node && node.nodeType === 1) {
+            var tag = node.tagName ? node.tagName.toLowerCase() : ""
+            if (tag === "li" || tag === "ul" || tag === "ol") return true
+            if (node.classList && node.classList.contains("ccv-editor")) break
+            node = node.parentNode
+          }
+          return false
+        }
+        function onKeyDown(e) {
+          if (e.key !== "Tab") return
+          e.preventDefault()
+          if (inListItem()) {
+            // 列表里：Tab 嵌套一级、Shift+Tab 退回一级，效果相反
+            document.execCommand(e.shiftKey ? "outdent" : "indent", false, null)
+          } else if (!e.shiftKey) {
+            // 非列表：Tab 插两个空格；Shift+Tab 无处可退，不做动作
+            // （之前 Shift+Tab 也走这里插空格，两种按起来一样，是 bug）
+            document.execCommand("insertText", false, "  ")
+          }
+        }
+        function onPaste(e) {
+          var items = e.clipboardData && e.clipboardData.items
+          if (!items) return
+          for (var i = 0; i < items.length; i++) {
+            var it = items[i]
+            if (it.kind === "file" && it.type && it.type.indexOf("image/") === 0) {
+              var f = it.getAsFile()
+              if (!f) continue
+              e.preventDefault()
+              // 剪贴板里的截图通常叫 image.png，重命名带上时间戳便于辨认
+              var ext = (it.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png"
+              var name = "clipboard-" + Date.now() + "." + ext
+              try { f = new File([f], name, { type: it.type }) } catch (_) { /* 旧环境保留原名 */ }
+              var rng = currentRange()
+              uploadCanvasFile(f, function(p) {
+                insertHtmlAtRange('<img src="' + escHtml(assetDisplayUrl(p)) + '" alt="截图" style="max-width:100%;height:auto;vertical-align:middle"/>', rng)
+              }, function(f2) {
+                // 上传失败兜底：dataURL 内嵌
+                fileToDataUrl(f2, function(u) {
+                  if (u) insertHtmlAtRange('<img src="' + u + '" alt="截图" style="max-width:100%;height:auto;vertical-align:middle"/>', rng)
+                  else ccvLog("paste: 图片上传失败且无兜底")
+                })
+              })
+              return
+            }
+          }
+        }
+        ed.addEventListener("keydown", onKeyDown)
+        ed.addEventListener("paste", onPaste)
+        return function () {
+          ed.removeEventListener("keydown", onKeyDown)
+          ed.removeEventListener("paste", onPaste)
+        };
       }, []);
 
       // 兜底触发：编辑区的 React onMouseUp 不是每次都生效（拖选结束时指针落在
@@ -444,6 +523,37 @@ window.__ModuleLoader__.load({
       // ─── Markdown ↔ HTML ──────────────────────────
       function htmlToMd(root) {
         var fnDefs = [];
+        // 对齐：execCommand('justifyCenter'/'justifyRight') 会在块元素上留 align 属性
+        // 或 text-align 内联样式。markdown 没有对齐语法，存成 ::: center/right 围栏，
+        // 渲染端 renderBlocks 负责转回 <div style="text-align:...">
+        function blockAlign(el) {
+          if (!el || !el.getAttribute) return "";
+          var a = (el.getAttribute("align") || "").toLowerCase();
+          if (a === "center" || a === "right") return a;
+          var m = (el.getAttribute("style") || "").match(/text-align\s*:\s*(center|right)/i);
+          if (m) return m[1].toLowerCase();
+          try { var ta = el.style && el.style.textAlign; if (ta === "center" || ta === "right") return ta; } catch (_) {}
+          return "";
+        }
+        function withAlign(al, md) {
+          if (!al) return md;
+          return "::: " + al + "\n" + md.replace(/\n*$/, "\n") + ":::\n";
+        }
+        function withFence(kind, md) {
+          return "::: " + kind + "\n" + md.replace(/\n*$/, "\n") + ":::\n";
+        }
+        // 编辑器里 <img>/<a> 的 src/href 是 host 读文件接口地址（插入时就要能显示）；
+        // 存盘换回 attachments/ 相对路径，md 文件保持可携带、跟着画布文件夹走
+        function assetMdPath(u) {
+          var m = String(u).match(/^\/api\/canvas\/file\?name=([^&]+)$/);
+          if (m) {
+            try {
+              var d = decodeURIComponent(m[1]);
+              if (d.indexOf("attachments/") === 0) return d;
+            } catch (_) {}
+          }
+          return u;
+        }
         function w(n) {
           if (n.nodeType === 3) return n.nodeValue.replace(/\u00a0/g, " ");
           if (n.nodeType !== 1) return "";
@@ -476,17 +586,23 @@ window.__ModuleLoader__.load({
           if (t === "br") return "\n";
           var inner = Array.prototype.map.call(n.childNodes || [], w).join("");
           switch (t) {
-            case "div": case "p": return inner + "\n";
-            case "h1": return "# " + inner + "\n";
-            case "h2": return "## " + inner + "\n";
-            case "h3": return "### " + inner + "\n";
-            case "h4": return "#### " + inner + "\n";
-            case "h5": return "##### " + inner + "\n";
-            case "h6": return "###### " + inner + "\n";
+            case "div": case "p": {
+              // 高亮块：mdToHtml 渲染 ::: highlight 时打的 class，序列化回围栏
+              if (t === "div" && n.classList && n.classList.contains("ccv-hl")) {
+                return withFence("highlight", inner);
+              }
+              return withAlign(blockAlign(n), inner + "\n");
+            }
+            case "h1": return withAlign(blockAlign(n), "# " + inner + "\n");
+            case "h2": return withAlign(blockAlign(n), "## " + inner + "\n");
+            case "h3": return withAlign(blockAlign(n), "### " + inner + "\n");
+            case "h4": return withAlign(blockAlign(n), "#### " + inner + "\n");
+            case "h5": return withAlign(blockAlign(n), "##### " + inner + "\n");
+            case "h6": return withAlign(blockAlign(n), "###### " + inner + "\n");
             case "img": {
               var iSrc = n.getAttribute && n.getAttribute("src") || "";
               var iAlt = n.getAttribute && n.getAttribute("alt") || "";
-              return iSrc ? "![" + iAlt + "](" + iSrc + ")" : "";
+              return iSrc ? "![" + iAlt + "](" + assetMdPath(iSrc) + ")" : "";
             }
             case "ul": case "ol": return renderListMd(n, "");
             case "li": {
@@ -496,7 +612,11 @@ window.__ModuleLoader__.load({
             }
             case "strong": case "b": return inner ? "**" + inner + "**" : "";
             case "em": case "i": return inner ? "*" + inner + "*" : "";
-            case "u": return inner ? "<u>" + inner + "</u>" : "";
+            // markdown 没有下划线语法，用 ++文字++ 扩展标记存（渲染端 im 负责转回 <u>）。
+            // 之前直接存 <u> 原始标签，mdToHtml 的 esc 会把它转义成字面文字，重开画布就露馅
+            case "u": case "ins": return inner ? "++" + inner + "++" : "";
+            // 高亮：==文字== ↔ <mark>
+            case "mark": return inner ? "==" + inner + "==" : "";
             case "strike": case "s": case "del": return inner ? "~~" + inner + "~~" : "";
             case "code": return "`" + inner + "`";
             case "pre": return "\n```\n" + (n.textContent || "") + "\n```\n";
@@ -538,7 +658,7 @@ window.__ModuleLoader__.load({
               if (href.indexOf("#fn-") === 0) {
                 return "[^" + href.replace("#fn-", "") + "]";
               }
-              return "[" + inner + "](" + href + ")";
+              return "[" + inner + "](" + assetMdPath(href) + ")";
             case "hr": return "\n---\n";
             case "sup":
               // 脚注引用：<sup><a href="#fn-label">[label]</a></sup>
@@ -629,18 +749,33 @@ window.__ModuleLoader__.load({
       function mdToHtml(src) {
         if (!src) return "";
         function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+        // 附件相对路径（attachments/…）重写成 host 读文件接口；编辑器里才能显示。
+        // 存盘的 md 始终保持相对路径，画布文件夹整个挪走/换机器都不断链
+        function resolveAssetUrl(u) {
+          if (/^attachments\//.test(u)) return "/api/canvas/file?name=" + encodeURIComponent(u)
+          return u
+        }
         function im(s) {
           return esc(s)
+            // 兼容旧版直接存进 md 的 <u> 原始标签（已被 esc 转义成 &lt;u&gt;）→ 转回真下划线
+            .replace(/&lt;u&gt;([\s\S]*?)&lt;\/u&gt;/g, '<u>$1</u>')
             // 兼容旧版 htmlToMd 产生的 [[label]](#fn-label) 手写链接 → 转成规范脚注引用
             .replace(/\[\[([^\]]+)\]\]\(#fn-([^)]+)\)/g, '<a href="#fn-$2" id="fnref-$2" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$2]</a>')
             // ⚠️ 图片必须先于链接规则处理：!\[alt\](src) 里的 [alt](src) 会被链接
             // 规则啃掉，渲染成 !<a href="src">alt</a> 这种残骸
-            .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%;height:auto;vertical-align:middle"/>')
-            .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
+            .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (_m0, alt, src) {
+              return '<img src="' + resolveAssetUrl(src) + '" alt="' + alt + '" style="max-width:100%;height:auto;vertical-align:middle"/>'
+            })
+            .replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (_m1, txt, href) {
+              // title 悬停显示 md 里写的原始地址；esc 不管引号，title 属性里自己补 &quot;
+              return '<a href="' + resolveAssetUrl(href) + '" title="' + String(href).replace(/"/g, '&quot;') + '">' + txt + '</a>'
+            })
             .replace(/`([^`]+)`/g, "<code>$1</code>")
             .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
             .replace(/\*([^*]+)\*/g, "<em>$1</em>")
             .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+            .replace(/\+\+([^+]+)\+\+/g, "<u>$1</u>")
+            .replace(/==([^=]+)==/g, "<mark>$1</mark>")
             .replace(/\[\^([^\]]+)\](?!:)/g, '<a href="#fn-$1" id="fnref-$1" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$1]</a>');
         }
         // 块级渲染（可递归：blockquote 内部再走一遍同样的块解析，支持引用里套表格/列表）
@@ -668,6 +803,24 @@ window.__ModuleLoader__.load({
             var t = l.trim(); if (!t) { i++; continue; }
             var h2 = t.match(/^(#{1,6})\s+(.*)$/); if (h2) { out.push("<h" + h2[1].length + ">" + im(h2[2]) + "</h" + h2[1].length + ">"); i++; continue; }
             if (/^(-{3,}|\*{3,})$/.test(t)) { out.push("<hr/>"); i++; continue; }
+            // ::: 围栏：center/right/left 对齐 + highlight 高亮块，同一套机制，
+            // 支持嵌套（depth 计数），内部递归渲染，标题/列表/引用放进去都行
+            var alM = t.match(/^:::\s*(center|right|left|highlight)\s*$/i);
+            if (alM) {
+              var alInner = [], alDepth = 1;
+              i++;
+              while (i < lines.length) {
+                var alT = lines[i].trim();
+                if (/^:::\s*$/.test(alT)) { alDepth--; if (!alDepth) { i++; break; } }
+                else if (/^:::\s*(center|right|left|highlight)\s*$/i.test(alT)) alDepth++;
+                alInner.push(lines[i]); i++;
+              }
+              var alKind = alM[1].toLowerCase();
+              out.push(alKind === "highlight"
+                ? '<div class="ccv-hl">' + renderBlocks(alInner.join("\n")) + "</div>"
+                : '<div style="text-align:' + alKind + '">' + renderBlocks(alInner.join("\n")) + "</div>");
+              continue;
+            }
             // 表格：本行含 |，且下一行是 |---|---| 形式的分隔行 → 收集连续 | 行成表
             if (t.indexOf("|") >= 0 && i + 1 < lines.length) {
               var next = lines[i + 1].trim();
@@ -742,7 +895,7 @@ window.__ModuleLoader__.load({
           var tm = content.match(/^\[([ xX])\]\s+(.*)$/);
           if (tm) {
             var ck = tm[1].toLowerCase() === "x" ? " checked" : "";
-            return '<input type="checkbox" disabled' + ck + '> ' + im(tm[2]);
+            return '<input type="checkbox"' + ck + '> ' + im(tm[2]);
           }
           return im(content);
         }
@@ -783,6 +936,34 @@ window.__ModuleLoader__.load({
         return bodyHtml;
       }
 
+      // ─── 黑白线条图标库（stroke=currentColor，随主题/悬停变色，避免 emoji 彩色不统一）──
+      var CCV_ICONS = {
+        ask: '<path d="M4 5h16v11H10l-6 4z"/>',
+        highlight: '<path d="M12 4.5a4.5 4.5 0 0 0-2.6 8.2c.6.4 1.1 1.2 1.1 2v.8h3v-.8c0-.8.5-1.6 1.1-2A4.5 4.5 0 0 0 12 4.5z"/><path d="M9.5 19h5M10.5 21.5h3"/><path d="M12 1.5v2M5.6 3.6L7 5M18.4 3.6L17 5M3 9h2M21.5 9h-2"/>',
+        clear: '<path d="M16 4l4 4-9 9H7l-3-3L16 4z"/><path d="M5 21h14"/><path d="M11 9l4 4"/>',
+        uploadImage: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 16v-5M9.5 13.5L12 11l2.5 2.5"/>',
+        globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c3.2 2.7 3.2 14.3 0 17-3.2-2.7-3.2-14.3 0-17z"/>',
+        file: '<path d="M13.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5L13.5 3z"/><path d="M13.5 3v5.5H19"/>',
+        table: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9.5h18M9.5 9.5V20M15.5 9.5V20"/>',
+        task: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8.5 12.5l2.5 2.5 5-5.5"/>',
+        listUl: '<path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1.2"/><circle cx="4.5" cy="12" r="1.2"/><circle cx="4.5" cy="18" r="1.2"/>',
+        listOl: '<path d="M10 6h10M10 12h10M10 18h10"/><text x="2.5" y="8.5" font-size="7.5" stroke="none" fill="currentColor">1</text><text x="2.5" y="14.5" font-size="7.5" stroke="none" fill="currentColor">2</text><text x="2.5" y="20.5" font-size="7.5" stroke="none" fill="currentColor">3</text>',
+        link: '<path d="M9.5 14.5a4 4 0 0 0 5.7 0l3.2-3.2a4 4 0 1 0-5.7-5.7l-1.6 1.6"/><path d="M14.5 9.5a4 4 0 0 0-5.7 0l-3.2 3.2a4 4 0 1 0 5.7 5.7l1.6-1.6"/>',
+        code: '<path d="M8.5 7.5L4 12l4.5 4.5M15.5 7.5L20 12l-4.5 4.5"/>',
+        codeBlock: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9.5 10L7 12.5 9.5 15M14.5 10l2.5 2.5-2.5 2.5"/>',
+        quote: '<path d="M10 6H5.5v5H9c0 2.5-1.2 3.8-3.5 4M18.5 6H14v5h3.5c0 2.5-1.2 3.8-3.5 4"/>',
+        hr: '<path d="M4 12h16"/>',
+        hlBlock: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7 12h10" stroke-width="2.4"/>',
+        indent: '<path d="M4 5h16M10 10h10M10 14h10M4 19h16M7 9.5L4.5 12 7 14.5"/>',
+        outdent: '<path d="M4 5h16M10 10h10M10 14h10M4 19h16M4.5 9.5L7 12l-2.5 2.5"/>',
+      }
+      function ccvIcon(name, size) {
+        var body = CCV_ICONS[name]
+        if (!body) return ""
+        var s = size || 15
+        return '<svg viewBox="0 0 24 24" width="' + s + '" height="' + s + '" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="display:block">' + body + '</svg>'
+      }
+
       // ─── 划词栏（参考豆包样式）──────────────────────
       // 下拉菜单状态 + 选区保存
       var activeDropdown = null
@@ -805,13 +986,37 @@ window.__ModuleLoader__.load({
         activeDropdown = null
       }
 
-      function showDropdown(anchor, items, onSelect) {
+      // 菜单在任意屏幕坐标打开（右键菜单用）；showDropdown 走 anchor 定位也归到这里
+      function openDropdownAt(left, top, items, onSelect) {
         closeDropdowns()
         saveSelection()
         var dd = document.createElement('div')
         dd.className = 'ccv-dropdown'
-        dd.style.cssText = 'position:fixed;z-index:2147483001;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border:1px solid rgba(128,128,128,.2);border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.15);padding:4px 0;min-width:140px;font-size:13px;color:#1a1a1a'
-        // 先添加所有内容
+        // 黑白极简：不透明底、细灰边、轻阴影，无毛玻璃无彩色
+        dd.style.cssText = 'position:fixed;z-index:2147483001;background:var(--dsw-alias-bg-overlay,#fff);border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.35));border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.1);padding:4px 0;min-width:160px;max-width:320px;font-size:13px;color:var(--dsw-alias-label-primary,#1a1a1a);max-height:72vh;overflow-y:auto'
+        // 图标：SVG 用 innerHTML（线条图标），纯文本（如 ¹）用 textContent
+        function iconSpan(icon) {
+          var ic = document.createElement('span')
+          if (icon.indexOf('<svg') === 0) ic.innerHTML = icon
+          else ic.textContent = icon
+          ic.style.cssText = 'width:18px;display:flex;justify-content:center;flex:0 0 auto'
+          return ic
+        }
+        function addRow(item) {
+          var row = document.createElement('div')
+          row.style.cssText = 'padding:7px 14px;cursor:pointer;display:flex;align-items:center;gap:9px;transition:background .1s;border-radius:0;white-space:nowrap'
+          if (item.icon) row.appendChild(iconSpan(item.icon))
+          var lb = document.createElement('span')
+          lb.textContent = item.label
+          row.appendChild(lb)
+          if (item.style) row.style.cssText += ';' + item.style
+          // 选中态：黑白线条风 = 1px currentColor 描边 + 加粗，不用彩色
+          if (item.active) { row.style.boxShadow = 'inset 0 0 0 1px currentColor'; row.style.fontWeight = '600' }
+          row.addEventListener('mouseenter', function() { row.style.background = 'rgba(128,128,128,.12)' })
+          row.addEventListener('mouseleave', function() { row.style.background = 'transparent' })
+          row.addEventListener('click', function(e) { e.stopPropagation(); closeDropdowns(); onSelect(item) })
+          dd.appendChild(row)
+        }
         items.forEach(function(item) {
           if (item.type === 'sep') {
             var sep = document.createElement('div')
@@ -819,35 +1024,364 @@ window.__ModuleLoader__.load({
             dd.appendChild(sep)
             return
           }
-          var row = document.createElement('div')
-          row.style.cssText = 'padding:6px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;transition:background .1s;border-radius:0'
-          row.textContent = item.label
-          if (item.style) row.style.cssText += ';' + item.style
-          if (item.active) { row.style.background = 'rgba(59,130,246,.1)'; row.style.color = '#3b82f6' }
-          row.addEventListener('mouseenter', function() { row.style.background = 'rgba(128,128,128,.1)' })
-          row.addEventListener('mouseleave', function() { row.style.background = item.active ? 'rgba(59,130,246,.1)' : 'transparent' })
-          row.addEventListener('click', function(e) { e.stopPropagation(); closeDropdowns(); onSelect(item) })
-          dd.appendChild(row)
+          if (item.type === 'header') {
+            // 分组标题：不可点，小号灰字、加字距
+            var hd = document.createElement('div')
+            hd.style.cssText = 'padding:6px 14px 2px;font-size:11px;color:rgba(128,128,128,.75);letter-spacing:.5px;user-select:none;-webkit-user-select:none;white-space:nowrap'
+            hd.textContent = item.label
+            dd.appendChild(hd)
+            return
+          }
+          if (item.type === 'row') {
+            // 横排：多个紧凑按钮挤一行（块区四个常用项），省菜单高度
+            var rr = document.createElement('div')
+            rr.style.cssText = 'display:flex;align-items:center;gap:2px;padding:2px 8px'
+            item.items.forEach(function(sub) {
+              var b = document.createElement('div')
+              b.style.cssText = 'flex:1 1 0;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 8px;cursor:pointer;border-radius:6px;white-space:nowrap;min-width:0'
+              if (sub.icon) b.appendChild(iconSpan(sub.icon))
+              var sl = document.createElement('span')
+              sl.textContent = sub.label
+              b.appendChild(sl)
+              b.addEventListener('mouseenter', function() { b.style.background = 'rgba(128,128,128,.12)' })
+              b.addEventListener('mouseleave', function() { b.style.background = 'transparent' })
+              b.addEventListener('click', function(e) { e.stopPropagation(); closeDropdowns(); onSelect(sub) })
+              rr.appendChild(b)
+            })
+            dd.appendChild(rr)
+            return
+          }
+          addRow(item)
         })
         document.body.appendChild(dd)
-        // 再测量并定位
-        var rect = anchor.getBoundingClientRect()
+        // 先挂载量尺寸，再夹到视口内；下方放不下就翻到坐标上方
         var ddWidth = dd.offsetWidth
         var ddHeight = dd.offsetHeight
-        var left = rect.left
-        if (left + ddWidth > window.innerWidth - 8) left = rect.right - ddWidth
-        if (left < 8) left = 8
-        var top = rect.bottom + 4
-        if (top + ddHeight > window.innerHeight - 8) top = Math.max(8, rect.top - ddHeight - 4)
-        dd.style.left = left + 'px'
-        dd.style.top = top + 'px'
+        var x = Math.max(8, Math.min(left, window.innerWidth - ddWidth - 8))
+        var y = top
+        if (y + ddHeight > window.innerHeight - 8) y = Math.max(8, top - ddHeight - 4)
+        dd.style.left = x + 'px'
+        dd.style.top = y + 'px'
         activeDropdown = dd
-        // 点击外部关闭
+        // 点击外部关闭；没点菜单就关掉的话，保存的选区一并作废（防止之后误插到旧位置）
         setTimeout(function() {
           document.addEventListener('mousedown', function close(ev) {
-            if (!dd.contains(ev.target)) { closeDropdowns(); document.removeEventListener('mousedown', close) }
+            if (!dd.contains(ev.target)) { closeDropdowns(); savedRange = null; document.removeEventListener('mousedown', close) }
           })
         }, 0)
+      }
+
+      function showDropdown(anchor, items, onSelect) {
+        var rect = anchor.getBoundingClientRect()
+        openDropdownAt(rect.left, rect.bottom + 4, items, onSelect)
+      }
+
+      // ─── 画布命令统一分发（划词栏 / ⋮ / 右键菜单共用）──────────
+      function escHtml(s) {
+        return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+      }
+      // 插入时用 host 接口地址，图/链接当场就能显示；htmlToMd 的 assetMdPath
+      // 存盘时再换回 attachments/ 相对路径，两边互逆
+      function assetDisplayUrl(p) {
+        if (/^attachments\//.test(p)) return "/api/canvas/file?name=" + encodeURIComponent(p)
+        return p
+      }
+      function selectionText() {
+        var sel = document.getSelection()
+        return sel ? sel.toString() : ""
+      }
+      function currentRange() {
+        var s = document.getSelection()
+        return (s && s.rangeCount) ? s.getRangeAt(0).cloneRange() : null
+      }
+      // 异步上传完成后在原光标处插 HTML：先聚焦编辑器、找回范围再 insertHTML
+      function insertHtmlAtRange(html, rng) {
+        var ed = editorRef.current
+        if (!ed) return
+        ed.focus()
+        if (rng) {
+          try { var s = document.getSelection(); s.removeAllRanges(); s.addRange(rng) } catch (_) {}
+        }
+        document.execCommand("insertHTML", false, html)
+      }
+      // 上传文件 → host /api/canvas/upload → 返回相对路径 attachments/xxx
+      function uploadCanvasFile(file, onOk, onFail) {
+        try {
+          fetch("/api/canvas/upload?name=" + encodeURIComponent(file.name || "file.bin"), {
+            method: "POST",
+            headers: { "Content-Type": file.type || "application/octet-stream" },
+            body: file
+          }).then(function(r) { return r.json() }).then(function(d) {
+            if (d && d.ok && d.path) onOk(d.path, file.name || "图片")
+            else onFail(file)
+          }).catch(function() { onFail(file) })
+        } catch (e) { onFail(file) }
+      }
+      // 上传失败兜底：图片转 dataURL 内嵌（md 会变大，仅作 fallback）
+      function fileToDataUrl(file, cb) {
+        try {
+          var fr = new FileReader()
+          fr.onload = function() { cb(String(fr.result)) }
+          fr.onerror = function() { cb("") }
+          fr.readAsDataURL(file)
+        } catch (_) { cb("") }
+      }
+      // 打开系统文件选择框，选中后回调（菜单点击是用户手势，input.click() 能弹出）
+      function pickFile(accept, cb) {
+        var inp = document.createElement("input")
+        inp.type = "file"
+        if (accept) inp.accept = accept
+        inp.style.display = "none"
+        document.body.appendChild(inp)
+        inp.addEventListener("change", function() {
+          var f = inp.files && inp.files[0]
+          if (f) cb(f)
+          inp.remove()
+        })
+        inp.click()
+      }
+      function insertTableHtml(rows, cols) {
+        var html = "<table>"
+        for (var r = 0; r < rows; r++) {
+          html += "<tr>"
+          for (var c = 0; c < cols; c++) html += (r === 0 ? "<th>表头</th>" : "<td></td>")
+          html += "</tr>"
+        }
+        html += "</table><div><br></div>"
+        document.execCommand("insertHTML", false, html)
+      }
+      // 问 AI：选中文本以引用块格式塞进 DSH 输入框（划词栏💬与右键菜单共用）
+      function askAiFromSelection() {
+        var sel = document.getSelection()
+        var text = sel ? sel.toString().trim() : ''
+        if (!text) { alert('请先选中要问 AI 的文本'); return }
+        hideSelbar()
+        var input =
+          document.querySelector('div[data-composer-input="true"]') ||
+          document.querySelector('[data-slot="conversation.input"] textarea') ||
+          document.querySelector('[data-slot="conversation.composer"] textarea') ||
+          document.querySelector('[data-slot="conversation.composer.bar"] textarea') ||
+          document.querySelector('[data-pane="conversation"] textarea') ||
+          document.querySelector('textarea[placeholder*="发消息"]') ||
+          document.querySelector('textarea[placeholder*="说话"]') ||
+          document.querySelector('textarea[placeholder*="消息"]') ||
+          document.querySelector('textarea[placeholder*="输入"]') ||
+          document.querySelector('[contenteditable="true"][role="textbox"]')
+        if (input) {
+          if (input.tagName === 'TEXTAREA') {
+            var quote = '> ' + text + '\n\n'
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
+            nativeInputValueSetter.call(input, quote + input.value)
+            input.dispatchEvent(new Event('input', { bubbles: true }))
+          } else {
+            // 新版 DSH 用 Lexical 编辑器：优先走官方 inputActions.setDraft（能保留换行）
+            var draftState = window.__ccvInputState
+            var curDraft = (draftState && draftState.draft) ? draftState.draft : ''
+            var newDraft = '> ' + text + '\n\n' + curDraft
+            if (window.__ccvInputActions && window.__ccvInputActions.setDraft) {
+              window.__ccvInputActions.setDraft(newDraft)
+            } else {
+              // fallback: 直接写 DOM + 派发 input
+              var escTxt = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+              var quoteHtml = '<div>> ' + escTxt + '</div><div><br></div><div><br></div>'
+              input.innerHTML = quoteHtml + input.innerHTML
+              input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '> ' + text }))
+            }
+          }
+          input.focus()
+        }
+      }
+      function runCanvasCmd(cmd) {
+        restoreSelection()
+        var text
+        switch (cmd) {
+          case "highlight": {
+            text = selectionText()
+            if (!text) return true
+            document.execCommand("insertHTML", false, "<mark>" + escHtml(text) + "</mark>")
+            break
+          }
+          case "clearFormat": {
+            document.execCommand("removeFormat", false, null)
+            // removeFormat 管不到自定义的 <mark> 和 <a>：选区内的手动拆掉。
+            // 脚注引用 [1]（href="#fn-…"）是内容标记不是格式，保留
+            try {
+              var ed3 = editorRef.current
+              var s3 = document.getSelection()
+              if (ed3 && s3 && s3.rangeCount) {
+                var rg = s3.getRangeAt(0)
+                var marks = ed3.querySelectorAll("mark")
+                for (var mi = marks.length - 1; mi >= 0; mi--) {
+                  if (rg.intersectsNode(marks[mi])) {
+                    var pMark = marks[mi].parentNode
+                    while (marks[mi].firstChild) pMark.insertBefore(marks[mi].firstChild, marks[mi])
+                    pMark.removeChild(marks[mi])
+                  }
+                }
+                var links = ed3.querySelectorAll("a")
+                for (var ai = links.length - 1; ai >= 0; ai--) {
+                  var lh = links[ai].getAttribute("href") || ""
+                  if (lh.indexOf("#fn") === 0) continue
+                  if (rg.intersectsNode(links[ai])) {
+                    var pA = links[ai].parentNode
+                    while (links[ai].firstChild) pA.insertBefore(links[ai].firstChild, links[ai])
+                    pA.removeChild(links[ai])
+                  }
+                }
+              }
+            } catch (_) {}
+            break
+          }
+          case "inlineCode": {
+            text = selectionText() || "code"
+            document.execCommand("insertHTML", false, '<code style="background:rgba(136,136,136,.15);padding:1px 4px;border-radius:3px;font-family:monospace;font-size:.9em">' + escHtml(text) + '</code>')
+            break
+          }
+          case "codeBlock": {
+            text = selectionText() || "code"
+            document.execCommand("insertHTML", false, '<pre style="background:#f5f5f5;padding:12px 16px;border-radius:6px;font-family:monospace;font-size:13px;line-height:1.5;overflow-x:auto;white-space:pre"><code>' + escHtml(text) + '</code></pre><div><br></div>')
+            break
+          }
+          case "blockquote": {
+            text = selectionText() || "引用内容"
+            document.execCommand("insertHTML", false, '<blockquote style="border-left:3px solid #ccc;padding-left:12px;margin:8px 0;color:#666">' + escHtml(text) + '</blockquote><div><br></div>')
+            break
+          }
+          case "link": {
+            var url = prompt("请输入链接地址：", "https://")
+            if (url) {
+              text = selectionText().trim() || "链接文字"
+              document.execCommand("insertHTML", false, '<a href="' + escHtml(url) + '" style="color:#3b82f6;text-decoration:underline">' + escHtml(text) + '</a>')
+            }
+            break
+          }
+          case "footnote": {
+            // 脚注：自动生成编号，插入引用标记，并在文末添加定义
+            var label = prompt("脚注标签（如 1、2、a）：", "")
+            if (label) {
+              var html = '<a href="#fn-' + escHtml(label) + '" id="fnref-' + escHtml(label) + '" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[' + escHtml(label) + ']</a>'
+              document.execCommand("insertHTML", false, html)
+              var ed = editorRef.current
+              if (ed) {
+                var existing = ed.querySelector('#fn-' + label)
+                if (!existing) {
+                  var fnDiv = ed.querySelector('.footnotes')
+                  if (!fnDiv) {
+                    fnDiv = document.createElement('div')
+                    fnDiv.className = 'footnotes'
+                    fnDiv.innerHTML = '<hr/>'
+                    var ol = document.createElement('ol')
+                    fnDiv.appendChild(ol)
+                    ed.appendChild(fnDiv)
+                  }
+                  var ol2 = fnDiv.querySelector('ol')
+                  var li = document.createElement('li')
+                  li.id = 'fn-' + label
+                  li.innerHTML = '脚注 ' + escHtml(label) + ' 的内容 <a href="#fnref-' + escHtml(label) + '" contenteditable="false" style="color:#3b82f6;text-decoration:none">↩</a>'
+                  ol2.appendChild(li)
+                  li.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                }
+              }
+            }
+            break
+          }
+          case "uploadImage": {
+            var rngImg = currentRange()
+            pickFile("image/*", function(f) {
+              uploadCanvasFile(f, function(p, name) {
+                insertHtmlAtRange('<img src="' + escHtml(assetDisplayUrl(p)) + '" alt="' + escHtml(name) + '" style="max-width:100%;height:auto;vertical-align:middle"/>', rngImg)
+              }, function(f2) {
+                fileToDataUrl(f2, function(u) {
+                  if (u) insertHtmlAtRange('<img src="' + u + '" alt="" style="max-width:100%;height:auto;vertical-align:middle"/>', rngImg)
+                  else alert("图片上传失败")
+                })
+              })
+            })
+            break
+          }
+          case "imageUrl": {
+            var iurl = prompt("请输入图片地址：", "https://")
+            if (iurl) document.execCommand("insertHTML", false, '<img src="' + escHtml(iurl) + '" alt="" style="max-width:100%;height:auto;vertical-align:middle"/>')
+            break
+          }
+          case "uploadFile": {
+            var rngFile = currentRange()
+            pickFile("", function(f) {
+              uploadCanvasFile(f, function(p, name) {
+                insertHtmlAtRange('<a href="' + escHtml(assetDisplayUrl(p)) + '">' + escHtml(name) + '</a>', rngFile)
+              }, function() { alert("文件上传失败") })
+            })
+            break
+          }
+          case "insertTable": {
+            var rc = prompt("表格行数×列数（如 3×4）：", "3×3")
+            if (rc) {
+              var mm = rc.match(/(\d+)\s*[×xX*]\s*(\d+)/)
+              if (mm) insertTableHtml(Math.max(1, Math.min(50, +mm[1])), Math.max(1, Math.min(20, +mm[2])))
+              else alert("格式不对，示例：3×4")
+            }
+            break
+          }
+          case "insertTaskList": {
+            document.execCommand("insertHTML", false, '<ul><li><input type="checkbox"> 任务事项</li></ul><div><br></div>')
+            break
+          }
+          case "highlightBlock": {
+            text = selectionText()
+            var inner = text ? escHtml(text) : "高亮内容"
+            document.execCommand("insertHTML", false, '<div class="ccv-hl"><p>' + inner + '</p></div><div><br></div>')
+            break
+          }
+          case "indent": document.execCommand("indent", false, null); break
+          case "outdent": document.execCommand("outdent", false, null); break
+          default: return false
+        }
+        if (editorRef.current) editorRef.current.focus()
+        return true
+      }
+      // ─── 右键菜单（桌面端插入入口）──────────────────────
+      function showContextMenu(x, y) {
+        var hasSel = selectionText().trim().length > 0
+        var items = [
+          { label: "问AI", cmd: "askAI", icon: ccvIcon("ask") },
+          { type: "sep" },
+          { type: "header", label: "常用" },
+          { label: "上传图片…", cmd: "uploadImage", icon: ccvIcon("uploadImage") },
+          { label: "网络图片…", cmd: "imageUrl", icon: ccvIcon("globe") },
+          { label: "上传文件…", cmd: "uploadFile", icon: ccvIcon("file") },
+          { label: "插入表格…", cmd: "insertTable", icon: ccvIcon("table") },
+          { label: "插入链接…", cmd: "link", icon: ccvIcon("link") },
+          { type: "row", items: [
+            { label: "无序列表", cmd: "insertUnorderedList", icon: ccvIcon("listUl") },
+            { label: "有序列表", cmd: "insertOrderedList", icon: ccvIcon("listOl") },
+            { label: "任务列表", cmd: "insertTaskList", icon: ccvIcon("task") },
+          ]},
+          { type: "sep" },
+          { type: "header", label: "块" },
+          { type: "row", items: [
+            { label: "代码块", cmd: "codeBlock", icon: ccvIcon("codeBlock") },
+            { label: "引用", cmd: "blockquote", icon: ccvIcon("quote") },
+            { label: "分割线", cmd: "insertHorizontalRule", icon: ccvIcon("hr") },
+            { label: "高亮块", cmd: "highlightBlock", icon: ccvIcon("hlBlock") },
+          ]},
+          { type: "sep" },
+          { label: "增加缩进", cmd: "indent", icon: ccvIcon("indent") },
+          { label: "减少缩进", cmd: "outdent", icon: ccvIcon("outdent") },
+        ]
+        if (hasSel) {
+          items.push(
+            { type: "sep" },
+            { type: "header", label: "转换为" },
+            { label: "代码块", cmd: "codeBlock", icon: ccvIcon("codeBlock") },
+            { label: "引用", cmd: "blockquote", icon: ccvIcon("quote") },
+            { label: "高亮", cmd: "highlight", icon: ccvIcon("highlight") },
+            { label: "链接", cmd: "link", icon: ccvIcon("link") }
+          )
+        }
+        openDropdownAt(x, y, items, function(item) {
+          if (item.cmd === "askAI") { askAiFromSelection(); return }
+          if (!runCanvasCmd(item.cmd)) document.execCommand(item.cmd, false, item.val)
+        })
       }
 
       // 标题下拉菜单
@@ -885,7 +1419,7 @@ window.__ModuleLoader__.load({
       }
 
       var SELBAR_ITEMS = [
-        { label: "💬 问AI", title: "将选中文本发送给 AI 问答", isAskAI: true },
+        { label: ccvIcon("ask") + '<span style="margin-left:5px">问AI</span>', title: "将选中文本发送给 AI 问答", isAskAI: true },
         { type: "sep" },
         { label: "H", cmd: "formatBlock", val: "<h2>", title: "标题", isHeading: true, hasDropdown: true },
         { type: "sep" },
@@ -895,85 +1429,42 @@ window.__ModuleLoader__.load({
         { label: "<i>I</i>", cmd: "italic", title: "斜体" },
         { label: "<s>S</s>", cmd: "strikeThrough", title: "删除线" },
         { label: "U", cmd: "underline", title: "下划线", style: "text-decoration:underline" },
+        { label: ccvIcon("highlight"), cmd: "highlight", title: "高亮" },
+        { label: ccvIcon("clear"), cmd: "clearFormat", title: "清除格式" },
         { type: "sep" },
         { label: "⋮", title: "更多功能", hasDropdown: true, showFullMenu: true },
       ]
 
-      // ─── 完整功能菜单（点击⋮展开）──────────────────────
+      // ─── 全功能菜单（⋮：移动端唯一入口，格式+插入都在）──────────────
       function showFullMenu(anchor) {
         var items = [
-          { label: "行内代码", cmd: "inlineCode", icon: "`" },
-          { label: "代码块", cmd: "codeBlock", icon: "{}" },
-          { label: "引用", cmd: "blockquote", icon: "「」" },
+          { type: "header", label: "格式" },
+          { label: "行内代码", cmd: "inlineCode", icon: ccvIcon("code") },
+          { label: "高亮", cmd: "highlight", icon: ccvIcon("highlight") },
+          { label: "清除格式", cmd: "clearFormat", icon: ccvIcon("clear") },
           { label: "脚注", cmd: "footnote", icon: "¹" },
-          { type: "sep" },
-          { label: "无序列表", cmd: "insertUnorderedList", icon: "≡" },
-          { label: "有序列表", cmd: "insertOrderedList", icon: "1." },
-          { type: "sep" },
-          { label: "链接", cmd: "link", icon: "🔗" },
-          { label: "分割线", cmd: "insertHorizontalRule", icon: "—" },
+          { type: "header", label: "插入" },
+          { label: "上传图片…", cmd: "uploadImage", icon: ccvIcon("uploadImage") },
+          { label: "网络图片…", cmd: "imageUrl", icon: ccvIcon("globe") },
+          { label: "上传文件…", cmd: "uploadFile", icon: ccvIcon("file") },
+          { label: "插入表格…", cmd: "insertTable", icon: ccvIcon("table") },
+          { label: "任务列表", cmd: "insertTaskList", icon: ccvIcon("task") },
+          { label: "无序列表", cmd: "insertUnorderedList", icon: ccvIcon("listUl") },
+          { label: "有序列表", cmd: "insertOrderedList", icon: ccvIcon("listOl") },
+          { label: "插入链接…", cmd: "link", icon: ccvIcon("link") },
+          { type: "header", label: "块" },
+          { type: "row", items: [
+            { label: "代码块", cmd: "codeBlock", icon: ccvIcon("codeBlock") },
+            { label: "引用", cmd: "blockquote", icon: ccvIcon("quote") },
+            { label: "分割线", cmd: "insertHorizontalRule", icon: ccvIcon("hr") },
+            { label: "高亮块", cmd: "highlightBlock", icon: ccvIcon("hlBlock") },
+          ]},
+          { type: "header", label: "缩进" },
+          { label: "增加缩进", cmd: "indent", icon: ccvIcon("indent") },
+          { label: "减少缩进", cmd: "outdent", icon: ccvIcon("outdent") },
         ]
         showDropdown(anchor, items, function(item) {
-          restoreSelection()
-          if (item.cmd === "inlineCode") {
-            var sel = document.getSelection()
-            var text = sel ? sel.toString() : "code"
-            var html = '<code style="background:rgba(136,136,136,.15);padding:1px 4px;border-radius:3px;font-family:monospace;font-size:.9em">' + text + '</code>'
-            document.execCommand("insertHTML", false, html)
-          } else if (item.cmd === "codeBlock") {
-            var sel = document.getSelection()
-            var text = sel ? sel.toString() : "code"
-            var html = '<pre style="background:#f5f5f5;padding:12px 16px;border-radius:6px;font-family:monospace;font-size:13px;line-height:1.5;overflow-x:auto;white-space:pre"><code>' + text + '</code></pre><div><br></div>'
-            document.execCommand("insertHTML", false, html)
-          } else if (item.cmd === "blockquote") {
-            var sel = document.getSelection()
-            var text = sel ? sel.toString() : "引用内容"
-            var html = '<blockquote style="border-left:3px solid #ccc;padding-left:12px;margin:8px 0;color:#666">' + text + '</blockquote><div><br></div>'
-            document.execCommand("insertHTML", false, html)
-          } else if (item.cmd === "link") {
-            var url = prompt("请输入链接地址：", "https://")
-            if (url) {
-              var sel = document.getSelection()
-              var text = sel ? sel.toString().trim() : "链接文字"
-              var html = '<a href="' + url + '" style="color:#3b82f6;text-decoration:underline">' + text + '</a>'
-              document.execCommand("insertHTML", false, html)
-            }
-          } else if (item.cmd === "footnote") {
-            // 脚注：自动生成编号，插入引用标记，并在文末添加定义
-            var label = prompt("脚注标签（如 1、2、a）：", "")
-            if (label) {
-              // 插入脚注引用：显示 [label]，点击跳到脚注
-              var html = '<a href="#fn-' + label + '" id="fnref-' + label + '" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[' + label + ']</a>'
-              document.execCommand("insertHTML", false, html)
-              // 在编辑器末尾追加脚注定义（如果不存在）
-              var ed = editorRef.current
-              if (ed) {
-                var existing = ed.querySelector('#fn-' + label)
-                if (!existing) {
-                  // 找到或创建 .footnotes 容器
-                  var fnDiv = ed.querySelector('.footnotes')
-                  if (!fnDiv) {
-                    fnDiv = document.createElement('div')
-                    fnDiv.className = 'footnotes'
-                    fnDiv.innerHTML = '<hr/>'
-                    var ol = document.createElement('ol')
-                    fnDiv.appendChild(ol)
-                    ed.appendChild(fnDiv)
-                  }
-                  var ol = fnDiv.querySelector('ol')
-                  var li = document.createElement('li')
-                  li.id = 'fn-' + label
-                  li.innerHTML = '脚注 ' + label + ' 的内容 <a href="#fnref-' + label + '" contenteditable="false" style="color:#3b82f6;text-decoration:none">↩</a>'
-                  ol.appendChild(li)
-                  // 滚动到脚注区域
-                  li.scrollIntoView({ behavior: 'smooth', block: 'center' })
-                }
-              }
-            }
-          } else {
-            document.execCommand(item.cmd, false, item.val)
-          }
-          if (editorRef.current) editorRef.current.focus()
+          if (!runCanvasCmd(item.cmd)) document.execCommand(item.cmd, false, item.val)
         })
       }
       var selectionFormats = { bold: false, italic: false, underline: false, heading: null }
@@ -1040,56 +1531,19 @@ window.__ModuleLoader__.load({
           else if (item.cmd === 'italic') isActive = selectionFormats.italic
           else if (item.cmd === 'underline') isActive = selectionFormats.underline
           else if (item.cmd === 'formatBlock' && item.val) isActive = selectionFormats.heading === item.val.replace('<','').replace('>','')
-          if (isActive) { btn.dataset.active = '1'; btn.style.background = 'rgba(59,130,246,.15)'; btn.style.color = 'var(--dsw-alias-brand-primary,#3b82f6)' }
+          // 选中态黑白反色：用主题变量的前景/背景互换，深浅主题都自动成立
+          if (isActive) { btn.dataset.active = '1'; btn.style.background = 'var(--dsw-alias-label-primary, #1a1a1a)'; btn.style.color = 'var(--dsw-alias-bg-overlay, #fff)' }
           btn.addEventListener('mousedown', function(e) { e.preventDefault() })
           btn.addEventListener('click', function(e) {
             e.stopPropagation()
             if (item.isAskAI) {
-              // 问 AI：获取选中文本，设置引用 + 插入到输入框
-              var sel = document.getSelection()
-              var text = sel ? sel.toString().trim() : ''
-              if (!text) { alert('请先选中要问 AI 的文本'); return }
-              hideSelbar()
-              // 插入到输入框（引用块格式）—— 兼容新旧版 DSH
-              var input =
-                document.querySelector('div[data-composer-input="true"]') ||
-                document.querySelector('[data-slot="conversation.input"] textarea') ||
-                document.querySelector('[data-slot="conversation.composer"] textarea') ||
-                document.querySelector('[data-slot="conversation.composer.bar"] textarea') ||
-                document.querySelector('[data-pane="conversation"] textarea') ||
-                document.querySelector('textarea[placeholder*="发消息"]') ||
-                document.querySelector('textarea[placeholder*="说话"]') ||
-                document.querySelector('textarea[placeholder*="消息"]') ||
-                document.querySelector('textarea[placeholder*="输入"]') ||
-                document.querySelector('[contenteditable="true"][role="textbox"]')
-              if (input) {
-                if (input.tagName === 'TEXTAREA') {
-                  var quote = '> ' + text + '\n\n'
-                  var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
-                  nativeInputValueSetter.call(input, quote + input.value)
-                  input.dispatchEvent(new Event('input', { bubbles: true }))
-                } else {
-                  // 新版 DSH 用 Lexical 编辑器：优先走官方 inputActions.setDraft（能保留换行）
-                  var draftState = window.__ccvInputState
-                  var curDraft = (draftState && draftState.draft) ? draftState.draft : ''
-                  var newDraft = '> ' + text + '\n\n' + curDraft
-                  if (window.__ccvInputActions && window.__ccvInputActions.setDraft) {
-                    window.__ccvInputActions.setDraft(newDraft)
-                  } else {
-                    // fallback: 直接写 DOM + 派发 input
-                    var escTxt = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-                    var quoteHtml = '<div>> ' + escTxt + '</div><div><br></div><div><br></div>'
-                    input.innerHTML = quoteHtml + input.innerHTML
-                    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '> ' + text }))
-                  }
-                }
-                input.focus()
-              }
+              // 问 AI：选中文本以引用格式塞进输入框（右键菜单同款逻辑）
+              askAiFromSelection()
             } else if (item.hasDropdown) {
               if (item.isHeading) showHeadingDropdown(btn)
               else if (item.showAlign) showAlignDropdown(btn)
               else if (item.showFullMenu) showFullMenu(btn)
-            } else {
+            } else if (!runCanvasCmd(item.cmd)) {
               document.execCommand(item.cmd, false, item.val)
               if (editorRef.current) editorRef.current.focus()
             }
@@ -1211,11 +1665,12 @@ window.__ModuleLoader__.load({
           ref: editorRef, className: "ccv-editor", contentEditable: true, suppressContentEditableWarning: true, style: S.editor,
           dangerouslySetInnerHTML: { __html: mdToHtml(content) },
           onInput: () => { clearTimeout(saveTimer.current); saveTimer.current = setTimeout(saveCanvas, 1500); },
-          onMouseUp: onEditorMouseUp
+          onMouseUp: onEditorMouseUp,
+          onContextMenu: (e) => { e.preventDefault(); showContextMenu(e.clientX, e.clientY) }
         }),
         // width:max-content + flexWrap:nowrap —— 让栏按内容取自然宽度，
         // 绝不被 left 位置挤窄；放不下时由 showSelbar 整体左移，而不是内部折行。
-        h("div", { id: "ccv-selbar", style: { position: "fixed", zIndex: 100000, display: "none", alignItems: "center", gap: 1, width: "max-content", maxWidth: "none", flexWrap: "nowrap", flexShrink: 0, background: "var(--dsw-specific-menu, var(--dsw-alias-bg-overlay, #fff))", color: "var(--dsw-alias-label-primary, #1a1a1a)", border: "1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.3))", borderRadius: 10, boxShadow: "0 4px 20px rgba(0,0,0,.15)", padding: "3px 6px", userSelect: "none", WebkitUserSelect: "none", backdropFilter: "blur(12px) saturate(150%)", WebkitBackdropFilter: "blur(12px) saturate(150%)", background: "rgba(255,255,255,.92)" } })
+        h("div", { id: "ccv-selbar", style: { position: "fixed", zIndex: 100000, display: "none", alignItems: "center", gap: 1, width: "max-content", maxWidth: "none", flexWrap: "nowrap", flexShrink: 0, background: "var(--dsw-specific-menu, var(--dsw-alias-bg-overlay, #fff))", color: "var(--dsw-alias-label-primary, #1a1a1a)", border: "1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.3))", borderRadius: 8, boxShadow: "0 6px 20px rgba(0,0,0,.1)", padding: "3px 6px", userSelect: "none", WebkitUserSelect: "none", backdropFilter: "blur(12px) saturate(150%)", WebkitBackdropFilter: "blur(12px) saturate(150%)" } })
       );
     }
 
@@ -1311,8 +1766,8 @@ window.__ModuleLoader__.load({
         onClick: toggle,
         style: {
           padding: "4px 10px", border: "1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35))",
-          borderRadius: 6, background: open ? "rgba(59,130,246,.15)" : "transparent",
-          color: open ? "var(--dsw-alias-brand-primary, #3b82f6)" : "var(--dsw-alias-label-primary, #1a1a1a)",
+          borderRadius: 6, background: open ? "rgba(128,128,128,.15)" : "transparent",
+          color: "var(--dsw-alias-label-primary, #1a1a1a)",
           cursor: "pointer", fontSize: 13, fontFamily: "inherit"
         },
         title: "话布编辑器"
@@ -1395,17 +1850,17 @@ window.__ModuleLoader__.load({
             '#collab-canvas-panel .ccv-tbtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15))}',
             '#collab-canvas-panel .ccv-tbtn:disabled{opacity:.35;cursor:default}',
             '#collab-canvas-panel .ccv-tbtn:disabled:hover{background:transparent}',
-            '#collab-canvas-panel .ccv-chip{display:flex;align-items:center;gap:6px;padding:4px 6px 4px 8px;background:var(--dsw-alias-interactive-bg-active,rgba(59,130,246,.16));border:1px solid var(--dsw-alias-brand-primary,rgba(59,130,246,.4));border-radius:7px;max-width:240px;min-width:56px;flex:0 1 auto;font-size:13px;color:inherit;cursor:pointer;user-select:none}',
+            '#collab-canvas-panel .ccv-chip{display:flex;align-items:center;gap:6px;padding:4px 6px 4px 8px;background:rgba(128,128,128,.08);border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));border-radius:7px;max-width:240px;min-width:56px;flex:0 1 auto;font-size:13px;color:inherit;cursor:pointer;user-select:none}',
             '#collab-canvas-panel .ccv-chip:hover{filter:brightness(1.06)}',
             '#collab-canvas-panel .ccv-chipwrap{position:relative;display:flex;min-width:0;flex:0 1 auto}',
             '#collab-canvas-panel .ccv-chip-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}',
             '#collab-canvas-panel .ccv-chip-caret{flex:0 0 auto;font-size:10px;line-height:1;opacity:.65}',
             '#collab-canvas-panel .ccv-spacer{flex:1 1 0%;min-width:6px}',
-            '#collab-canvas-panel .ccv-ninput{width:150px;flex:0 1 auto;min-width:64px;padding:4px 8px;border:1px solid var(--dsw-alias-brand-primary,rgba(59,130,246,.5));border-radius:6px;background:transparent;color:inherit;font-size:13px;font-family:inherit;outline:none;line-height:1.4}',
+            '#collab-canvas-panel .ccv-ninput{width:150px;flex:0 1 auto;min-width:64px;padding:4px 8px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.35));border-radius:6px;background:transparent;color:inherit;font-size:13px;font-family:inherit;outline:none;line-height:1.4}',
             '#collab-canvas-panel .ccv-drop{position:absolute;top:calc(100% + 3px);left:0;z-index:60;min-width:200px;max-width:min(260px,80vw);max-height:52vh;overflow-y:auto;background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:8px;padding:4px;box-shadow:0 4px 14px rgba(0,0,0,.12)}',
             '#collab-canvas-panel .ccv-drop-item{display:block;width:100%;text-align:left;padding:6px 8px;border:none;background:transparent;color:inherit;font-size:13px;font-family:inherit;cursor:pointer;border-radius:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;box-sizing:border-box}',
-            '#collab-canvas-panel .ccv-drop-item:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(59,130,246,.16))}',
-            '#collab-canvas-panel .ccv-drop-item[data-on="1"]{font-weight:600;background:var(--dsw-alias-interactive-bg-active,rgba(59,130,246,.2))}',
+            '#collab-canvas-panel .ccv-drop-item:hover{background:rgba(128,128,128,.12)}',
+            '#collab-canvas-panel .ccv-drop-item[data-on="1"]{font-weight:600;background:rgba(128,128,128,.1)}',
             '#collab-canvas-panel .ccv-drop-empty{padding:8px;opacity:.6;font-size:12px;text-align:center}',
             '#collab-canvas-panel .ccv-meter{font-size:11px;opacity:0;transition:opacity .15s ease;white-space:nowrap;user-select:none;font-variant-numeric:tabular-nums;flex:0 0 auto}',
             // 脚注区域样式
@@ -1434,6 +1889,11 @@ window.__ModuleLoader__.load({
             '#collab-canvas-panel .ccv-editor blockquote{border-left:3px solid var(--dsw-alias-border-l2,rgba(128,128,128,.4));margin:.6em 0;padding:4px 12px;opacity:.9;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.7))}',
             '#collab-canvas-panel .ccv-editor blockquote > *:first-child{margin-top:0}',
             '#collab-canvas-panel .ccv-editor blockquote > *:last-child{margin-bottom:0}',
+            '#collab-canvas-panel .ccv-editor mark{background:rgba(250,204,21,.45);color:inherit;padding:0 2px;border-radius:3px}',
+            '#collab-canvas-panel .ccv-editor .ccv-hl{background:rgba(250,204,21,.16);border-left:3px solid rgba(234,179,8,.55);border-radius:6px;padding:8px 14px;margin:.6em 0}',
+            '#collab-canvas-panel .ccv-editor .ccv-hl > *:first-child{margin-top:0}',
+            '#collab-canvas-panel .ccv-editor .ccv-hl > *:last-child{margin-bottom:0}',
+            '#collab-canvas-panel .ccv-editor input[type="checkbox"]{cursor:pointer}',
             '#collab-canvas-panel .ccv-editor pre{background:var(--dsw-alias-markdown-code-block,rgba(128,128,128,.12));padding:10px 12px;border-radius:6px;overflow-x:auto;white-space:pre-wrap;margin:.6em 0;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
             '#collab-canvas-panel .ccv-editor code{background:var(--dsw-alias-markdown-inline-code,rgba(128,128,128,.16));padding:1px 4px;border-radius:3px;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
             '#collab-canvas-panel .ccv-editor pre code{background:transparent;padding:0;border-radius:0}',
@@ -1448,7 +1908,9 @@ window.__ModuleLoader__.load({
             '#collab-canvas-panel .ccv-editor tr:nth-child(even){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08))}',
             '#collab-canvas-panel .ccv-editor tr:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(59,130,246,.08))}',
             '#collab-canvas-panel .ccv-editor hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));margin:1em 0}',
-            '#collab-canvas-panel .ccv-editor a{color:var(--dsw-alias-brand-primary,#3b82f6);text-decoration:none}',
+            '#collab-canvas-panel .ccv-editor a{color:#3b82f6;text-decoration:underline;cursor:pointer}',
+            // 脚注引用 [1] 和文末 ↩ 不是网页链接，保持无下划线、不做手型
+            '#collab-canvas-panel .ccv-editor a[href^="#fn"]{text-decoration:none;cursor:default}',
             '#collab-canvas-panel .ccv-editor img{max-width:100%;height:auto;vertical-align:middle}',
             '#collab-canvas-panel .ccv-editor strong{font-weight:600}',
             '#collab-canvas-panel .ccv-editor em{font-style:italic}',
