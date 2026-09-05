@@ -1045,16 +1045,30 @@ window.__ModuleLoader__.load({
               var text = sel ? sel.toString().trim() : ''
               if (!text) { alert('请先选中要问 AI 的文本'); return }
               hideSelbar()
-              // 插入到输入框（引用块格式）
-              var input = document.querySelector('[data-slot="conversation.input"] textarea') ||
-                          document.querySelector('[data-slot="conversation.composer"] textarea') ||
-                          document.querySelector('textarea[placeholder*="发消息"]') ||
-                          document.querySelector('textarea[placeholder*="说话"]')
+              // 插入到输入框（引用块格式）—— 多选择器兼容 DSH 不同版本
+              var input =
+                document.querySelector('[data-slot="conversation.input"] textarea') ||
+                document.querySelector('[data-slot="conversation.composer"] textarea') ||
+                document.querySelector('[data-slot="conversation.composer.bar"] textarea') ||
+                document.querySelector('[data-pane="conversation"] textarea') ||
+                document.querySelector('textarea[placeholder*="发消息"]') ||
+                document.querySelector('textarea[placeholder*="说话"]') ||
+                document.querySelector('textarea[placeholder*="消息"]') ||
+                document.querySelector('textarea[placeholder*="输入"]') ||
+                document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                document.querySelector('[data-slot="conversation"] [contenteditable="true"]')
               if (input) {
                 var quote = '> ' + text + '\n\n'
-                var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
-                nativeInputValueSetter.call(input, quote + input.value)
-                input.dispatchEvent(new Event('input', { bubbles: true }))
+                // 兼容 textarea 和 contentEditable 两种输入方式
+                if (input.tagName === 'TEXTAREA') {
+                  var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
+                  nativeInputValueSetter.call(input, quote + input.value)
+                  input.dispatchEvent(new Event('input', { bubbles: true }))
+                } else {
+                  // contentEditable: 直接设置 innerText 并触发 input 事件
+                  input.innerText = quote + input.innerText
+                  input.dispatchEvent(new Event('input', { bubbles: true }))
+                }
                 input.focus()
               }
             } else if (item.hasDropdown) {
