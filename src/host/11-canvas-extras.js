@@ -94,17 +94,24 @@ function initCanvasExtraEndpoints(ctx, webServer) {
     try {
       const map = regScanFolder(folder)
       let n = 0
-      map.forEach(arr => { n += arr.length })
+      const sigs = []
+      map.forEach(arr => { n += arr.length; arr.forEach(p => sigs.push(p)) })
+      sigs.sort()
+      const sig = n + '|' + sigs.join(',')
+      // 无变化的重扫（OneDrive 触碰文件、临时文件增删）静默处理，只留真正变化日志
+      const changed = sig !== regLastSig.get(folder)
+      regLastSig.set(folder, sig)
       regIndex.set(folder, map)
       regTotal = 0
       regIndex.forEach(m => { m.forEach(arr => { regTotal += arr.length }) })
-      console.log('[collab-canvas] registry scanned', folder, '->', n, 'files')
+      if (changed) console.log('[collab-canvas] registry scanned', folder, '->', n, 'files')
     } catch (e) { console.error('[collab-canvas] registry scan failed:', folder, e && e.message) }
   }
+  const regLastSig = new Map()   // folder -> 上次索引签名（文件数+路径集），无变化的重扫静默处理
   const regRescanTimers = new Map()
   function regScheduleRescan(folder) {
     if (regRescanTimers.has(folder)) return
-    const t = setTimeout(function () { regRescanTimers.delete(folder); regRescanFolder(folder) }, 1500)
+    const t = setTimeout(function () { regRescanTimers.delete(folder); regRescanFolder(folder) }, 3000)
     regRescanTimers.set(folder, t)
   }
   function regWatch(folder) {
@@ -205,23 +212,40 @@ function initCanvasExtraEndpoints(ctx, webServer) {
         try { await saveCanvas(c) } catch (e) { console.error('[collab-canvas] load-doc save failed:', e && e.message) }
         created = true
       }
+      sessAdd(url.searchParams.get('sid'), c.id)   // 登记即记入当前会话清单
       json(res, { ok: true, id: c.id, title: c.title, created: created })
     } catch (e) { error(res, 500, { ok: false, error: e.message }) }
   }}))
-  // GET /api/canvas/delete?id=xxx —— 删除话布（移出清单并删除 md 文件；管理/清重用途）
+  // GET /api/canvas/delete?id=xxx&sid=xxx —— 从当前会话清单移除画布；
+  // 若其他会话清单仍引用该画布则只摘引用保留文件，无人引用才连 md 一起删
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/delete', handler: async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
       const id = url.searchParams.get('id')
+      const sid = sessSafe(url.searchParams.get('sid'))
       const c = id ? canvases.get(id) : null
       if (!c) { error(res, 404, { ok: false, error: '画布不存在' }); return }
-      canvases.delete(id)
-      if (activeId === id) activeId = null
+      sessRemove(sid, id)
+      let referenced = false
       try {
-        if (c.filePath && nodefs.existsSync(c.filePath)) nodefs.unlinkSync(c.filePath)
-      } catch (e) { console.error('[collab-canvas] delete file failed:', e && e.message) }
-      persistMeta()
-      json(res, { ok: true, id: id, title: c.title })
+        const files = nodefs.readdirSync(sessDirPath())
+        for (const f of files) {
+          if (!f.endsWith('.json') || f === sessSafe(sid) + '.json') continue
+          try {
+            const j = JSON.parse(nodefs.readFileSync(path.join(sessDirPath(), f), 'utf8'))
+            if (Array.isArray(j.ids) && j.ids.indexOf(id) >= 0) { referenced = true; break }
+          } catch (_) {}
+        }
+      } catch (_) {}
+      if (!referenced) {
+        canvases.delete(id)
+        if (activeId === id) activeId = null
+        try {
+          if (c.filePath && nodefs.existsSync(c.filePath)) nodefs.unlinkSync(c.filePath)
+        } catch (e) { console.error('[collab-canvas] delete file failed:', e && e.message) }
+        persistMeta()
+      }
+      json(res, { ok: true, id: id, title: c.title, fileDeleted: !referenced })
     } catch (e) { error(res, 500, { ok: false, error: e.message }) }
   }}))
   // POST /api/canvas/import-doc?name=xxx —— 外部文档拖入/上传：复制到会话工作区
@@ -271,6 +295,7 @@ function initCanvasExtraEndpoints(ctx, webServer) {
         try { await saveCanvas(c) } catch (e) { console.error('[collab-canvas] open-upload save failed:', e && e.message) }
         created = true
       }
+      sessAdd(url.searchParams.get('sid'), c.id)   // 导入即记入当前会话清单
       json(res, { ok: true, id: c.id, title: c.title, created: created, matched: matched })
     } catch (e) { error(res, 500, { ok: false, error: e.message }) }
   }}))

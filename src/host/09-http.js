@@ -2,6 +2,64 @@
 // 路由：GET /api/canvas/list|read?id=xxx，POST /api/canvas/write|save|create
 // 用 ctx.inject(['webServer']) 确保 webServer 服务就绪后再注册
 
+// ─── 会话独立清单：每个会话记录自己新建/打开过的画布 ───
+// 元数据存 canvas-docs/.sessions/<sid>.json；文档 md 文件仍在共享池 canvas-docs/
+var sessStore = new Map()   // sid -> { activeId, ids: [] }
+var lastBrowserSid = 'default'   // 浏览器最近在看的会话键（AI 工具创建的画布归入它的清单）
+// 一次性迁移的持久化标记（.sessions/.migrated）：迁移执行过一次就永久生效，
+// 重启不再把全局画布重新挂回清单（之前标记是内存变量，重启清零导致删掉的清单复原）
+function sessMigratedAlready() {
+  try { return nodefs.existsSync(joinPath(sessDirPath(), '.migrated')) } catch (_) { return true }
+}
+function sessMarkMigrated() {
+  try { nodefs.writeFileSync(joinPath(sessDirPath(), '.migrated'), String(Date.now())) } catch (_) {}
+}
+var sessMigrated = false
+function sessDirPath() {
+  const d = joinPath(docsDir(), '.sessions')
+  try { nodefs.mkdirSync(d, { recursive: true }) } catch (_) {}
+  return d
+}
+function sessSafe(sid) { return String(sid || '').replace(/[^\w\u4e00-\u9fa5-]/g, '').slice(0, 80) || 'default' }
+function sessLoad(sid) {
+  try {
+    const j = JSON.parse(nodefs.readFileSync(joinPath(sessDirPath(), sessSafe(sid) + '.json'), 'utf8'))
+    if (j && Array.isArray(j.ids)) return { activeId: j.activeId || null, ids: j.ids.filter(x => canvases.has(x)) }
+  } catch (_) {}
+  return { activeId: null, ids: [] }
+}
+function sessPersist(sid, st) {
+  try { nodefs.writeFileSync(joinPath(sessDirPath(), sessSafe(sid) + '.json'), JSON.stringify({ activeId: st.activeId, ids: st.ids }, null, 2)) } catch (_) {}
+}
+function sessState(sid) {
+  sid = sessSafe(sid)
+  if (!sessStore.has(sid)) {
+    let st = sessLoad(sid)
+    // 一次性迁移：旧全局清单挂到重启后第一个使用的会话名下。
+    // 标记用持久化文件（.sessions/.migrated），内存标记会在重启后丢失、
+    // 导致每次重启都把全局画布重新挂回清单（用户删了又复现的根因）
+    if (!st.ids.length && canvases.size && !sessMigratedAlready()) {
+      st = { activeId: activeId, ids: Array.from(canvases.keys()) }
+      sessMarkMigrated()
+      sessPersist(sid, st)
+      console.log('[collab-canvas] 会话清单迁移:', sid, '<-', st.ids.join(','))
+    }
+    sessStore.set(sid, st)
+  }
+  return sessStore.get(sid)
+}
+function sessAdd(sid, id) {
+  const st = sessState(sid)
+  if (st.ids.indexOf(id) < 0) { st.ids.push(id); sessPersist(sid, st) }
+  if (st.activeId !== id) { st.activeId = id; sessPersist(sid, st) }
+}
+function sessRemove(sid, id) {
+  const st = sessState(sid)
+  st.ids = st.ids.filter(x => x !== id)
+  if (st.activeId === id) st.activeId = null
+  sessPersist(sid, st)
+}
+
 function initCanvasHttpEndpoints(ctx, webServer) {
   // JSON 响应辅助
   function json(res, data) {
@@ -24,18 +82,24 @@ function initCanvasHttpEndpoints(ctx, webServer) {
       req.on('error', reject)
     })
   }
-  // GET /api/canvas/list
+  // GET /api/canvas/list?sid=xxx —— 只返回该会话清单里的画布
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/list', handler: async (req, res) => {
+    const url = new URL(req.url, 'http://x')
+    const sid = sessSafe(url.searchParams.get('sid'))
+    lastBrowserSid = sid
+    const st = sessState(sid)
     const arr = []
-    canvases.forEach((c) => { arr.push({ id: c.id, title: c.title, version: c.version }) })
-    json(res, { ok: true, canvases: arr, activeId })
+    st.ids.forEach((id) => { const c = canvases.get(id); if (c) arr.push({ id: c.id, title: c.title, version: c.version }) })
+    json(res, { ok: true, canvases: arr, activeId: st.activeId })
   }}))
-  // GET /api/canvas/read?id=xxx
+  // GET /api/canvas/read?id=xxx —— 打开过就记入该会话清单
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/read', handler: async (req, res) => {
     const url = new URL(req.url, 'http://x')
     const id = url.searchParams.get('id')
     const c = id ? canvases.get(id) : (activeId ? canvases.get(activeId) : null)
     if (!c) { error(res, 404, { ok: false, error: '画布不存在' }); return }
+    sessAdd(url.searchParams.get('sid'), c.id)
+    lastBrowserSid = sessSafe(url.searchParams.get('sid'))
     json(res, { ok: true, id: c.id, title: c.title, content: c.content, version: c.version })
   }}))
   // POST /api/canvas/write
@@ -61,11 +125,13 @@ function initCanvasHttpEndpoints(ctx, webServer) {
       json(res, { ok: true, filePath: r.path })
     } catch (e) { error(res, 500, { ok: false, error: e.message }) }
   }}))
-  // POST /api/canvas/create
+  // POST /api/canvas/create?sid=xxx —— 新建即记入当前会话清单
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/create', handler: async (req, res) => {
     try {
+      const url = new URL(req.url, 'http://x')
       const body = await readBody(req)
       const c = createCanvasDoc(body.title || '新话布')
+      sessAdd(url.searchParams.get('sid'), c.id)
       json(res, { ok: true, id: c.id, title: c.title })
     } catch (e) { error(res, 500, { ok: false, error: e.message }) }
   }}))

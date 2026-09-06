@@ -6,27 +6,6 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
-    // 独立功能模块动态挂载（源码各自单文件维护，由 host 端点提供，读盘即最新，
-    // 改完刷新页面即可）。引导失败只影响对应功能，画布本体不受影响。
-    try {
-      if (!window.__ccvSideModulesBooted) {
-        window.__ccvSideModulesBooted = true;
-        ["/api/canvas/docdrop.js", "/api/canvas/doclink.js"].forEach(function (u) {
-          var name = u.slice(u.lastIndexOf("/") + 1);
-          fetch(u + "?ts=" + Date.now()).then(function (r) {
-            ccvLog(name + ": 源码拉取 HTTP " + r.status);
-            return r.ok ? r.text() : "";
-          }).then(function (src) {
-            if (!src) { ccvLog(name + ": 源码为空，跳过"); return; }
-            try {
-              new Function(src)();
-              ccvLog(name + ": 模块执行完成");
-            } catch (e) { ccvLog(name + ": 模块执行失败 " + (e && e.message)); }
-          }).catch(function (e) { ccvLog(name + ": 拉取失败 " + (e && e.message)); });
-        });
-      }
-    } catch (e) { try { ccvLog("侧模块引导异常 " + (e && e.message)); } catch (_) {} }
-
     const React = require("react");
     const ReactDOMClient = require("react-dom/client");
     const { createElement: h, useState, useEffect, useRef, useCallback } = React;
@@ -56,36 +35,6 @@ window.__ModuleLoader__.load({
     // ─── 诊断日志（排障用，可整段删除）────────────────────
     // 本环境开不了浏览器控制台，把划词链路的关键判定点发到 host，
     // 由 host 落盘到 %TEMP%/ccv-selbar.log，之后直接读文件复盘。
-    // ─── 会话标识：侧边栏「当前选中会话行」的标题 ───
-    // 选中行有独立的 selected 类，切会话即变、同会话稳定——比窗口标题可靠
-    //（窗口标题会随视图/加载状态变成无会话名的形态，导致键漂移）
-    function hashStr(s) {
-      let h = 5381;
-      for (let i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; }
-      return h.toString(36);
-    }
-    // 标题形如 "DeepSeek Harness - <会话名> — DeepSeek Harness"，随会话切换变化；
-    // 哈希保证不同会话不同键，同会话稳定。每个会话的画布清单互相独立。
-    function activeSessionTitle() {
-      try {
-        const row = document.querySelector('[class*="sessionRow"][class*="selected"]') ||
-                    document.querySelector('[class*="sessionRow"][class*="active"]');
-        if (!row) return null;
-        const t = row.querySelector('[class*="title"]');
-        const name = ((t || row).textContent || "").trim();
-        return name || null;
-      } catch (_) {}
-      return null;
-    }
-    function sessionKey() {
-      const name = activeSessionTitle();
-      if (name) return "sess-" + hashStr(name);
-      const t = (document.title || "默认会话").trim() || "默认会话";
-      return "t" + hashStr(t);
-    }
-    function canvasApi(path) {
-      try { return path + (path.indexOf("?") >= 0 ? "&" : "?") + "sid=" + encodeURIComponent(sessionKey()); } catch (_) { return path; }
-    }
     function ccvLog(msg) {
       try {
         fetch("/api/canvas/log", {
@@ -93,30 +42,8 @@ window.__ModuleLoader__.load({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ lines: [String(msg)] })
         }).then(function () {}, function () {});
-      } catch (_) {}
+      } catch (e) {}
     }
-    // 会话键同步：轮询当前会话键，变化时更新全局 sid（docdrop/doclink 读取）
-    try {
-      if (!window.__ccvSidTimer) {
-        window.__ccvSidTimer = setInterval(function () {
-          try {
-            const k = sessionKey();
-            if (window.__ccvSid !== k) {
-              const first = !window.__ccvSid;
-              window.__ccvSid = k;
-              ccvLog("会话键" + (first ? "" : " 更新") + ": " + k + (activeSessionTitle() ? " | 侧栏选中行命中" : " | 未识别到选中会话"));
-            }
-          } catch (_) {}
-        }, 2000);
-      }
-    } catch (_) {}
-    // 会话键诊断：每次页面加载记录一次解析结果，便于排障
-    try {
-      if (!window.__ccvSessKeyLogged) {
-        window.__ccvSessKeyLogged = true;
-        ccvLog("会话键: " + sessionKey() + " | 窗口标题: " + (document.title || ""));
-      }
-    } catch (_) {}
     function ccvDesc(el) {
       if (!el) return "null";
       return el.tagName + (el.id ? "#" + el.id : "") + (el.className && typeof el.className === "string" ? "." + el.className.split(/\s+/).slice(0, 2).join(".") : "");
@@ -497,64 +424,21 @@ window.__ModuleLoader__.load({
       }, [isFull]);
 
       useEffect(() => {
-        fetch(canvasApi("/api/canvas/list")).then(r => r.json()).then(d => {
-          // pending 时让位：doclink 链接点名要打开的画布优先于默认 activeId
-          if (d.ok) { setCanvases(d.canvases); if (d.activeId && !window.__ccvPendingCanvasId) loadCanvas(d.activeId); }
+        fetch("/api/canvas/list").then(r => r.json()).then(d => {
+          if (d.ok) { setCanvases(d.canvases); if (d.activeId) loadCanvas(d.activeId); }
         }).catch(() => {});
-      }, []);
-
-      // doclink 桥接：外部「文档名链接」点名要打开的画布（优先于默认 activeId），
-      // 打开状态下通过事件直接切换
-      useEffect(function () {
-        var pid = window.__ccvPendingCanvasId;
-        if (pid) { window.__ccvPendingCanvasId = null; loadCanvas(pid); }
-        function onOpen(e) {
-          var id = e.detail && e.detail.id;
-          if (!id) return;
-          loadCanvas(id);
-          // 新导入的画布不在清单里，顺手刷新下拉列表
-          fetch(canvasApi("/api/canvas/list")).then(r => r.json()).then(d => {
-            if (d.ok) setCanvases(d.canvases);
-          }).catch(() => {});
-        }
-        window.addEventListener('ccv-open-canvas', onOpen);
-        return function () { window.removeEventListener('ccv-open-canvas', onOpen); };
-      }, []);
-
-      // 清单轮询：AI 通过工具创建/加载的画布自动出现在下拉清单里（10 秒一次）
-      useEffect(function () {
-        var t = setInterval(function () {
-          try {
-            fetch(canvasApi("/api/canvas/list")).then(r => r.json()).then(d => {
-              if (d.ok) setCanvases(d.canvases);
-            }).catch(() => {});
-          } catch (_) {}
-        }, 10000);
-        return () => clearInterval(t);
       }, []);
 
       function loadCanvas(id) {
-        clearTimeout(saveTimer.current);   // 防竞态：切换前丢掉旧文档的待写自动保存
-        fetch(canvasApi("/api/canvas/read?id=" + encodeURIComponent(id))).then(r => r.json()).then(d => {
+        fetch("/api/canvas/read?id=" + encodeURIComponent(id)).then(r => r.json()).then(d => {
           if (d.ok) { setActiveId(d.id); setContent(d.content); setVersion(d.version); }
         }).catch(() => {});
-      }
-
-      // 删除话布：移出清单并删除对应 md 文件（host 端 /api/canvas/delete）
-      function deleteCanvasById(id, title) {
-        if (!confirm("确定删除话布「" + title + "」吗？\n对应的 md 文件也会一并删除，不可恢复。")) return;
-        fetch(canvasApi("/api/canvas/delete?id=" + encodeURIComponent(id))).then(r => r.json()).then(d => {
-          if (d.ok) {
-            setCanvases(prev => prev.filter(x => x.id !== id));
-            if (activeId === id) { setActiveId(null); setContent(""); setVersion(0); }
-          } else alert("删除失败: " + (d.error || "未知错误"));
-        }).catch(() => alert("删除失败"));
       }
 
       function saveCanvas() {
         if (!activeId || !editorRef.current) return;
         const md = htmlToMd(editorRef.current);
-        fetch(canvasApi("/api/canvas/write"), {
+        fetch("/api/canvas/write", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ id: activeId, content: md })
         }).then(r => r.json()).then(d => { if (d.ok) setVersion(d.version); }).catch(() => {});
@@ -568,43 +452,13 @@ window.__ModuleLoader__.load({
           .catch(e => { ccvLog("open-folder 请求失败: " + e); });
       }
 
-      // 「登记」：管理拖拽文件来源文件夹（host 端文件登记表，命中后按真实路径 @ 引用）
-      function manageRegistry() {
-        fetch("/api/canvas/registry").then(r => r.json()).then(d => {
-          if (!d.ok) { alert("读取登记信息失败"); return; }
-          const folders = d.folders || [];
-          const tip = folders.length
-            ? folders.map((f, i) => (i + 1) + ". " + f).join("\n") + "\n\n输入序号移除对应文件夹；或直接输入新的文件夹绝对路径添加："
-            : "尚未登记文件夹。\n输入要登记的文件夹绝对路径（之后拖拽该文件夹内的文件时，将按真实路径 @ 引用）：";
-          const ans = prompt("已登记 " + folders.length + " 个文件夹，共索引 " + (d.files || 0) + " 个文件。\n\n" + tip, "");
-          if (ans === null) return;
-          const t = ans.trim();
-          let next;
-          const idx = /^\d+$/.test(t) ? parseInt(t, 10) - 1 : -1;
-          if (idx >= 0 && idx < folders.length) {
-            next = folders.filter((_, i) => i !== idx);
-          } else if (t) {
-            next = folders.concat([t]);
-          } else {
-            return;
-          }
-          fetch("/api/canvas/registry", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ folders: next })
-          }).then(r => r.json()).then(d2 => {
-            if (d2.ok) alert("已更新登记文件夹（" + (d2.folders || []).length + " 个，索引 " + (d2.files || 0) + " 个文件，构建中）");
-            else alert("更新失败: " + (d2.error || "未知错误"));
-          }).catch(() => alert("更新失败"));
-        }).catch(() => alert("读取登记信息失败"));
-      }
-
       // ─── 顶栏：新建话布（行内输入框，替掉原生 prompt）──
       function startCreate() { setDropOpen(false); setNewTitle(""); setCreating(true); }
       function cancelCreate() { setCreating(false); setNewTitle(""); }
       function submitCreate() {
         const t = newTitle.trim();
         if (!t) { cancelCreate(); return; }
-        fetch(canvasApi("/api/canvas/create"), {
+        fetch("/api/canvas/create", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ title: t })
         }).then(r => r.json()).then(d => {
@@ -1677,8 +1531,8 @@ window.__ModuleLoader__.load({
           else if (item.cmd === 'italic') isActive = selectionFormats.italic
           else if (item.cmd === 'underline') isActive = selectionFormats.underline
           else if (item.cmd === 'formatBlock' && item.val) isActive = selectionFormats.heading === item.val.replace('<','').replace('>','')
-          // 选中态：灰色胶囊（不遮字、深浅主题都可读），替代之前的黑白反色
-          if (isActive) { btn.dataset.active = '1'; btn.style.background = 'rgba(128,128,128,.18)'; btn.style.color = 'var(--dsw-alias-label-primary, #1a1a1a)' }
+          // 选中态黑白反色：用主题变量的前景/背景互换，深浅主题都自动成立
+          if (isActive) { btn.dataset.active = '1'; btn.style.background = 'var(--dsw-alias-label-primary, #1a1a1a)'; btn.style.color = 'var(--dsw-alias-bg-overlay, #fff)' }
           btn.addEventListener('mousedown', function(e) { e.preventDefault() })
           btn.addEventListener('click', function(e) {
             e.stopPropagation()
@@ -1781,17 +1635,11 @@ window.__ModuleLoader__.load({
                   // 不是 fixed 浮层 —— 它属于顶栏的局部堆叠，不会脱离面板
                   dropOpen ? h("div", { className: "ccv-drop" },
                     canvases.length
-                      ? canvases.map(c => h("div", { key: c.id, className: "ccv-drop-row" },
-                          h("button", {
-                            className: "ccv-drop-item", "data-on": c.id === activeId ? "1" : "0",
-                            title: c.title,
-                            onClick: () => { loadCanvas(c.id); setDropOpen(false); }
-                          }, c.title),
-                          h("button", {
-                            className: "ccv-drop-x", title: "删除话布「" + c.title + "」（同时删除对应 md 文件）",
-                            onClick: (e) => { e.stopPropagation(); deleteCanvasById(c.id, c.title); }
-                          }, "×")
-                        ))
+                      ? canvases.map(c => h("button", {
+                          key: c.id, className: "ccv-drop-item", "data-on": c.id === activeId ? "1" : "0",
+                          title: c.title,
+                          onClick: () => { loadCanvas(c.id); setDropOpen(false); }
+                        }, c.title))
                       : h("div", { className: "ccv-drop-empty" }, "还没有话布，点 ＋ 新建一个")
                   ) : null
                 ),
@@ -1806,7 +1654,6 @@ window.__ModuleLoader__.load({
             h("button", { className: "ccv-tbtn", onClick: () => { if (activeId) loadCanvas(activeId); }, disabled: !activeId, title: "从服务端拉取最新内容 —— AI 在对话里改过话布后用它同步" }, "重载"),
             h("button", { className: "ccv-ibtn", onClick: openFolder, title: "在文件管理器中打开本文档所在的文件夹",
               dangerouslySetInnerHTML: { __html: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:auto"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>' } }),
-            h("button", { className: "ccv-tbtn", onClick: manageRegistry, title: "登记文件夹：之后把登记文件夹内的文件拖进 DSH 窗口时，按真实路径 @ 引用（不产生副本）" }, "登记"),
             h("div", { className: "ccv-spacer" }),
             h("span", {
               ref: meterRef, className: "ccv-meter",
@@ -1827,9 +1674,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-      // ─── Header 按钮组件 ─────────────────────────────────
-    // 当前存活的话布面板 React 根（跨 CanvasToggle 实例共享，保证全局最多一个面板）
-    var livePanelRoot = null
+    // ─── Header 按钮组件 ─────────────────────────────────
     function CanvasToggle({ ctx }) {
       const [open, setOpen] = useState(false);
       const [panelRoot, setPanelRoot] = useState(null);
@@ -1856,17 +1701,11 @@ window.__ModuleLoader__.load({
           compressMainContent(0);
           setOpen(false);
         } else {
-          // 先收掉可能残留的旧面板（切会话时旧实例卸载不彻底的遗留），保证全局最多一个
-          try { if (livePanelRoot) { livePanelRoot.unmount(); } } catch (_) {}
-          livePanelRoot = null;
-          var staleOld = document.getElementById("collab-canvas-panel");
-          if (staleOld) staleOld.remove();
           var div = document.createElement("div");
           div.id = "collab-canvas-panel";
           // 面板是 fixed 的，直接挂 body：不进 #root 的 Grid，不会成为 grid item
           document.body.appendChild(div);
           var r = ReactDOMClient.createRoot(div);
-          livePanelRoot = r;
           var avail = measureAvail();
           var w = Math.max(dragMin(avail), Math.min(dragMax(avail), Math.round(ratio * avail)));
           r.render(h(CanvasPanel, {
@@ -1881,12 +1720,6 @@ window.__ModuleLoader__.load({
           setOpen(true);
         }
       }, [open, panelRoot, ctx, ratio]);
-
-      // 对外桥接：doclink「文档名链接」通过这两个全局量打开话布并切换文档
-      useEffect(function () {
-        window.__ccvCanvasToggle = toggle;
-        window.__ccvPanelOpen = open;
-      }, [toggle, open]);
 
       // 监听左侧栏展开/收起、窗口 resize：保持 ratio，重新计算话布像素宽度
       const lastWRef = useRef(0);
@@ -1922,13 +1755,7 @@ window.__ModuleLoader__.load({
       }, [open, ratio]);
 
       useEffect(() => () => {
-        // 切换会话时本组件随旧会话头部卸载：把话布面板连根收起
-        //（卸载 React 根 + 移除面板 div + 清布局样式），
-        // 不留下失去悬浮定位的面板尸体（之前切会话后面板掉到页面底部的根因）
-        try { if (livePanelRoot) { livePanelRoot.unmount(); } } catch (_) {}
-        livePanelRoot = null;
-        var stale = document.getElementById("collab-canvas-panel");
-        if (stale) stale.remove();
+        if (panelRoot) { panelRoot.remove(); }
         var el = document.getElementById("root");
         if (el) el.classList.remove("ccv-open", "ccv-full");
         document.body.removeAttribute("data-ccv-dragging");
@@ -2034,10 +1861,6 @@ window.__ModuleLoader__.load({
             '#collab-canvas-panel .ccv-drop-item{display:block;width:100%;text-align:left;padding:6px 8px;border:none;background:transparent;color:inherit;font-size:13px;font-family:inherit;cursor:pointer;border-radius:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;box-sizing:border-box}',
             '#collab-canvas-panel .ccv-drop-item:hover{background:rgba(128,128,128,.12)}',
             '#collab-canvas-panel .ccv-drop-item[data-on="1"]{font-weight:600;background:rgba(128,128,128,.1)}',
-            '#collab-canvas-panel .ccv-drop-row{display:flex;align-items:center;gap:4px}',
-            '#collab-canvas-panel .ccv-drop-row .ccv-drop-item{flex:1 1 auto;min-width:0}',
-            '#collab-canvas-panel .ccv-drop-x{flex:0 0 auto;width:20px;height:24px;border:none;background:transparent;color:inherit;opacity:.45;cursor:pointer;font-size:14px;line-height:1;border-radius:4px}',
-            '#collab-canvas-panel .ccv-drop-x:hover{opacity:1;background:rgba(128,128,128,.18)}',
             '#collab-canvas-panel .ccv-drop-empty{padding:8px;opacity:.6;font-size:12px;text-align:center}',
             '#collab-canvas-panel .ccv-meter{font-size:11px;opacity:0;transition:opacity .15s ease;white-space:nowrap;user-select:none;font-variant-numeric:tabular-nums;flex:0 0 auto}',
             // 脚注区域样式
