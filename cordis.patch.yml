@@ -1,7 +1,4 @@
-# DSH Collab-Canvas 插件（单包双插件）
-# 在 profile package.json 的 dsh.profile.bundles 加入 "collab-canvas" 即可生效
+# DSH Collab-Canvas
 - insert:
-    - id: collab-canvas-host
-      name: 'collab-canvas'
-    - id: collab-canvas-client
-      name: 'collab-canvas/client'
+    - id: collab-canvas
+      name: collab-canvas

@@ -1,21 +1,31 @@
 {
   "name": "collab-canvas",
-  "version": "0.1.6",
-  "description": "DSH 协作画布插件：Markdown 渲染/编辑/序列化 + 状态管理 + RPC + 工具注册",
+  "version": "0.2.0",
+  "description": "DSH 协作画布插件：Markdown 渲染/编辑/序列化 + 状态管理 + 工具注册",
   "type": "module",
   "main": "dist/host.js",
   "exports": {
     ".": "./dist/host.js",
-    "./client": "./dist/client.js"
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
+    "lib",
     "cordis.patch.yml"
   ],
   "license": "MIT",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
     }
   }
 }
