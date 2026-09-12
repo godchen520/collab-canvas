@@ -6,14 +6,24 @@
 
 ---
 
-## 零、当前部署状态（2026-08 最新）
+## 零、当前部署状态（2026-09 最新）
 
-**Phase 1 已成功部署**（composition 插件方式，正式生产）：
-- 插件名：`collab-canvas-host`（Host）+ `collab-canvas-client`（Phase 2 待做）
-- 物理位置：`E:\DeepSeek Harness\.dsh\profiles\web\node_modules\collab-canvas-*\`
-- composition 条目：web profile 的 `cordis.patch.yml` 里 `insert`
-- 已注册 7 个 AI 工具：`canvas_list/create/read/write/save/load/configure`（经 `ctx.tools.register`）
-- 数据持久化到：`H:\WPSCloud\OneDrive - 星河游\文档\DSH project\DSH Collab Doc\canvas-docs\`
+**生产部署：单包 `collab-canvas`**（host + client 同包，`dsh.bundle.patch` 自动注册）：
+
+- 物理位置：`E:\DeepSeek Harness\.dsh\profiles\web\node_modules\collab-canvas\`
+- composition 条目：web profile 的 `cordis.patch.yml` 里 `insert` → `id: collab-canvas`
+- **Host 半边**：`dist/host.js`（由 `tools/build.cjs` 从 `src/host/*.js` 拼出）
+- **Client 半边**：`lib/client.js` —— 独立的 `__ModuleLoader__.load` 模块，
+  源文件是 `src/client/editor-panel.js`；由 package.json 的 `dsh.client` 声明加载
+- 另有 `lib/docdrop.js`、`lib/doclink.js`：host 按请求实时供源码的独立客户端模块
+  （改完**刷新页面**即生效，不用重启）
+- 已注册 8 个 AI 工具（经 `ctx.tools.register`）：
+  `canvas_list` / `create` / `read` / `write` / `save` / `load` / `configure` / `delete`
+- 数据持久化到：`canvas-docs/`，会话清单在 `canvas-docs/.sessions/<sid>.json`
+
+> 历史遗留（2026-09-12 清理）：早期曾有 `collab-canvas-host` + `collab-canvas-client`
+> 两个包，客户端走 `dist/client.js`（cordis composition 版）。现客户端统一走
+> `lib/client.js`，`src/client/00-*.js ~ 99-*.js` 与 `dist/client.js` 均已删除。
 
 **验证方式**：AI 直接调 `canvas_list` 返回画布列表；`canvas_write` 协作写画布。✅ 已验证工作。
 

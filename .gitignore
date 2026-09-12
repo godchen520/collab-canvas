@@ -5,3 +5,6 @@ dist/
 Thumbs.db
 *.bak
 *.bak-*
+
+# 会话级画布清单：每次打开文档都会变，属于运行时状态，不入库
+canvas-docs/.sessions/

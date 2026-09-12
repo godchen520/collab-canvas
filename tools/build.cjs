@@ -11,15 +11,13 @@ const ROOT = path.join(__dirname, '..')
 const DIST = path.join(ROOT, 'dist')
 if (!fs.existsSync(DIST)) fs.mkdirSync(DIST)
 
-// src/client 下混着两种客户端入口，不能一起拼：
-//   · 00-*.js ~ 99-*.js：cordis composition 模块，拼进 dist/client.js 的 apply(ctx) 函数体
-//   · editor-panel.js：独立的 __ModuleLoader__.load 模块（即 lib/client.js 的源），
-//     自带 factory 闭包与 exports.apply，拼进 bundle 会直接语法错乱。
-// 所以这里显式排除。
+// 只构建 host：src/host/*.js → dist/host.js（cordis composition 模块）。
+// 客户端不走这里 —— lib/client.js 是独立的 __ModuleLoader__.load 模块，
+// 源文件是 src/client/editor-panel.js，由人工/脚本直接同步（见 README/DEV-GUIDE）。
+// 历史遗留：src/client/00-*.js ~ 99-*.js 曾是「cordis composition 版客户端」的源码，
+// 2026-09-12 确认 package.json 的 exports 与 cordis.patch.yml 都不再引用
+// dist/client.js，整套已删除。需要考古可查 git 历史。
 const EXCLUDE = {
-  // img-constrain.js 是独立注入的 <script> 资产（IIFE），不是 composition
-  // 模块。拼进 bundle 会让它在 apply() 时就跑起来，重复起一个 1s 轮询。
-  client: ['editor-panel.js', 'img-constrain.js'],
   host: []
 }
 
@@ -69,5 +67,5 @@ build('host', 'collab-canvas-host', ['timer', 'tools', 'fs', 'webServer', 'syste
   'import path from "node:path"',
   'import { exec, execFile, spawn } from "node:child_process"'
 ])
-// Client 插件：WYSIWYG 编辑 + Slot 注册（Phase 2）
-build('client', 'collab-canvas-client', ['slots', 'timer'], [])
+// 客户端 bundle（build('client', …)）已于 2026-09-12 移除：
+// dist/client.js 无人引用，客户端实际走 lib/client.js。
