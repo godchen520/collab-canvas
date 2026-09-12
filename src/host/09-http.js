@@ -119,6 +119,15 @@ function initCanvasHttpEndpoints(ctx, webServer) {
       const c = id ? canvases.get(id) : null
       if (!c) { error(res, 404, { ok: false, error: '画布不存在' }); return }
       const result = applyWrite(c, body.content, 'replace', body.knownVer, 'human')
+      // ⚠️ 冲突必须显式回传。applyWrite 检出并发冲突时返回
+      //    { conflict, currentVersion, currentContent }，此时 result.version 是 undefined；
+      //    若照原样 json({ ok: true, version: result.version })，
+      //    undefined 会被 JSON.stringify 丢掉 → 响应变成 {"ok":true} ——
+      //    冲突被伪装成成功，浏览器编辑器无从察觉，只能继续用旧内容写。
+      if (result && result.conflict) {
+        json(res, { ok: false, conflict: true, currentVersion: result.currentVersion, currentContent: result.currentContent })
+        return
+      }
       json(res, { ok: true, version: result.version })
     } catch (e) { error(res, 500, { ok: false, error: e.message }) }
   }}))
