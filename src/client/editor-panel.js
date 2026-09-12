@@ -429,7 +429,19 @@ window.__ModuleLoader__.load({
         return u
       }
       function im(s) {
-        return esc(s)
+        // ⚠️ 行内代码必须「先抽出、后还原」。
+        //    代码跨度里的 * ~ = + 等字符不是标记。若先把代码换成 <code> HTML、
+        //    再跑强调规则，`\*([^*]+)\*` 会跨过 <code> 边界配对，生成非法嵌套
+        //    （<em>…<code>…</em>…</code>）；浏览器纠正该 DOM 后，htmlToMd 再把它
+        //    序列化回 markdown，反引号位置就错乱了 —— 文档被静默破坏。
+        //    实例：**移除全部 `emit(EV.*)` 调用** 会变成 **移除全部 `emit(EV.`*`)` 调用**。
+        //    做法：先把代码替换成不含标记字符的占位符，跑完全部行内规则再还原。
+        var codes = []
+        var body = esc(s).replace(/`([^`]+)`/g, function (_mc, code) {
+          codes.push(code)
+          return '\u0000C' + (codes.length - 1) + '\u0000'
+        })
+        var out = body
           // 兼容旧版直接存进 md 的 <u> 原始标签（已被 esc 转义成 &lt;u&gt;）→ 转回真下划线
           .replace(/&lt;u&gt;([\s\S]*?)&lt;\/u&gt;/g, '<u>$1</u>')
           // 兼容旧版 htmlToMd 产生的 [[label]](#fn-label) 手写链接 → 转成规范脚注引用
@@ -443,13 +455,17 @@ window.__ModuleLoader__.load({
             // title 悬停显示 md 里写的原始地址；esc 不管引号，title 属性里自己补 &quot;
             return '<a href="' + resolveAssetUrl(href) + '" title="' + String(href).replace(/"/g, '&quot;') + '">' + txt + '</a>'
           })
-          .replace(/`([^`]+)`/g, "<code>$1</code>")
+          // 注：代码跨度已在上面抽走，这里的 * 只可能是真标记，不会跨界误配对
           .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
           .replace(/\*([^*]+)\*/g, "<em>$1</em>")
           .replace(/~~([^~]+)~~/g, "<del>$1</del>")
           .replace(/\+\+([^+]+)\+\+/g, "<u>$1</u>")
           .replace(/==([^=]+)==/g, "<mark>$1</mark>")
-          .replace(/\[\^([^\]]+)\](?!:)/g, '<a href="#fn-$1" id="fnref-$1" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$1]</a>');
+          .replace(/\[\^([^\]]+)\](?!:)/g, '<a href="#fn-$1" id="fnref-$1" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$1]</a>')
+        // 还原代码跨度（内容在 esc 阶段已转义，直接放回）
+        return out.replace(/\u0000C(\d+)\u0000/g, function (_mr, idx) {
+          return '<code>' + codes[Number(idx)] + '</code>'
+        })
       }
       // 块级渲染（可递归：blockquote 内部再走一遍同样的块解析，支持引用里套表格/列表）
       function buildTable(ls) {
