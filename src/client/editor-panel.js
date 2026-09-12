@@ -95,6 +95,11 @@ window.__ModuleLoader__.load({
         }).then(function () {}, function () {});
       } catch (_) {}
     }
+    // 只在高频路径上用的日志：CCV_DEBUG 关着时连字符串拼接都不做（msg 可传函数，按需求值）
+    function ccvLogD(msg) {
+      if (!CCV_DEBUG) return;
+      try { ccvLog(typeof msg === "function" ? msg() : msg); } catch (_) {}
+    }
     // 会话键同步：轮询当前会话键，变化时更新全局 sid（docdrop/doclink 读取）
     try {
       if (!window.__ccvSidTimer) {
@@ -135,9 +140,13 @@ window.__ModuleLoader__.load({
     //    需要互相回避（切模式得先把另一边收干净），改成纯负债。
     //    ⚠️ 代码一律保留：想找回悬浮，把这个值改成 true 即可（其余一行不用动）。
     var CCV_FLOAT_ENABLED = false;
+    // 🔍 高频路径的调试日志开关。默认 false —— 因为"鼠标松开 / 划词判定 / 隐藏划词栏"
+    //    这类动作一秒能触发几十次，每次都在拼调用栈并发一条网络请求写盘，属于实打实的卡顿源。
+    //    平时静默；排查划词相关问题时把它改成 true，这些日志就会照旧出现。
+    //    低频日志（各种 catch 里的失败原因）不受影响，永远都会记。
+    var CCV_DEBUG = false;
     var CCV_DRAFT_KEY = "ccv-draft-cache";    // { [canvasId]: { content, at } }
     var ccvCtx = null;                        // 模块级 ctx：tab 正文是独立组件，拿不到 apply 的闭包
-    var ccvDockTypeOk = false;
     var ccvLiveEditor = null;                 // 当前编辑区 DOM。组件卸载后 React 会把 ref 置空，
     var ccvLiveCanvasId = null;               // 但我们自己留的这份引用仍能读到用户刚敲的字。
 
@@ -174,6 +183,11 @@ window.__ModuleLoader__.load({
       if (d && d.content === md) draftDrop(id);
     }
 
+    // ⛔ 【当前不可达】给"自建悬浮/分栏"用的：靠给 #root 加 margin-right 把会话区挤窄，
+    //    好给浮出来的话布腾地方（配合下面的 _ccvStyle / CCV_COL / colRules）。
+    //    悬浮模式 2026-09-12 停用（CCV_FLOAT_ENABLED=false）后，唯一调用方是 CanvasToggle，
+    //    于是这一整块连带成了死岛。官方右侧栏自己会重排布局，不需要挤 #root。
+    //    留着是因为恢复悬浮时要用；CCV_FLOAT_ENABLED 改回 true 即一并复活。
     function compressMainContent(widthPx) {
       if (!_ccvStyle) {
         _ccvStyle = document.createElement("style");
@@ -1264,8 +1278,10 @@ window.__ModuleLoader__.load({
       }
 
       // ─── 划词栏（参考豆包样式）──────────────────────
-      // 下拉菜单状态 + 选区保存
-      var activeDropdown = null
+      // 选区保存
+      // ⚠️ savedRange 建在组件函数体内，每次重渲染都会被重置为 null。
+      //    目前调用链恰好都在同一渲染周期内（saveSelection → 紧接着 restoreSelection），
+      //    所以没出问题；若将来把 restoreSelection 挪到异步或跨渲染的位置，必须先把它提到模块级。
       var savedRange = null
 
       function saveSelection() {
@@ -1282,7 +1298,6 @@ window.__ModuleLoader__.load({
       function closeDropdowns() {
         var existing = document.querySelectorAll('.ccv-dropdown')
         existing.forEach(function(d) { d.remove() })
-        activeDropdown = null
       }
 
       // 菜单在任意屏幕坐标打开（右键菜单用）；showDropdown 走 anchor 定位也归到这里
@@ -1361,7 +1376,6 @@ window.__ModuleLoader__.load({
         if (y + ddHeight > window.innerHeight - 8) y = Math.max(8, top - ddHeight - 4)
         dd.style.left = x + 'px'
         dd.style.top = y + 'px'
-        activeDropdown = dd
         // 点击外部关闭；没点菜单就关掉的话，保存的选区一并作废（防止之后误插到旧位置）
         setTimeout(function() {
           document.addEventListener('mousedown', function close(ev) {
@@ -1770,16 +1784,16 @@ window.__ModuleLoader__.load({
 
       function onEditorMouseUp() {
         try {
-          ccvLog("mouseup: enter")
+          ccvLogD("mouseup: enter")
           var sel = document.getSelection()
           if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
-            ccvLog("mouseup: 选区为空 -> hide (sel=" + (sel ? "collapsed" : "null") + ")")
+            ccvLogD(function () { return "mouseup: 选区为空 -> hide (sel=" + (sel ? "collapsed" : "null") + ")" })
             hideSelbar(); return
           }
           var rect = sel.getRangeAt(0).getBoundingClientRect()
-          ccvLog("mouseup: rect w=" + Math.round(rect.width) + " h=" + Math.round(rect.height) + " l=" + Math.round(rect.left) + " t=" + Math.round(rect.top))
+          ccvLogD(function () { return "mouseup: rect w=" + Math.round(rect.width) + " h=" + Math.round(rect.height) + " l=" + Math.round(rect.left) + " t=" + Math.round(rect.top) })
           if (!rect || (!rect.width && !rect.height)) {
-            ccvLog("mouseup: rect 空 -> hide")
+            ccvLogD("mouseup: rect 空 -> hide")
             hideSelbar(); return
           }
           updateSelFormats(sel)
@@ -1858,29 +1872,37 @@ window.__ModuleLoader__.load({
         if (y < 8) y = Math.min(rect.bottom + 10, window.innerHeight - bh - 8)
         bar.style.left = x + 'px'; bar.style.top = y + 'px'
         // 落定后再量一次：位置/尺寸/裁剪祖先，任何一项不对都能从日志看出来
-        var fin = bar.getBoundingClientRect()
-        ccvLog('showSelbar: 完成 bw=' + bw + ' bh=' + bh + ' x=' + x + ' y=' + y +
-          ' | display=' + bar.style.display +
-          ' | 实际渲染 w=' + Math.round(fin.width) + ' h=' + Math.round(fin.height) +
-          ' l=' + Math.round(fin.left) + ' t=' + Math.round(fin.top) +
-          ' | offsetParent=' + ccvDesc(bar.offsetParent) +
-          ' | parent=' + ccvDesc(bar.parentElement))
+        ccvLogD(function () {
+          var fin = bar.getBoundingClientRect()
+          return 'showSelbar: 完成 bw=' + bw + ' bh=' + bh + ' x=' + x + ' y=' + y +
+            ' | display=' + bar.style.display +
+            ' | 实际渲染 w=' + Math.round(fin.width) + ' h=' + Math.round(fin.height) +
+            ' l=' + Math.round(fin.left) + ' t=' + Math.round(fin.top) +
+            ' | offsetParent=' + ccvDesc(bar.offsetParent) +
+            ' | parent=' + ccvDesc(bar.parentElement)
+        })
         // 沿祖先链找第一个会裁剪 fixed 子元素的容器（有 overflow 且非 visible）
-        var n = bar.parentElement, clip = 'none'
-        while (n && n !== document.documentElement) {
-          var ov = getComputedStyle(n).overflow
-          if (ov && ov !== 'visible') { clip = ccvDesc(n) + ' overflow=' + ov; break }
-          n = n.parentElement
-        }
-        ccvLog('showSelbar: 裁剪祖先 ' + clip)
+        // 这段纯粹是诊断用的（结果只进日志），且 getComputedStyle 会强制排版 —— 同样只在开关打开时跑
+        ccvLogD(function () {
+          var n = bar.parentElement, clip = 'none'
+          while (n && n !== document.documentElement) {
+            var ov = getComputedStyle(n).overflow
+            if (ov && ov !== 'visible') { clip = ccvDesc(n) + ' overflow=' + ov; break }
+            n = n.parentElement
+          }
+          return 'showSelbar: 裁剪祖先 ' + clip
+        })
       }
       function hideSelbar() {
         var bar = document.getElementById('ccv-selbar');
         if (bar) bar.style.display = 'none';
-        var st = ''
-        try { st = (new Error()).stack || '' } catch (e) {}
-        var line = st.split('\n')[2] || ''
-        ccvLog('hideSelbar: 调用 bar=' + (bar ? 'yes' : 'MISSING') + ' 来自 ' + String(line).trim())
+        // 取调用栈很贵，且这里一次鼠标松开可能被调多次 —— 只有 CCV_DEBUG 打开时才做
+        ccvLogD(function () {
+          var st = ''
+          try { st = (new Error()).stack || '' } catch (e) {}
+          var line = st.split('\n')[2] || ''
+          return 'hideSelbar: 调用 bar=' + (bar ? 'yes' : 'MISSING') + ' 来自 ' + String(line).trim()
+        })
       }
 
       // ─── 样式 ──────────────────────────────────────
@@ -1992,7 +2014,15 @@ window.__ModuleLoader__.load({
     }
 
       // ─── Header 按钮组件 ─────────────────────────────────
-    // 当前存活的话布面板 React 根（跨 CanvasToggle 实例共享，保证全局最多一个面板）
+    // ⛔ 【当前不可达 · 死岛】从这里到下面 InputBridge 之前，是早期顶栏「话布」按钮的整套实现：
+    //    按钮本体 + 自建悬浮/分栏窗口 + 宽度拖拽 + 全屏键 + dock/float 模式菜单。
+    //    2026-09-12 起两件事同时发生，导致它彻底没人调用：
+    //      ① 顶栏按钮撤下（入口已挪到右侧栏门厅页）；
+    //      ② 自建悬浮停用（CCV_FLOAT_ENABLED = false）。
+    //    连带失去调用方的还有：compressMainContent、colRules、CCV_COL(_HAS)、_ccvStyle、
+    //    livePanelRoot、ReactDOMClient。
+    //    ⚠️ 一律不删：把 CCV_FLOAT_ENABLED 改成 true，这一整块连同它的配套立即复活。
+    //       也就是说"停用悬浮"这个开关同时管着两件事，别以为它只管悬浮。
     var livePanelRoot = null
     function CanvasToggle({ ctx }) {
       const [open, setOpen] = useState(false);
@@ -2343,145 +2373,145 @@ window.__ModuleLoader__.load({
             'overflow-x:auto!important;' +
           '}';
         document.head.appendChild(s);
-        // ─── 两行顶栏样式 ────────────────────────────
-        // 上行管话布（＋新建 / 文件名切换 / 全屏），下行管当前文档（保存 / 重载 / 关闭）。
-        // hover 与 disabled 用内联 style 表达不了（内联优先级还会盖掉 CSS 的 hover），
-        // 所以走 className + 注入 CSS；选择器统一带 .ccv-panel 前缀提权（面板根自己的
-        // class，悬浮/停靠两种摆法都命中），因此不需要 !important。
-        if (typeof document !== 'undefined' && !document.getElementById('ccv-hdr2-style')) {
-          var hs = document.createElement('style');
-          hs.id = 'ccv-hdr2-style';
-          hs.textContent = [
-            '.ccv-panel .ccv-head{display:flex;flex-direction:column;flex:0 0 auto;min-width:0;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25))}',
-            '.ccv-panel .ccv-row{display:flex;align-items:center;gap:6px;padding:5px 8px;flex-wrap:nowrap;overflow:visible;min-width:0}',
-            '.ccv-panel .ccv-row-top{position:relative}',
-            '.ccv-panel .ccv-row-doc{border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.14))}',
-            '.ccv-panel .ccv-ibtn{width:26px;height:26px;display:flex;align-items:center;justify-content:center;background:transparent;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;color:inherit;cursor:pointer;font-size:13px;font-family:inherit;line-height:1;padding:0;flex:0 0 auto;white-space:nowrap}',
-            '.ccv-panel .ccv-ibtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15))}',
-            '.ccv-panel .ccv-ibtn:disabled{opacity:.35;cursor:default}',
-            '.ccv-panel .ccv-ibtn:disabled:hover{background:transparent}',
-            '.ccv-panel .ccv-tbtn{padding:4px 9px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;background:transparent;color:inherit;font-size:12px;font-family:inherit;cursor:pointer;flex:0 0 auto;white-space:nowrap;line-height:1.4}',
-            '.ccv-panel .ccv-tbtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15))}',
-            '.ccv-panel .ccv-tbtn:disabled{opacity:.35;cursor:default}',
-            '.ccv-panel .ccv-tbtn:disabled:hover{background:transparent}',
-            '.ccv-panel .ccv-chip{display:flex;align-items:center;gap:6px;padding:4px 6px 4px 8px;background:rgba(128,128,128,.08);border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));border-radius:7px;max-width:240px;min-width:56px;flex:0 1 auto;font-size:13px;color:inherit;cursor:pointer;user-select:none}',
-            '.ccv-panel .ccv-chip:hover{filter:brightness(1.06)}',
-            '.ccv-panel .ccv-chipwrap{position:relative;display:flex;min-width:0;flex:0 1 auto}',
-            '.ccv-panel .ccv-chip-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}',
-            '.ccv-panel .ccv-chip-caret{flex:0 0 auto;font-size:10px;line-height:1;opacity:.65}',
-            '.ccv-panel .ccv-spacer{flex:1 1 0%;min-width:6px}',
-            '.ccv-panel .ccv-ninput{width:150px;flex:0 1 auto;min-width:64px;padding:4px 8px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.35));border-radius:6px;background:transparent;color:inherit;font-size:13px;font-family:inherit;outline:none;line-height:1.4}',
-            '.ccv-panel .ccv-drop{position:absolute;top:calc(100% + 3px);left:0;z-index:60;min-width:200px;max-width:min(260px,80vw);max-height:52vh;overflow-y:auto;background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:8px;padding:4px;box-shadow:0 4px 14px rgba(0,0,0,.12)}',
-            '.ccv-panel .ccv-drop-item{display:block;width:100%;text-align:left;padding:6px 8px;border:none;background:transparent;color:inherit;font-size:13px;font-family:inherit;cursor:pointer;border-radius:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;box-sizing:border-box}',
-            '.ccv-panel .ccv-drop-item:hover{background:rgba(128,128,128,.12)}',
-            '.ccv-panel .ccv-drop-item[data-on="1"]{font-weight:600;background:rgba(128,128,128,.1)}',
-            '.ccv-panel .ccv-drop-row{display:flex;align-items:center;gap:4px}',
-            '.ccv-panel .ccv-drop-row .ccv-drop-item{flex:1 1 auto;min-width:0}',
-            '.ccv-panel .ccv-drop-x{flex:0 0 auto;width:20px;height:24px;border:none;background:transparent;color:inherit;opacity:.45;cursor:pointer;font-size:14px;line-height:1;border-radius:4px}',
-            '.ccv-panel .ccv-drop-x:hover{opacity:1;background:rgba(128,128,128,.18)}',
-            '.ccv-panel .ccv-drop-empty{padding:8px;opacity:.6;font-size:12px;text-align:center}',
-            '.ccv-panel .ccv-meter{font-size:11px;opacity:0;transition:opacity .15s ease;white-space:nowrap;user-select:none;font-variant-numeric:tabular-nums;flex:0 0 auto}',
-            // 脚注区域样式
-            '.ccv-panel .ccv-editor .footnotes{margin-top:16px;padding-top:8px;font-size:13px;color:var(--dsw-alias-label-secondary,rgba(128,128,128,.85))}',
-            '.ccv-panel .ccv-editor .footnotes hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));margin:0 0 8px}',
-            '.ccv-panel .ccv-editor .footnotes ol{margin:0;padding-left:20px}',
-            '.ccv-panel .ccv-editor .footnotes li{margin:4px 0;line-height:1.6}',
-            '.ccv-panel .ccv-editor .footnotes a{color:#3b82f6;text-decoration:none}'
+      }
+      // ─── 两行顶栏样式 ────────────────────────────
+      // 上行管话布（＋新建 / 文件名切换 / 全屏），下行管当前文档（保存 / 重载 / 关闭）。
+      // hover 与 disabled 用内联 style 表达不了（内联优先级还会盖掉 CSS 的 hover），
+      // 所以走 className + 注入 CSS；选择器统一带 .ccv-panel 前缀提权（面板根自己的
+      // class，悬浮/停靠两种摆法都命中），因此不需要 !important。
+      if (typeof document !== 'undefined' && !document.getElementById('ccv-hdr2-style')) {
+        var hs = document.createElement('style');
+        hs.id = 'ccv-hdr2-style';
+        hs.textContent = [
+          '.ccv-panel .ccv-head{display:flex;flex-direction:column;flex:0 0 auto;min-width:0;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25))}',
+          '.ccv-panel .ccv-row{display:flex;align-items:center;gap:6px;padding:5px 8px;flex-wrap:nowrap;overflow:visible;min-width:0}',
+          '.ccv-panel .ccv-row-top{position:relative}',
+          '.ccv-panel .ccv-row-doc{border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.14))}',
+          '.ccv-panel .ccv-ibtn{width:26px;height:26px;display:flex;align-items:center;justify-content:center;background:transparent;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;color:inherit;cursor:pointer;font-size:13px;font-family:inherit;line-height:1;padding:0;flex:0 0 auto;white-space:nowrap}',
+          '.ccv-panel .ccv-ibtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15))}',
+          '.ccv-panel .ccv-ibtn:disabled{opacity:.35;cursor:default}',
+          '.ccv-panel .ccv-ibtn:disabled:hover{background:transparent}',
+          '.ccv-panel .ccv-tbtn{padding:4px 9px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;background:transparent;color:inherit;font-size:12px;font-family:inherit;cursor:pointer;flex:0 0 auto;white-space:nowrap;line-height:1.4}',
+          '.ccv-panel .ccv-tbtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15))}',
+          '.ccv-panel .ccv-tbtn:disabled{opacity:.35;cursor:default}',
+          '.ccv-panel .ccv-tbtn:disabled:hover{background:transparent}',
+          '.ccv-panel .ccv-chip{display:flex;align-items:center;gap:6px;padding:4px 6px 4px 8px;background:rgba(128,128,128,.08);border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));border-radius:7px;max-width:240px;min-width:56px;flex:0 1 auto;font-size:13px;color:inherit;cursor:pointer;user-select:none}',
+          '.ccv-panel .ccv-chip:hover{filter:brightness(1.06)}',
+          '.ccv-panel .ccv-chipwrap{position:relative;display:flex;min-width:0;flex:0 1 auto}',
+          '.ccv-panel .ccv-chip-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}',
+          '.ccv-panel .ccv-chip-caret{flex:0 0 auto;font-size:10px;line-height:1;opacity:.65}',
+          '.ccv-panel .ccv-spacer{flex:1 1 0%;min-width:6px}',
+          '.ccv-panel .ccv-ninput{width:150px;flex:0 1 auto;min-width:64px;padding:4px 8px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.35));border-radius:6px;background:transparent;color:inherit;font-size:13px;font-family:inherit;outline:none;line-height:1.4}',
+          '.ccv-panel .ccv-drop{position:absolute;top:calc(100% + 3px);left:0;z-index:60;min-width:200px;max-width:min(260px,80vw);max-height:52vh;overflow-y:auto;background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:8px;padding:4px;box-shadow:0 4px 14px rgba(0,0,0,.12)}',
+          '.ccv-panel .ccv-drop-item{display:block;width:100%;text-align:left;padding:6px 8px;border:none;background:transparent;color:inherit;font-size:13px;font-family:inherit;cursor:pointer;border-radius:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;box-sizing:border-box}',
+          '.ccv-panel .ccv-drop-item:hover{background:rgba(128,128,128,.12)}',
+          '.ccv-panel .ccv-drop-item[data-on="1"]{font-weight:600;background:rgba(128,128,128,.1)}',
+          '.ccv-panel .ccv-drop-row{display:flex;align-items:center;gap:4px}',
+          '.ccv-panel .ccv-drop-row .ccv-drop-item{flex:1 1 auto;min-width:0}',
+          '.ccv-panel .ccv-drop-x{flex:0 0 auto;width:20px;height:24px;border:none;background:transparent;color:inherit;opacity:.45;cursor:pointer;font-size:14px;line-height:1;border-radius:4px}',
+          '.ccv-panel .ccv-drop-x:hover{opacity:1;background:rgba(128,128,128,.18)}',
+          '.ccv-panel .ccv-drop-empty{padding:8px;opacity:.6;font-size:12px;text-align:center}',
+          '.ccv-panel .ccv-meter{font-size:11px;opacity:0;transition:opacity .15s ease;white-space:nowrap;user-select:none;font-variant-numeric:tabular-nums;flex:0 0 auto}',
+          // 脚注区域样式
+          '.ccv-panel .ccv-editor .footnotes{margin-top:16px;padding-top:8px;font-size:13px;color:var(--dsw-alias-label-secondary,rgba(128,128,128,.85))}',
+          '.ccv-panel .ccv-editor .footnotes hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));margin:0 0 8px}',
+          '.ccv-panel .ccv-editor .footnotes ol{margin:0;padding-left:20px}',
+          '.ccv-panel .ccv-editor .footnotes li{margin:4px 0;line-height:1.6}',
+          '.ccv-panel .ccv-editor .footnotes a{color:#3b82f6;text-decoration:none}'
+        ].join('\n');
+        document.head.appendChild(hs);
+      }
+      // ─── Markdown 渲染样式（新 editor 用 .ccv-editor；旧 03-styles.js 的 .ccv-wysiwyg 已弃用）
+      if (typeof document !== 'undefined' && !document.getElementById('ccv-md-style')) {
+        var ms = document.createElement('style');
+        ms.id = 'ccv-md-style';
+        ms.textContent = [
+          '.ccv-panel .ccv-editor > *:first-child{margin-top:0}',
+          '.ccv-panel .ccv-editor > *:last-child{margin-bottom:0}',
+          '.ccv-panel .ccv-editor h1{font-size:1.6em;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));padding-bottom:.2em;margin:.6em 0 .4em;font-weight:600;line-height:1.3}',
+          '.ccv-panel .ccv-editor h2{font-size:1.35em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+          '.ccv-panel .ccv-editor h3{font-size:1.18em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+          '.ccv-panel .ccv-editor h4{font-size:1.05em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+          '.ccv-panel .ccv-editor h5{font-size:1em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+          '.ccv-panel .ccv-editor h6{font-size:.95em;margin:.7em 0 .45em;font-weight:600;line-height:1.35;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.65))}',
+          '.ccv-panel .ccv-editor p{margin:.5em 0}',
+          '.ccv-panel .ccv-editor blockquote{border-left:3px solid var(--dsw-alias-border-l2,rgba(128,128,128,.4));margin:.6em 0;padding:4px 12px;opacity:.9;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.7))}',
+          '.ccv-panel .ccv-editor blockquote > *:first-child{margin-top:0}',
+          '.ccv-panel .ccv-editor blockquote > *:last-child{margin-bottom:0}',
+          '.ccv-panel .ccv-editor mark{background:rgba(250,204,21,.45);color:inherit;padding:0 2px;border-radius:3px}',
+          '.ccv-panel .ccv-editor .ccv-hl{background:rgba(250,204,21,.16);border-left:3px solid rgba(234,179,8,.55);border-radius:6px;padding:8px 14px;margin:.6em 0}',
+          '.ccv-panel .ccv-editor .ccv-hl > *:first-child{margin-top:0}',
+          '.ccv-panel .ccv-editor .ccv-hl > *:last-child{margin-bottom:0}',
+          '.ccv-panel .ccv-editor input[type="checkbox"]{cursor:pointer}',
+          '.ccv-panel .ccv-editor pre{background:var(--dsw-alias-markdown-code-block,rgba(128,128,128,.12));padding:10px 12px;border-radius:6px;overflow-x:auto;white-space:pre-wrap;margin:.6em 0;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
+          '.ccv-panel .ccv-editor code{background:var(--dsw-alias-markdown-inline-code,rgba(128,128,128,.16));padding:1px 4px;border-radius:3px;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
+          '.ccv-panel .ccv-editor pre code{background:transparent;padding:0;border-radius:0}',
+          '.ccv-panel .ccv-editor ul,.ccv-panel .ccv-editor ol{padding-left:1.6em;margin:.5em 0}',
+          '.ccv-panel .ccv-editor li{margin:.25em 0}',
+          '.ccv-panel .ccv-editor ul ul,.ccv-panel .ccv-editor ol ol,.ccv-panel .ccv-editor ul ol,.ccv-panel .ccv-editor ol ul{margin:.2em 0}',
+          '.ccv-panel .ccv-editor li input[type="checkbox"]{margin-right:.45em;vertical-align:middle;width:1em;height:1em}',
+          '.ccv-panel .ccv-editor li:has(> input[type="checkbox"]){list-style:none;margin-left:-.2em}',
+          '.ccv-panel .ccv-editor table{border-collapse:separate;border-spacing:0;margin:.8em 0;width:100%;max-width:100%;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));border-radius:6px;overflow:hidden}',
+          '.ccv-panel .ccv-editor th,.ccv-panel .ccv-editor td{border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));padding:8px 12px;text-align:left;vertical-align:top}',
+          '.ccv-panel .ccv-editor th{background:var(--dsw-alias-interactive-bg-active,rgba(128,128,128,.18));font-weight:600}',
+          '.ccv-panel .ccv-editor tr:nth-child(even){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08))}',
+          '.ccv-panel .ccv-editor tr:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(59,130,246,.08))}',
+          '.ccv-panel .ccv-editor hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));margin:1em 0}',
+          '.ccv-panel .ccv-editor a{color:#3b82f6;text-decoration:underline;cursor:pointer}',
+          // 脚注引用 [1] 和文末 ↩ 不是网页链接，保持无下划线、不做手型
+          '.ccv-panel .ccv-editor a[href^="#fn"]{text-decoration:none;cursor:default}',
+          '.ccv-panel .ccv-editor img{max-width:100%;height:auto;vertical-align:middle}',
+          '.ccv-panel .ccv-editor strong{font-weight:600}',
+          '.ccv-panel .ccv-editor em{font-style:italic}',
+          '.ccv-panel .ccv-editor del{text-decoration:line-through;opacity:.75}'
+        ].join('\n');
+        document.head.appendChild(ms);
+      }
+      // ─── JS 终极兜底 ──────────────────────────────
+      // 即使 CSS 选择器漏、即使 inline style 用了 !important (CSS 覆盖不了
+      // inline !important) 都能压住。每秒 + 任何 DOM 新增都重扫一遍。
+      // ⚠️ JS 必须严格无 inline `//` 注释——下面的代码会被拼成单行，注释到 EOF
+      // 行为不可靠。这里用 \n 转义序列替代源换行，并把注释放进函数体内作为可
+      // 运行的字符串字面量（不是真的 JS 注释，零运行时开销）。
+      if (!document.getElementById('ccv-cc-constrain-js')) {
+        try {
+          var js = document.createElement('script');
+          js.id = 'ccv-cc-constrain-js';
+          js.textContent = [
+            '(function(){',
+            'var fix=function(root){',
+            'var scope=root||document;',
+            'var imgs=scope.querySelectorAll?scope.querySelectorAll("img"):[];',
+            'for(var i=0;i<imgs.length;i++){',
+            'var img=imgs[i];',
+            'if(!img.isConnected)continue;',
+            'var parent=img.parentElement||document.body;',
+            'var pw=parent.clientWidth;',
+            'if(!pw)continue;',
+            'var w=img.offsetWidth||img.naturalWidth||0;',
+            'if(w>pw+2){',
+            'img.style.maxWidth="100%";',
+            'img.style.maxHeight="100vh";',
+            'img.style.width="100%";',
+            'img.style.height="auto";',
+            '}',
+            '}',
+            '};',
+            'if(document.readyState!=="loading")fix();',
+            'else document.addEventListener("DOMContentLoaded",fix);',
+            'setInterval(fix,1000);',
+            'try{',
+            'new MutationObserver(function(muts){',
+            'for(var i=0;i<muts.length;i++){',
+            'var m=muts[i];',
+            'if(m.addedNodes&&m.addedNodes.length)fix(document);',
+            '}',
+            '}).observe(document.body,{childList:true,subtree:true});',
+            '}catch(e){}',
+            '})();'
           ].join('\n');
-          document.head.appendChild(hs);
-        }
-        // ─── Markdown 渲染样式（新 editor 用 .ccv-editor；旧 03-styles.js 的 .ccv-wysiwyg 已弃用）
-        if (typeof document !== 'undefined' && !document.getElementById('ccv-md-style')) {
-          var ms = document.createElement('style');
-          ms.id = 'ccv-md-style';
-          ms.textContent = [
-            '.ccv-panel .ccv-editor > *:first-child{margin-top:0}',
-            '.ccv-panel .ccv-editor > *:last-child{margin-bottom:0}',
-            '.ccv-panel .ccv-editor h1{font-size:1.6em;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));padding-bottom:.2em;margin:.6em 0 .4em;font-weight:600;line-height:1.3}',
-            '.ccv-panel .ccv-editor h2{font-size:1.35em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
-            '.ccv-panel .ccv-editor h3{font-size:1.18em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
-            '.ccv-panel .ccv-editor h4{font-size:1.05em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
-            '.ccv-panel .ccv-editor h5{font-size:1em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
-            '.ccv-panel .ccv-editor h6{font-size:.95em;margin:.7em 0 .45em;font-weight:600;line-height:1.35;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.65))}',
-            '.ccv-panel .ccv-editor p{margin:.5em 0}',
-            '.ccv-panel .ccv-editor blockquote{border-left:3px solid var(--dsw-alias-border-l2,rgba(128,128,128,.4));margin:.6em 0;padding:4px 12px;opacity:.9;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.7))}',
-            '.ccv-panel .ccv-editor blockquote > *:first-child{margin-top:0}',
-            '.ccv-panel .ccv-editor blockquote > *:last-child{margin-bottom:0}',
-            '.ccv-panel .ccv-editor mark{background:rgba(250,204,21,.45);color:inherit;padding:0 2px;border-radius:3px}',
-            '.ccv-panel .ccv-editor .ccv-hl{background:rgba(250,204,21,.16);border-left:3px solid rgba(234,179,8,.55);border-radius:6px;padding:8px 14px;margin:.6em 0}',
-            '.ccv-panel .ccv-editor .ccv-hl > *:first-child{margin-top:0}',
-            '.ccv-panel .ccv-editor .ccv-hl > *:last-child{margin-bottom:0}',
-            '.ccv-panel .ccv-editor input[type="checkbox"]{cursor:pointer}',
-            '.ccv-panel .ccv-editor pre{background:var(--dsw-alias-markdown-code-block,rgba(128,128,128,.12));padding:10px 12px;border-radius:6px;overflow-x:auto;white-space:pre-wrap;margin:.6em 0;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
-            '.ccv-panel .ccv-editor code{background:var(--dsw-alias-markdown-inline-code,rgba(128,128,128,.16));padding:1px 4px;border-radius:3px;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
-            '.ccv-panel .ccv-editor pre code{background:transparent;padding:0;border-radius:0}',
-            '.ccv-panel .ccv-editor ul,.ccv-panel .ccv-editor ol{padding-left:1.6em;margin:.5em 0}',
-            '.ccv-panel .ccv-editor li{margin:.25em 0}',
-            '.ccv-panel .ccv-editor ul ul,.ccv-panel .ccv-editor ol ol,.ccv-panel .ccv-editor ul ol,.ccv-panel .ccv-editor ol ul{margin:.2em 0}',
-            '.ccv-panel .ccv-editor li input[type="checkbox"]{margin-right:.45em;vertical-align:middle;width:1em;height:1em}',
-            '.ccv-panel .ccv-editor li:has(> input[type="checkbox"]){list-style:none;margin-left:-.2em}',
-            '.ccv-panel .ccv-editor table{border-collapse:separate;border-spacing:0;margin:.8em 0;width:100%;max-width:100%;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));border-radius:6px;overflow:hidden}',
-            '.ccv-panel .ccv-editor th,.ccv-panel .ccv-editor td{border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));padding:8px 12px;text-align:left;vertical-align:top}',
-            '.ccv-panel .ccv-editor th{background:var(--dsw-alias-interactive-bg-active,rgba(128,128,128,.18));font-weight:600}',
-            '.ccv-panel .ccv-editor tr:nth-child(even){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08))}',
-            '.ccv-panel .ccv-editor tr:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(59,130,246,.08))}',
-            '.ccv-panel .ccv-editor hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));margin:1em 0}',
-            '.ccv-panel .ccv-editor a{color:#3b82f6;text-decoration:underline;cursor:pointer}',
-            // 脚注引用 [1] 和文末 ↩ 不是网页链接，保持无下划线、不做手型
-            '.ccv-panel .ccv-editor a[href^="#fn"]{text-decoration:none;cursor:default}',
-            '.ccv-panel .ccv-editor img{max-width:100%;height:auto;vertical-align:middle}',
-            '.ccv-panel .ccv-editor strong{font-weight:600}',
-            '.ccv-panel .ccv-editor em{font-style:italic}',
-            '.ccv-panel .ccv-editor del{text-decoration:line-through;opacity:.75}'
-          ].join('\n');
-          document.head.appendChild(ms);
-        }
-        // ─── JS 终极兜底 ──────────────────────────────
-// 即使 CSS 选择器漏、即使 inline style 用了 !important (CSS 覆盖不了
-// inline !important) 都能压住。每秒 + 任何 DOM 新增都重扫一遍。
-// ⚠️ JS 必须严格无 inline `//` 注释——下面的代码会被拼成单行，注释到 EOF
-// 行为不可靠。这里用 \n 转义序列替代源换行，并把注释放进函数体内作为可
-// 运行的字符串字面量（不是真的 JS 注释，零运行时开销）。
-if (!document.getElementById('ccv-cc-constrain-js')) {
-  try {
-    var js = document.createElement('script');
-    js.id = 'ccv-cc-constrain-js';
-    js.textContent = [
-      '(function(){',
-      'var fix=function(root){',
-      'var scope=root||document;',
-      'var imgs=scope.querySelectorAll?scope.querySelectorAll("img"):[];',
-      'for(var i=0;i<imgs.length;i++){',
-      'var img=imgs[i];',
-      'if(!img.isConnected)continue;',
-      'var parent=img.parentElement||document.body;',
-      'var pw=parent.clientWidth;',
-      'if(!pw)continue;',
-      'var w=img.offsetWidth||img.naturalWidth||0;',
-      'if(w>pw+2){',
-      'img.style.maxWidth="100%";',
-      'img.style.maxHeight="100vh";',
-      'img.style.width="100%";',
-      'img.style.height="auto";',
-      '}',
-      '}',
-      '};',
-      'if(document.readyState!=="loading")fix();',
-      'else document.addEventListener("DOMContentLoaded",fix);',
-      'setInterval(fix,1000);',
-      'try{',
-      'new MutationObserver(function(muts){',
-      'for(var i=0;i<muts.length;i++){',
-      'var m=muts[i];',
-      'if(m.addedNodes&&m.addedNodes.length)fix(document);',
-      '}',
-      '}).observe(document.body,{childList:true,subtree:true});',
-      '}catch(e){}',
-      '})();'
-    ].join('\n');
-    document.head.appendChild(js);
-  } catch (e) {}
-}
+          document.head.appendChild(js);
+        } catch (e) {}
       }
       // ─── 顶栏「话布」按钮：默认不挂载（入口已在右侧栏门厅页）────────
       // 2026-09-12 撤下。理由：官方右侧栏的「开始」页已有「话布」入口卡片，
@@ -2558,7 +2588,6 @@ if (!document.getElementById('ccv-cc-constrain-js')) {
             }]
           });
         }, "collab-canvas: 右侧栏 tab 类型");
-        ccvDockTypeOk = true;
       } catch (e) { ccvLog("右侧栏 tab 类型注册失败: " + (e && e.message)); }
 
       try {
