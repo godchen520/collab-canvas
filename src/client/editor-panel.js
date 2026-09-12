@@ -122,6 +122,58 @@ window.__ModuleLoader__.load({
       return el.tagName + (el.id ? "#" + el.id : "") + (el.className && typeof el.className === "string" ? "." + el.className.split(/\s+/).slice(0, 2).join(".") : "");
     }
 
+    // ─── 停靠模式（右侧栏）─────────────────────────────
+    // 右侧栏的标签一切走，正文组件就被整个卸载重建（实测「正文已挂载」每次 +1）。
+    // 也就是说：界面上的东西没有任何一样能指望它自己记得住。
+    // 于是——① 面板实例放到模块级，方便别处复用；② 用户「刚敲进去、还没写盘」
+    // 的内容在卸载前抢存一份到 localStorage，切回来时先恢复它。
+    var CCV_DOCK_KIND = "collab-canvas";
+    var CCV_MODE_KEY = "ccv-open-mode";       // "dock"=停靠右侧栏（默认） / "float"=悬浮窗口
+    // ⛔ 自建悬浮模式的开关。2026-09-12 起置 false —— 官方右侧栏本身就两种都行：
+    //    停靠（标签页）和"把标签拖出面板就浮出来"，后者还更灵活。
+    //    自建悬浮当初唯一的理由是"那时没有官方侧栏"，现在理由没了，且两套浮动机制并存
+    //    需要互相回避（切模式得先把另一边收干净），改成纯负债。
+    //    ⚠️ 代码一律保留：想找回悬浮，把这个值改成 true 即可（其余一行不用动）。
+    var CCV_FLOAT_ENABLED = false;
+    var CCV_DRAFT_KEY = "ccv-draft-cache";    // { [canvasId]: { content, at } }
+    var ccvCtx = null;                        // 模块级 ctx：tab 正文是独立组件，拿不到 apply 的闭包
+    var ccvDockTypeOk = false;
+    var ccvLiveEditor = null;                 // 当前编辑区 DOM。组件卸载后 React 会把 ref 置空，
+    var ccvLiveCanvasId = null;               // 但我们自己留的这份引用仍能读到用户刚敲的字。
+
+    function ccvGetMode() {
+      // 悬浮被停用时，历史存过的 "float" 一律按 "dock" 处理，免得老用户一进来落在已停用的模式上
+      if (!CCV_FLOAT_ENABLED) return "dock";
+      try { return localStorage.getItem(CCV_MODE_KEY) === "float" ? "float" : "dock"; } catch (_) { return "dock"; }
+    }
+    function ccvSetMode(m) {
+      try { localStorage.setItem(CCV_MODE_KEY, m); } catch (_) {}
+    }
+    function ccvDrafts() {
+      try { var o = JSON.parse(localStorage.getItem(CCV_DRAFT_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch (_) { return {}; }
+    }
+    function draftGet(id) {
+      if (!id) return null;
+      var d = ccvDrafts()[id];
+      return d && typeof d.content === "string" ? d : null;
+    }
+    // 大文档（画布内嵌图片时动辄几百 KB）不进 localStorage：写配额报错比丢草稿更烦人。
+    var CCV_DRAFT_MAX = 400 * 1024;
+    function draftSet(id, content) {
+      if (!id || typeof content !== "string") return;
+      if (content.length > CCV_DRAFT_MAX) return;
+      try { var all = ccvDrafts(); all[id] = { content: content, at: Date.now() }; localStorage.setItem(CCV_DRAFT_KEY, JSON.stringify(all)); } catch (_) {}
+    }
+    function draftDrop(id) {
+      if (!id) return;
+      try { var all = ccvDrafts(); if (all[id]) { delete all[id]; localStorage.setItem(CCV_DRAFT_KEY, JSON.stringify(all)); } } catch (_) {}
+    }
+    // 只有「存盘成功的那一版」才清草稿：如果这期间用户又敲了新内容，草稿得更新，不能清。
+    function draftDropIf(id, md) {
+      var d = draftGet(id);
+      if (d && d.content === md) draftDrop(id);
+    }
+
     function compressMainContent(widthPx) {
       if (!_ccvStyle) {
         _ccvStyle = document.createElement("style");
@@ -264,7 +316,9 @@ window.__ModuleLoader__.load({
     }
 
     // ─── 编辑器面板组件 ─────────────────────────────────
-    function CanvasPanel({ ctx, width, onclose, onresize }) {
+    // embedded=true：画布作为「右侧栏标签正文」渲染。此时它不再是一个 fixed 悬浮层，
+    // 宽度/高度由标签页决定，拖拽条和全屏按钮交给侧栏自己，宽度也不再需要挤压对话列。
+    function CanvasPanel({ ctx, width, onclose, onresize, embedded }) {
       const [canvases, setCanvases] = useState([]);
       const [activeId, setActiveId] = useState(null);
       // 顶栏两行：creating = 行内新建输入框展开（不弹浮层，直接插在第一行流里）
@@ -277,10 +331,19 @@ window.__ModuleLoader__.load({
       // 窄屏（手机）一开始就是全屏：分栏拖拽在触屏上没法用
       const [isFull, setIsFull] = useState(isNarrow());
       const [narrow, setNarrow] = useState(isNarrow());
+      // 停靠模式下没有拖拽条，宽度得自己量（悬浮模式的宽度是拖出来的，见 width prop）
+      const [selfW, setSelfW] = useState(0);
+      const [restored, setRestored] = useState(false);   // 顶栏显示「已恢复未保存内容」
       const editorRef = useRef(null);
       const saveTimer = useRef(null);
       const panelRef = useRef(null);
       const meterRef = useRef(null);
+      const panelW = embedded ? selfW : (width || 500);
+      const draftTimer = useRef(null);
+      // 停靠模式下，"窄"由面板自己的宽度决定，而不是整个窗口 ——
+      // 窗口 1600 宽、侧栏只给 315 时，面板也是窄的，得用紧凑内边距。
+      const isNarrowPane = embedded ? (selfW > 0 && selfW < 520) : narrow;
+      const compact = narrow || isNarrowPane;
 
       // 横竖屏切换 / 窗口缩放时刷新窄屏判定
       useEffect(() => {
@@ -298,6 +361,9 @@ window.__ModuleLoader__.load({
       // 读数直接写 DOM，不走 state——拖拽时每帧 setState 会拖垮手感
       function updateMeter(w, avail) {
         if (!meterRef.current) return;
+        // 停靠模式先判：窄屏会被强制 isFull，那时读数写"全屏"是错的 ——
+        // 它只是被侧栏给了个窄格子，不是进了全屏。
+        if (embedded) { meterRef.current.textContent = Math.round(w) + "px · 侧栏"; return; }
         if (isFull) { meterRef.current.textContent = "全屏"; return; }
         var col = conversationColumn();
         var colLeft = col ? Math.round(col.getBoundingClientRect().left) : -1;
@@ -306,22 +372,85 @@ window.__ModuleLoader__.load({
           Math.round(w) + " / " + (avail ? Math.round(avail) : "?") + "px · " +
           (isSidebarExpanded() ? "1:1" : "1:2") + " · L" + colLeft;
       }
-      // 挂载后（CSS 已生效）测一次真实可用宽度
+      // 挂载后（CSS 已生效）测一次真实宽度。必须现场量 panelRef ——
+      // 不能用上面那个渲染时就定住的 width/panelW，首帧它还是 0，会把读数写成 0px。
       useEffect(() => {
-        var t = setTimeout(function () { updateMeter(width || 500, measureAvail()); }, 0);
+        var t = setTimeout(function () {
+          var el = panelRef.current;
+          var w = el ? el.getBoundingClientRect().width : panelW;
+          if (embedded) setSelfW(Math.round(w));
+          updateMeter(w, measureAvail());
+        }, 0);
         return function () { clearTimeout(t); };
-      }, [isFull]);
+      }, [isFull, embedded]);
       // 对话列尺寸一变（左侧栏收放、窗口缩放）就刷新读数
       useEffect(() => {
         var col = conversationColumn();
         if (!col) return;
         var ro = new ResizeObserver(function () {
-          var w = panelRef.current ? panelRef.current.getBoundingClientRect().width : (width || 500);
+          var w = panelRef.current ? panelRef.current.getBoundingClientRect().width : panelW;
           updateMeter(w, measureAvail());
         });
         ro.observe(col);
         return function () { ro.disconnect(); };
       }, [isFull]);
+
+      // 停靠模式：宽度由右侧栏标签页给，自己量。拖宽拖窄标签页时跟着变。
+      useEffect(function () {
+        if (!embedded) return;
+        var el = panelRef.current;
+        if (!el) return;
+        var measure = function () {
+          var w = Math.round(el.getBoundingClientRect().width);
+          setSelfW(w);
+          updateMeter(w, measureAvail());
+        };
+        measure();
+        if (typeof ResizeObserver === "undefined") return;
+        var ro = new ResizeObserver(measure);
+        ro.observe(el);
+        return function () { ro.disconnect(); };
+      }, [embedded, isFull]);
+
+      // 把「正在编辑的 DOM + 它属于哪个话布」记到模块级：卸载后 React 会把 ref 置空，
+      // 我们留的这份引用还能读到用户刚敲进去的字，用来抢存草稿。
+      useEffect(function () { ccvLiveCanvasId = activeId; }, [activeId]);
+      useEffect(function () {
+        ccvLiveEditor = editorRef.current;
+        return function () {
+          // 卸载瞬间抢存：右侧栏标签一切走，本组件就被整个拆掉，晚一步就读不到内容了
+          try {
+            if (ccvLiveCanvasId && ccvLiveEditor) draftSet(ccvLiveCanvasId, htmlToMd(ccvLiveEditor));
+          } catch (e) { ccvLog("草稿抢存失败: " + (e && e.message)); }
+          ccvLiveEditor = null;
+        };
+      }, []);
+
+      // 防抖落草稿（打字时只更新内存引用，500ms 空闲才动 localStorage）
+      function scheduleDraft() {
+        var el = editorRef.current;
+        if (!el || !activeId) return;
+        ccvLiveEditor = el;
+        ccvLiveCanvasId = activeId;
+        if (draftTimer.current) return;
+        draftTimer.current = setTimeout(function () {
+          draftTimer.current = null;
+          try {
+            if (ccvLiveEditor && ccvLiveCanvasId) draftSet(ccvLiveCanvasId, htmlToMd(ccvLiveEditor));
+          } catch (_) {}
+        }, 500);
+      }
+
+      // 关页面/刷新前也抢一次：F5 不会触发 React 卸载
+      useEffect(function () {
+        function flush() { try { if (ccvLiveCanvasId && ccvLiveEditor) draftSet(ccvLiveCanvasId, htmlToMd(ccvLiveEditor)); } catch (_) {} }
+        window.addEventListener("beforeunload", flush);
+        window.addEventListener("pagehide", flush);
+        return function () {
+          window.removeEventListener("beforeunload", flush);
+          window.removeEventListener("pagehide", flush);
+        };
+      }, []);
 
       // 全局点击隐藏划词栏和下拉菜单
       useEffect(() => {
@@ -485,6 +614,7 @@ window.__ModuleLoader__.load({
 
       // 面板宽度/定位全交给注入的 CSS（!important），这里只切全屏 class
       useEffect(() => {
+        if (embedded) return;   // 停靠模式：全屏是右侧栏自己的事，不碰对话列布局
         var panel = panelRef.current;
         if (panel) {
           // 注意：panelRef 是 CanvasPanel 的根 div，#collab-canvas-panel 是它外层的宿主容器，
@@ -536,7 +666,21 @@ window.__ModuleLoader__.load({
       function loadCanvas(id) {
         clearTimeout(saveTimer.current);   // 防竞态：切换前丢掉旧文档的待写自动保存
         fetch(canvasApi("/api/canvas/read?id=" + encodeURIComponent(id))).then(r => r.json()).then(d => {
-          if (d.ok) { setActiveId(d.id); setContent(d.content); setVersion(d.version); }
+          if (!d.ok) return;
+          var dft = draftGet(d.id);
+          if (dft && dft.content !== d.content) {
+            // 有一份没来得及写盘的草稿：它是用户刚敲的，比服务端那版新，优先恢复它。
+            // 恢复后按「停止输入 1.5 秒自动存」的同一规矩补写回服务端，
+            // 否则用户切走之后，这段内容只活在浏览器里，AI 在对话里看不到。
+            ccvLog("恢复未保存草稿: id=" + d.id + " 长度=" + dft.content.length + " 服务端长度=" + d.content.length);
+            setActiveId(d.id); setContent(dft.content); setVersion(d.version);
+            setRestored(true);
+            clearTimeout(saveTimer.current);
+            saveTimer.current = setTimeout(function () { writeMd(d.id, dft.content); }, 1500);
+          } else {
+            setActiveId(d.id); setContent(d.content); setVersion(d.version);
+            setRestored(false);
+          }
         }).catch(() => {});
       }
 
@@ -551,13 +695,22 @@ window.__ModuleLoader__.load({
         }).catch(() => alert("删除失败"));
       }
 
+      // 写盘。接受显式的 md：卸载后 / 恢复草稿时编辑器 DOM 已不可靠，
+      // 这两种情况下必须用调用方手里那份内容，不能再回头读 DOM。
+      function writeMd(id, md) {
+        if (!id || typeof md !== "string") return Promise.resolve(null);
+        return fetch(canvasApi("/api/canvas/write"), {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: id, content: md })
+        }).then(r => r.json()).then(function (d) {
+          if (d && d.ok) { setVersion(d.version); draftDropIf(id, md); setRestored(false); }
+          return d;
+        }).catch(function () { return null; });
+      }
+
       function saveCanvas() {
         if (!activeId || !editorRef.current) return;
-        const md = htmlToMd(editorRef.current);
-        fetch(canvasApi("/api/canvas/write"), {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: activeId, content: md })
-        }).then(r => r.json()).then(d => { if (d.ok) setVersion(d.version); }).catch(() => {});
+        writeMd(activeId, htmlToMd(editorRef.current));
       }
 
       // 在系统文件管理器里打开当前文档所在的文件夹（host 端调 explorer/open/xdg-open）
@@ -1735,9 +1888,12 @@ window.__ModuleLoader__.load({
         // 定位/宽高/边框由注入的 CSS（!important）统一控制，这里只放外观
         // 内层根 div 必须填满 #collab-canvas-panel 宿主（flex 列、高 100vh），
         // 否则它没有确定高度 → 编辑区 flex:1 1 0% 解析成 0 → 内容被压没、overflowY 失效、滚轮滚不动。
-        panel: { flex: "1 1 0%", minHeight: 0, background: "var(--dsw-alias-bg-layer-1, #fff)", color: "var(--dsw-alias-label-primary, #1a1a1a)", display: "flex", flexDirection: "column", fontFamily: "var(--font-ui, system-ui, sans-serif)" },
+        // minWidth/minHeight 必须写 0：flex 子项默认 min-width:auto，会被内容（宽表格、
+        // 长代码块）顶着涨，撑出容器 —— 停靠在窄侧栏里尤其明显。
+        panel: { flex: "1 1 0%", minHeight: 0, minWidth: 0, background: "var(--dsw-alias-bg-layer-1, #fff)", color: "var(--dsw-alias-label-primary, #1a1a1a)", display: "flex", flexDirection: "column", fontFamily: "var(--font-ui, system-ui, sans-serif)" },
         drag: { position: "absolute", left: -4, top: 0, bottom: 0, width: 8, cursor: "col-resize", zIndex: 10 },
-        editor: { flex: "1 1 0%", minHeight: 0, overflowY: "auto", padding: narrow ? "14px 16px" : "24px 32px", outline: "none", fontSize: 14, lineHeight: 1.75, wordBreak: "break-word" }
+        // overflowX:auto —— 宽表格/长代码块在窄侧栏里自己横向滚动，而不是把面板撑宽
+        editor: { flex: "1 1 0%", minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "auto", padding: compact ? "14px 16px" : "24px 32px", outline: "none", fontSize: 14, lineHeight: 1.75, wordBreak: "break-word" }
       };
 
       // 当前话布标题：canvases 里找 activeId 对应的那条
@@ -1746,9 +1902,9 @@ window.__ModuleLoader__.load({
         if (canvases[i].id === activeId) { curTitle = canvases[i].title; break; }
       }
 
-      return h("div", { ref: panelRef, style: S.panel },
-        // 窄屏没有分栏，也就不需要拖拽条
-        narrow ? null : h("div", { style: S.drag, onMouseDown: onDragStart }),
+      return h("div", { ref: panelRef, className: "ccv-panel" + (embedded ? " ccv-docked" : ""), style: S.panel },
+        // 窄屏没有分栏，也就不需要拖拽条；停靠模式下宽度由标签页给，同样不需要
+        (narrow || embedded) ? null : h("div", { style: S.drag, onMouseDown: onDragStart }),
         h("div", {
           className: "ccv-head",
           // 读数平时透明，鼠标移进顶栏才浮现
@@ -1796,9 +1952,10 @@ window.__ModuleLoader__.load({
                   ) : null
                 ),
             h("div", { className: "ccv-spacer" }),
-            // 窄屏始终全屏，没有可切换的余地，隐藏这个按钮
-            narrow ? null : h("button", { className: "ccv-ibtn", onClick: toggleFullscreen, title: isFull ? "退出全屏" : "全屏" }, isFull ? "❐" : "⛶"),
-            h("button", { className: "ccv-ibtn", onClick: onclose, title: "关闭话布" }, "×")
+            // 窄屏始终全屏，没有可切换的余地，隐藏这个按钮；
+            // 停靠模式下全屏按钮在侧栏自己身上，这里不重复一个
+            (narrow || embedded) ? null : h("button", { className: "ccv-ibtn", onClick: toggleFullscreen, title: isFull ? "退出全屏" : "全屏" }, isFull ? "❐" : "⛶"),
+            h("button", { className: "ccv-ibtn", onClick: onclose, title: embedded ? "关闭这个标签" : "关闭话布" }, "×")
           ),
           // ─── 第二行：管当前文档（保存 / 重载）───
           h("div", { className: "ccv-row ccv-row-doc" },
@@ -1808,16 +1965,23 @@ window.__ModuleLoader__.load({
               dangerouslySetInnerHTML: { __html: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:auto"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>' } }),
             h("button", { className: "ccv-tbtn", onClick: manageRegistry, title: "登记文件夹：之后把登记文件夹内的文件拖进 DSH 窗口时，按真实路径 @ 引用（不产生副本）" }, "登记"),
             h("div", { className: "ccv-spacer" }),
+            // 恢复提示：切标签会拆掉画布，切回来时如果捞到一份没写盘的草稿就说明一下，
+            // 否则用户会以为"我明明打过的字怎么自己变回去了"
+            restored ? h("span", {
+              className: "ccv-meter",
+              title: "这是你上次没来得及保存的内容，已自动补存回服务端",
+              style: { opacity: 1, color: "var(--dsw-alias-label-secondary, #6b7280)" }
+            }, "已恢复未保存内容") : null,
             h("span", {
               ref: meterRef, className: "ccv-meter",
-              title: "话布宽度 /（会话区 + 话布）可用宽度 —— 左侧栏不计入"
-            }, isFull ? "全屏" : (width || 500) + " / ?px")
+              title: embedded ? "本标签的宽度" : "话布宽度 /（会话区 + 话布）可用宽度 —— 左侧栏不计入"
+            }, isFull ? "全屏" : (embedded ? "" : (width || 500) + " / ?px"))
           )
         ),
         h("div", {
           ref: editorRef, className: "ccv-editor", contentEditable: true, suppressContentEditableWarning: true, style: S.editor,
           dangerouslySetInnerHTML: { __html: mdToHtml(content) },
-          onInput: () => { clearTimeout(saveTimer.current); saveTimer.current = setTimeout(saveCanvas, 1500); },
+          onInput: () => { scheduleDraft(); clearTimeout(saveTimer.current); saveTimer.current = setTimeout(saveCanvas, 1500); },
           onMouseUp: onEditorMouseUp,
           onContextMenu: (e) => { e.preventDefault(); showContextMenu(e.clientX, e.clientY) }
         }),
@@ -1836,6 +2000,9 @@ window.__ModuleLoader__.load({
       // ratio = 话布宽度 / 可用宽度（会话区 + 话布）。初始 1/3：会话占 2/3。
       const [ratio, setRatio] = useState(1 / 3);
       const [currentW, setCurrentW] = useState(500);
+      // dock = 停靠进 DSH 右侧栏（默认） / float = 老的悬浮窗口。选择记在本地，忘了也记得住。
+      const [mode, setMode] = useState(ccvGetMode());
+      const [menu, setMenu] = useState(false);
 
       // 根据当前可用宽度把像素宽度换算成 ratio 保存，避免左侧栏展开/收起时比例走样
       const onResize = useCallback((w) => {
@@ -1882,11 +2049,78 @@ window.__ModuleLoader__.load({
         }
       }, [open, panelRoot, ctx, ratio]);
 
+      // 关闭悬浮面板（不问当前状态，没开就什么都不做）——切到停靠时要先收掉它，
+      // 否则同一个画布会有两块界面，`#ccv-editor`、`#ccv-selbar` 这类 id 会撞车。
+      const closeFloat = useCallback(() => {
+        if (!open) return false;
+        if (panelRoot) { panelRoot.remove(); setPanelRoot(null); }
+        try { if (livePanelRoot) livePanelRoot.unmount(); } catch (_) {}
+        livePanelRoot = null;
+        var stale = document.getElementById("collab-canvas-panel");
+        if (stale) stale.remove();
+        var el = document.getElementById("root");
+        if (el) el.classList.remove("ccv-open", "ccv-full");
+        document.body.removeAttribute("data-ccv-dragging");
+        compressMainContent(0);
+        setOpen(false);
+        return true;
+      }, [open, panelRoot]);
+
+      // 打开停靠标签。cctx 走模块级引用：这里拿不到 apply 的闭包。
+      const openDock = useCallback(() => {
+        var svc = null;
+        try { svc = ccvCtx && ccvCtx.sidebarRight; } catch (_) {}
+        if (!svc || typeof svc.openTab !== "function") {
+          window.alert("右侧栏接口拿不到，话布没能打开。\n\n多半是插件没加载完整，刷新一次页面再试。");
+          return;
+        }
+        try { svc.openTab(CCV_DOCK_KIND); }
+        catch (e) { window.alert("打开右侧栏话布失败：\n\n" + (e && e.message ? e.message : e)); }
+      }, []);
+
+      // 顶栏按钮点下去做什么。悬浮已停用 → 永远开停靠；将来重新启用时按模式走。
+      const primary = useCallback(() => {
+        if (!CCV_FLOAT_ENABLED || mode === "dock") { closeFloat(); openDock(); }
+        else toggle();
+      }, [mode, closeFloat, openDock, toggle]);
+
+      // 换模式：把另一边的界面先收干净，再把选中的那边打开
+      const switchMode = useCallback((next) => {
+        setMenu(false);
+        if (next === mode) return;
+        ccvSetMode(next);
+        setMode(next);
+        if (next === "dock") {
+          closeFloat();
+          openDock();
+        } else {
+          // 悬浮模式：把停靠标签关掉（侧栏"唯一的常驻引导页"框架会自己保留，不用管）
+          try {
+            var svc = ccvCtx && ccvCtx.sidebarRight;
+            var act = svc && typeof svc.active === "function" ? svc.active() : null;
+            if (act && act.kind === CCV_DOCK_KIND && typeof svc.close === "function") svc.close(act.id);
+          } catch (_) {}
+          toggle();
+        }
+      }, [mode, closeFloat, openDock, toggle]);
+
       // 对外桥接：doclink「文档名链接」通过这两个全局量打开话布并切换文档
       useEffect(function () {
-        window.__ccvCanvasToggle = toggle;
+        window.__ccvCanvasToggle = primary;
         window.__ccvPanelOpen = open;
-      }, [toggle, open]);
+      }, [primary, open]);
+
+      // 点空白处收起模式菜单
+      useEffect(function () {
+        if (!menu) return;
+        function onDown(e) {
+          if (e.target && e.target.closest && e.target.closest(".ccv-mode-menu")) return;
+          if (e.target && e.target.closest && e.target.closest(".ccv-mode-caret")) return;
+          setMenu(false);
+        }
+        document.addEventListener("mousedown", onDown);
+        return function () { document.removeEventListener("mousedown", onDown); };
+      }, [menu]);
 
       // 监听左侧栏展开/收起、窗口 resize：保持 ratio，重新计算话布像素宽度
       const lastWRef = useRef(0);
@@ -1935,16 +2169,71 @@ window.__ModuleLoader__.load({
         compressMainContent(0);
       }, []);
 
-      return h("button", {
-        onClick: toggle,
-        style: {
-          padding: "4px 10px", border: "1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35))",
-          borderRadius: 6, background: open ? "rgba(128,128,128,.15)" : "transparent",
-          color: "var(--dsw-alias-label-primary, #1a1a1a)",
-          cursor: "pointer", fontSize: 13, fontFamily: "inherit"
-        },
-        title: "话布编辑器"
-      }, "话布");
+      // 模式菜单：悬浮 / 停靠 二选一。做成贴边的小下拉，不占地方。
+      function modeMenu() {
+        if (!menu) return null;
+        var items = [
+          { key: "dock", label: "停靠右侧栏", hint: mode === "dock" ? "当前" : "" },
+          { key: "float", label: "悬浮窗口", hint: mode === "float" ? "当前" : "" }
+        ];
+        return h("div", {
+          className: "ccv-mode-menu",
+          style: {
+            position: "absolute", top: "calc(100% + 4px)", right: 0, zIndex: 2147483001,
+            minWidth: 132, padding: 4, display: "flex", flexDirection: "column", gap: 2,
+            background: "var(--dsw-alias-bg-overlay, #fff)",
+            border: "1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.3))",
+            borderRadius: 8, boxShadow: "0 6px 20px rgba(0,0,0,.12)"
+          }
+        }, items.map(function (it) {
+          return h("button", {
+            key: it.key,
+            onClick: function () { switchMode(it.key); },
+            style: {
+              display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8,
+              padding: "5px 8px", border: "none", borderRadius: 6, background: "transparent",
+              color: "var(--dsw-alias-label-primary, #1a1a1a)", cursor: "pointer",
+              fontSize: 13, fontFamily: "inherit", textAlign: "left", whiteSpace: "nowrap"
+            },
+            onMouseEnter: function (e) { e.currentTarget.style.background = "rgba(128,128,128,.12)"; },
+            onMouseLeave: function (e) { e.currentTarget.style.background = "transparent"; }
+          },
+            h("span", null, it.label),
+            it.hint ? h("span", { style: { fontSize: 11, color: "var(--dsw-alias-label-secondary, #6b7280)" } }, it.hint) : null
+          );
+        }));
+      }
+
+      return h("div", { style: { position: "relative", display: "inline-flex", alignItems: "center" } },
+        h("button", {
+          onClick: primary,
+          style: {
+            padding: "4px 10px", border: "1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35))",
+            // 只剩一个按钮时用完整圆角；两段式按钮（带 ▾）时左段只圆左侧
+            borderRadius: CCV_FLOAT_ENABLED ? "6px 0 0 6px" : 6,
+            background: open ? "rgba(128,128,128,.15)" : "transparent",
+            color: "var(--dsw-alias-label-primary, #1a1a1a)",
+            cursor: "pointer", fontSize: 13, fontFamily: "inherit"
+          },
+          title: CCV_FLOAT_ENABLED
+            ? (mode === "dock" ? "话布编辑器（当前：停靠右侧栏）" : "话布编辑器（当前：悬浮窗口）")
+            : "话布编辑器（在右侧栏打开；拖出面板即可浮动）"
+        }, "话布"),
+        // ▾ 模式菜单只在悬浮重新启用时才出现（见 CCV_FLOAT_ENABLED）
+        CCV_FLOAT_ENABLED ? h("button", {
+          className: "ccv-mode-caret",
+          onClick: function (e) { e.stopPropagation(); setMenu(function (v) { return !v; }); },
+          style: {
+            marginLeft: -1, padding: "4px 5px", border: "1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35))",
+            borderTopRightRadius: 6, borderBottomRightRadius: 6, borderTopLeftRadius: 0, borderBottomLeftRadius: 0,
+            background: menu ? "rgba(128,128,128,.15)" : "transparent",
+            color: "var(--dsw-alias-label-primary, #1a1a1a)", cursor: "pointer", fontSize: 10,
+            fontFamily: "inherit", lineHeight: 1
+          },
+          title: "话布怎么摆：停靠右侧栏 / 悬浮窗口"
+        }, "▾") : null,
+        CCV_FLOAT_ENABLED ? modeMenu() : null
+      );
     }
 
     // ─── 输入桥组件：把官方 inputActions / draft 暴露给划词栏 ──
@@ -1962,10 +2251,59 @@ window.__ModuleLoader__.load({
       return null
     }
 
+    // ─── 门厅页（右侧栏「开始」）的入口图标 ────────────────
+    // 门厅页会给每个注册的标签类型画一个入口胶囊，图标没给就画个占位方块。
+    // 这里画一块"画布 + 两行字"的小图，和「工作区文件」的文件夹图标同尺寸。
+    // 只需 { size, className } 两个属性，跟随 currentColor，主题自动适配。
+    function CcvGuideGlyph(props) {
+      var size = props && props.size ? props.size : 16;
+      return h("svg", {
+        width: size, height: size, viewBox: "0 0 16 16", fill: "none",
+        className: props ? props.className : undefined, "aria-hidden": "true"
+      },
+        h("rect", {
+          x: 2.1, y: 2.7, width: 11.8, height: 10.6, rx: 2.2,
+          stroke: "currentColor", strokeWidth: 1.2
+        }),
+        h("path", {
+          d: "M5.1 6.1h5.8M5.1 9.1h3.5",
+          stroke: "currentColor", strokeWidth: 1.2, strokeLinecap: "round"
+        })
+      );
+    }
+
     // ─── 插件注册 ──────────────────────────────────────
-    const inject = ["slots", "conversation"];
+    // ─── 停靠模式：右侧栏标签的正文 ────────────────────────
+    // 这里渲染的就是同一个 CanvasPanel，只是把它当"填满标签页的一块区域"，
+    // 而不再是一个自己拖宽度、自己挤对话列的悬浮层。
+    function CanvasDockBody(props) {
+      var tab = null;
+      try {
+        var info = props && typeof props.useTabInfo === "function" ? props.useTabInfo() : null;
+        tab = info ? info.tab : null;
+      } catch (e) { ccvLog("dock 正文读 tab 信息失败: " + (e && e.message)); }
+      return h("div", {
+        style: {
+          display: "flex", flexDirection: "column",
+          height: "100%", minHeight: 0, minWidth: 0, overflow: "hidden",
+          background: "var(--dsw-alias-bg-layer-1, #fff)"
+        }
+      }, h(CanvasPanel, {
+        ctx: ccvCtx,
+        embedded: true,
+        width: 0,
+        onresize: function () {},
+        onclose: function () {
+          try { if (tab && tab.actions && typeof tab.actions.close === "function") tab.actions.close(); }
+          catch (e) { ccvLog("关闭标签失败: " + (e && e.message)); }
+        }
+      }));
+    }
+
+    const inject = ["slots", "conversation", "sidebarRightTabs", "sidebarRight"];
 
     function apply(ctx) {
+      ccvCtx = ctx;   // tab 正文是另一个组件，用的就是这个引用
       // ─── 会话内容限流 ──────────────────────────────
       // DSH 的会话消息不主动给 <img> 设 max-width，AI 生成的大图 / 截图会撑破
       // 会话列宽；右侧一旦打开话布（position:fixed、高 z-index），溢出的图片
@@ -1986,8 +2324,11 @@ window.__ModuleLoader__.load({
           '[data-slot="conversation"] img,' +
           '[data-pane="conversation"] img,' +
           // 话布面板内部：话布渲染的内容里有 AI 给的 <img>，同样会撑破面板
-          '#collab-canvas-panel img,' +
-          '#collab-canvas-panel .ccv-editor img{' +
+          // 用 .ccv-panel（面板根自己的 class）而不是 #collab-canvas-panel：
+          // 停靠到右侧栏时没有那个宿主 id，写死 id 会让这一整段失效。
+          // 类名写两遍是故意加权重，替掉原来靠 id 提权的做法。
+          '.ccv-panel.ccv-panel img,' +
+          '.ccv-panel.ccv-panel .ccv-editor img{' +
             'max-width:100%!important;' +
           '}' +
           // 不让 #root / body / 浮层超出视口横向滚动
@@ -1997,7 +2338,7 @@ window.__ModuleLoader__.load({
           '[data-slot="conversation"] pre,' +
           '[data-pane="conversation"] pre,' +
           // 长 <pre> 也按列宽走横向滚动，避免撑破话布面板
-          '#collab-canvas-panel .ccv-editor pre{' +
+          '.ccv-panel.ccv-panel .ccv-editor pre{' +
             'max-width:100%!important;' +
             'overflow-x:auto!important;' +
           '}';
@@ -2005,47 +2346,47 @@ window.__ModuleLoader__.load({
         // ─── 两行顶栏样式 ────────────────────────────
         // 上行管话布（＋新建 / 文件名切换 / 全屏），下行管当前文档（保存 / 重载 / 关闭）。
         // hover 与 disabled 用内联 style 表达不了（内联优先级还会盖掉 CSS 的 hover），
-        // 所以走 className + 注入 CSS；选择器统一带 #collab-canvas-panel 前缀提权，
-        // 因此不需要 !important。
+        // 所以走 className + 注入 CSS；选择器统一带 .ccv-panel 前缀提权（面板根自己的
+        // class，悬浮/停靠两种摆法都命中），因此不需要 !important。
         if (typeof document !== 'undefined' && !document.getElementById('ccv-hdr2-style')) {
           var hs = document.createElement('style');
           hs.id = 'ccv-hdr2-style';
           hs.textContent = [
-            '#collab-canvas-panel .ccv-head{display:flex;flex-direction:column;flex:0 0 auto;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25))}',
-            '#collab-canvas-panel .ccv-row{display:flex;align-items:center;gap:6px;padding:5px 8px;flex-wrap:nowrap;overflow:visible;min-width:0}',
-            '#collab-canvas-panel .ccv-row-top{position:relative}',
-            '#collab-canvas-panel .ccv-row-doc{border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.14))}',
-            '#collab-canvas-panel .ccv-ibtn{width:26px;height:26px;display:flex;align-items:center;justify-content:center;background:transparent;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;color:inherit;cursor:pointer;font-size:13px;font-family:inherit;line-height:1;padding:0;flex:0 0 auto;white-space:nowrap}',
-            '#collab-canvas-panel .ccv-ibtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15))}',
-            '#collab-canvas-panel .ccv-ibtn:disabled{opacity:.35;cursor:default}',
-            '#collab-canvas-panel .ccv-ibtn:disabled:hover{background:transparent}',
-            '#collab-canvas-panel .ccv-tbtn{padding:4px 9px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;background:transparent;color:inherit;font-size:12px;font-family:inherit;cursor:pointer;flex:0 0 auto;white-space:nowrap;line-height:1.4}',
-            '#collab-canvas-panel .ccv-tbtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15))}',
-            '#collab-canvas-panel .ccv-tbtn:disabled{opacity:.35;cursor:default}',
-            '#collab-canvas-panel .ccv-tbtn:disabled:hover{background:transparent}',
-            '#collab-canvas-panel .ccv-chip{display:flex;align-items:center;gap:6px;padding:4px 6px 4px 8px;background:rgba(128,128,128,.08);border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));border-radius:7px;max-width:240px;min-width:56px;flex:0 1 auto;font-size:13px;color:inherit;cursor:pointer;user-select:none}',
-            '#collab-canvas-panel .ccv-chip:hover{filter:brightness(1.06)}',
-            '#collab-canvas-panel .ccv-chipwrap{position:relative;display:flex;min-width:0;flex:0 1 auto}',
-            '#collab-canvas-panel .ccv-chip-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}',
-            '#collab-canvas-panel .ccv-chip-caret{flex:0 0 auto;font-size:10px;line-height:1;opacity:.65}',
-            '#collab-canvas-panel .ccv-spacer{flex:1 1 0%;min-width:6px}',
-            '#collab-canvas-panel .ccv-ninput{width:150px;flex:0 1 auto;min-width:64px;padding:4px 8px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.35));border-radius:6px;background:transparent;color:inherit;font-size:13px;font-family:inherit;outline:none;line-height:1.4}',
-            '#collab-canvas-panel .ccv-drop{position:absolute;top:calc(100% + 3px);left:0;z-index:60;min-width:200px;max-width:min(260px,80vw);max-height:52vh;overflow-y:auto;background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:8px;padding:4px;box-shadow:0 4px 14px rgba(0,0,0,.12)}',
-            '#collab-canvas-panel .ccv-drop-item{display:block;width:100%;text-align:left;padding:6px 8px;border:none;background:transparent;color:inherit;font-size:13px;font-family:inherit;cursor:pointer;border-radius:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;box-sizing:border-box}',
-            '#collab-canvas-panel .ccv-drop-item:hover{background:rgba(128,128,128,.12)}',
-            '#collab-canvas-panel .ccv-drop-item[data-on="1"]{font-weight:600;background:rgba(128,128,128,.1)}',
-            '#collab-canvas-panel .ccv-drop-row{display:flex;align-items:center;gap:4px}',
-            '#collab-canvas-panel .ccv-drop-row .ccv-drop-item{flex:1 1 auto;min-width:0}',
-            '#collab-canvas-panel .ccv-drop-x{flex:0 0 auto;width:20px;height:24px;border:none;background:transparent;color:inherit;opacity:.45;cursor:pointer;font-size:14px;line-height:1;border-radius:4px}',
-            '#collab-canvas-panel .ccv-drop-x:hover{opacity:1;background:rgba(128,128,128,.18)}',
-            '#collab-canvas-panel .ccv-drop-empty{padding:8px;opacity:.6;font-size:12px;text-align:center}',
-            '#collab-canvas-panel .ccv-meter{font-size:11px;opacity:0;transition:opacity .15s ease;white-space:nowrap;user-select:none;font-variant-numeric:tabular-nums;flex:0 0 auto}',
+            '.ccv-panel .ccv-head{display:flex;flex-direction:column;flex:0 0 auto;min-width:0;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25))}',
+            '.ccv-panel .ccv-row{display:flex;align-items:center;gap:6px;padding:5px 8px;flex-wrap:nowrap;overflow:visible;min-width:0}',
+            '.ccv-panel .ccv-row-top{position:relative}',
+            '.ccv-panel .ccv-row-doc{border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.14))}',
+            '.ccv-panel .ccv-ibtn{width:26px;height:26px;display:flex;align-items:center;justify-content:center;background:transparent;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;color:inherit;cursor:pointer;font-size:13px;font-family:inherit;line-height:1;padding:0;flex:0 0 auto;white-space:nowrap}',
+            '.ccv-panel .ccv-ibtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15))}',
+            '.ccv-panel .ccv-ibtn:disabled{opacity:.35;cursor:default}',
+            '.ccv-panel .ccv-ibtn:disabled:hover{background:transparent}',
+            '.ccv-panel .ccv-tbtn{padding:4px 9px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;background:transparent;color:inherit;font-size:12px;font-family:inherit;cursor:pointer;flex:0 0 auto;white-space:nowrap;line-height:1.4}',
+            '.ccv-panel .ccv-tbtn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15))}',
+            '.ccv-panel .ccv-tbtn:disabled{opacity:.35;cursor:default}',
+            '.ccv-panel .ccv-tbtn:disabled:hover{background:transparent}',
+            '.ccv-panel .ccv-chip{display:flex;align-items:center;gap:6px;padding:4px 6px 4px 8px;background:rgba(128,128,128,.08);border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));border-radius:7px;max-width:240px;min-width:56px;flex:0 1 auto;font-size:13px;color:inherit;cursor:pointer;user-select:none}',
+            '.ccv-panel .ccv-chip:hover{filter:brightness(1.06)}',
+            '.ccv-panel .ccv-chipwrap{position:relative;display:flex;min-width:0;flex:0 1 auto}',
+            '.ccv-panel .ccv-chip-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}',
+            '.ccv-panel .ccv-chip-caret{flex:0 0 auto;font-size:10px;line-height:1;opacity:.65}',
+            '.ccv-panel .ccv-spacer{flex:1 1 0%;min-width:6px}',
+            '.ccv-panel .ccv-ninput{width:150px;flex:0 1 auto;min-width:64px;padding:4px 8px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.35));border-radius:6px;background:transparent;color:inherit;font-size:13px;font-family:inherit;outline:none;line-height:1.4}',
+            '.ccv-panel .ccv-drop{position:absolute;top:calc(100% + 3px);left:0;z-index:60;min-width:200px;max-width:min(260px,80vw);max-height:52vh;overflow-y:auto;background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:8px;padding:4px;box-shadow:0 4px 14px rgba(0,0,0,.12)}',
+            '.ccv-panel .ccv-drop-item{display:block;width:100%;text-align:left;padding:6px 8px;border:none;background:transparent;color:inherit;font-size:13px;font-family:inherit;cursor:pointer;border-radius:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;box-sizing:border-box}',
+            '.ccv-panel .ccv-drop-item:hover{background:rgba(128,128,128,.12)}',
+            '.ccv-panel .ccv-drop-item[data-on="1"]{font-weight:600;background:rgba(128,128,128,.1)}',
+            '.ccv-panel .ccv-drop-row{display:flex;align-items:center;gap:4px}',
+            '.ccv-panel .ccv-drop-row .ccv-drop-item{flex:1 1 auto;min-width:0}',
+            '.ccv-panel .ccv-drop-x{flex:0 0 auto;width:20px;height:24px;border:none;background:transparent;color:inherit;opacity:.45;cursor:pointer;font-size:14px;line-height:1;border-radius:4px}',
+            '.ccv-panel .ccv-drop-x:hover{opacity:1;background:rgba(128,128,128,.18)}',
+            '.ccv-panel .ccv-drop-empty{padding:8px;opacity:.6;font-size:12px;text-align:center}',
+            '.ccv-panel .ccv-meter{font-size:11px;opacity:0;transition:opacity .15s ease;white-space:nowrap;user-select:none;font-variant-numeric:tabular-nums;flex:0 0 auto}',
             // 脚注区域样式
-            '#collab-canvas-panel .ccv-editor .footnotes{margin-top:16px;padding-top:8px;font-size:13px;color:var(--dsw-alias-label-secondary,rgba(128,128,128,.85))}',
-            '#collab-canvas-panel .ccv-editor .footnotes hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));margin:0 0 8px}',
-            '#collab-canvas-panel .ccv-editor .footnotes ol{margin:0;padding-left:20px}',
-            '#collab-canvas-panel .ccv-editor .footnotes li{margin:4px 0;line-height:1.6}',
-            '#collab-canvas-panel .ccv-editor .footnotes a{color:#3b82f6;text-decoration:none}'
+            '.ccv-panel .ccv-editor .footnotes{margin-top:16px;padding-top:8px;font-size:13px;color:var(--dsw-alias-label-secondary,rgba(128,128,128,.85))}',
+            '.ccv-panel .ccv-editor .footnotes hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25));margin:0 0 8px}',
+            '.ccv-panel .ccv-editor .footnotes ol{margin:0;padding-left:20px}',
+            '.ccv-panel .ccv-editor .footnotes li{margin:4px 0;line-height:1.6}',
+            '.ccv-panel .ccv-editor .footnotes a{color:#3b82f6;text-decoration:none}'
           ].join('\n');
           document.head.appendChild(hs);
         }
@@ -2054,44 +2395,44 @@ window.__ModuleLoader__.load({
           var ms = document.createElement('style');
           ms.id = 'ccv-md-style';
           ms.textContent = [
-            '#collab-canvas-panel .ccv-editor > *:first-child{margin-top:0}',
-            '#collab-canvas-panel .ccv-editor > *:last-child{margin-bottom:0}',
-            '#collab-canvas-panel .ccv-editor h1{font-size:1.6em;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));padding-bottom:.2em;margin:.6em 0 .4em;font-weight:600;line-height:1.3}',
-            '#collab-canvas-panel .ccv-editor h2{font-size:1.35em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
-            '#collab-canvas-panel .ccv-editor h3{font-size:1.18em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
-            '#collab-canvas-panel .ccv-editor h4{font-size:1.05em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
-            '#collab-canvas-panel .ccv-editor h5{font-size:1em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
-            '#collab-canvas-panel .ccv-editor h6{font-size:.95em;margin:.7em 0 .45em;font-weight:600;line-height:1.35;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.65))}',
-            '#collab-canvas-panel .ccv-editor p{margin:.5em 0}',
-            '#collab-canvas-panel .ccv-editor blockquote{border-left:3px solid var(--dsw-alias-border-l2,rgba(128,128,128,.4));margin:.6em 0;padding:4px 12px;opacity:.9;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.7))}',
-            '#collab-canvas-panel .ccv-editor blockquote > *:first-child{margin-top:0}',
-            '#collab-canvas-panel .ccv-editor blockquote > *:last-child{margin-bottom:0}',
-            '#collab-canvas-panel .ccv-editor mark{background:rgba(250,204,21,.45);color:inherit;padding:0 2px;border-radius:3px}',
-            '#collab-canvas-panel .ccv-editor .ccv-hl{background:rgba(250,204,21,.16);border-left:3px solid rgba(234,179,8,.55);border-radius:6px;padding:8px 14px;margin:.6em 0}',
-            '#collab-canvas-panel .ccv-editor .ccv-hl > *:first-child{margin-top:0}',
-            '#collab-canvas-panel .ccv-editor .ccv-hl > *:last-child{margin-bottom:0}',
-            '#collab-canvas-panel .ccv-editor input[type="checkbox"]{cursor:pointer}',
-            '#collab-canvas-panel .ccv-editor pre{background:var(--dsw-alias-markdown-code-block,rgba(128,128,128,.12));padding:10px 12px;border-radius:6px;overflow-x:auto;white-space:pre-wrap;margin:.6em 0;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
-            '#collab-canvas-panel .ccv-editor code{background:var(--dsw-alias-markdown-inline-code,rgba(128,128,128,.16));padding:1px 4px;border-radius:3px;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
-            '#collab-canvas-panel .ccv-editor pre code{background:transparent;padding:0;border-radius:0}',
-            '#collab-canvas-panel .ccv-editor ul,#collab-canvas-panel .ccv-editor ol{padding-left:1.6em;margin:.5em 0}',
-            '#collab-canvas-panel .ccv-editor li{margin:.25em 0}',
-            '#collab-canvas-panel .ccv-editor ul ul,#collab-canvas-panel .ccv-editor ol ol,#collab-canvas-panel .ccv-editor ul ol,#collab-canvas-panel .ccv-editor ol ul{margin:.2em 0}',
-            '#collab-canvas-panel .ccv-editor li input[type="checkbox"]{margin-right:.45em;vertical-align:middle;width:1em;height:1em}',
-            '#collab-canvas-panel .ccv-editor li:has(> input[type="checkbox"]){list-style:none;margin-left:-.2em}',
-            '#collab-canvas-panel .ccv-editor table{border-collapse:separate;border-spacing:0;margin:.8em 0;width:100%;max-width:100%;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));border-radius:6px;overflow:hidden}',
-            '#collab-canvas-panel .ccv-editor th,#collab-canvas-panel .ccv-editor td{border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));padding:8px 12px;text-align:left;vertical-align:top}',
-            '#collab-canvas-panel .ccv-editor th{background:var(--dsw-alias-interactive-bg-active,rgba(128,128,128,.18));font-weight:600}',
-            '#collab-canvas-panel .ccv-editor tr:nth-child(even){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08))}',
-            '#collab-canvas-panel .ccv-editor tr:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(59,130,246,.08))}',
-            '#collab-canvas-panel .ccv-editor hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));margin:1em 0}',
-            '#collab-canvas-panel .ccv-editor a{color:#3b82f6;text-decoration:underline;cursor:pointer}',
+            '.ccv-panel .ccv-editor > *:first-child{margin-top:0}',
+            '.ccv-panel .ccv-editor > *:last-child{margin-bottom:0}',
+            '.ccv-panel .ccv-editor h1{font-size:1.6em;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));padding-bottom:.2em;margin:.6em 0 .4em;font-weight:600;line-height:1.3}',
+            '.ccv-panel .ccv-editor h2{font-size:1.35em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+            '.ccv-panel .ccv-editor h3{font-size:1.18em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+            '.ccv-panel .ccv-editor h4{font-size:1.05em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+            '.ccv-panel .ccv-editor h5{font-size:1em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
+            '.ccv-panel .ccv-editor h6{font-size:.95em;margin:.7em 0 .45em;font-weight:600;line-height:1.35;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.65))}',
+            '.ccv-panel .ccv-editor p{margin:.5em 0}',
+            '.ccv-panel .ccv-editor blockquote{border-left:3px solid var(--dsw-alias-border-l2,rgba(128,128,128,.4));margin:.6em 0;padding:4px 12px;opacity:.9;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.7))}',
+            '.ccv-panel .ccv-editor blockquote > *:first-child{margin-top:0}',
+            '.ccv-panel .ccv-editor blockquote > *:last-child{margin-bottom:0}',
+            '.ccv-panel .ccv-editor mark{background:rgba(250,204,21,.45);color:inherit;padding:0 2px;border-radius:3px}',
+            '.ccv-panel .ccv-editor .ccv-hl{background:rgba(250,204,21,.16);border-left:3px solid rgba(234,179,8,.55);border-radius:6px;padding:8px 14px;margin:.6em 0}',
+            '.ccv-panel .ccv-editor .ccv-hl > *:first-child{margin-top:0}',
+            '.ccv-panel .ccv-editor .ccv-hl > *:last-child{margin-bottom:0}',
+            '.ccv-panel .ccv-editor input[type="checkbox"]{cursor:pointer}',
+            '.ccv-panel .ccv-editor pre{background:var(--dsw-alias-markdown-code-block,rgba(128,128,128,.12));padding:10px 12px;border-radius:6px;overflow-x:auto;white-space:pre-wrap;margin:.6em 0;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
+            '.ccv-panel .ccv-editor code{background:var(--dsw-alias-markdown-inline-code,rgba(128,128,128,.16));padding:1px 4px;border-radius:3px;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
+            '.ccv-panel .ccv-editor pre code{background:transparent;padding:0;border-radius:0}',
+            '.ccv-panel .ccv-editor ul,.ccv-panel .ccv-editor ol{padding-left:1.6em;margin:.5em 0}',
+            '.ccv-panel .ccv-editor li{margin:.25em 0}',
+            '.ccv-panel .ccv-editor ul ul,.ccv-panel .ccv-editor ol ol,.ccv-panel .ccv-editor ul ol,.ccv-panel .ccv-editor ol ul{margin:.2em 0}',
+            '.ccv-panel .ccv-editor li input[type="checkbox"]{margin-right:.45em;vertical-align:middle;width:1em;height:1em}',
+            '.ccv-panel .ccv-editor li:has(> input[type="checkbox"]){list-style:none;margin-left:-.2em}',
+            '.ccv-panel .ccv-editor table{border-collapse:separate;border-spacing:0;margin:.8em 0;width:100%;max-width:100%;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));border-radius:6px;overflow:hidden}',
+            '.ccv-panel .ccv-editor th,.ccv-panel .ccv-editor td{border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));padding:8px 12px;text-align:left;vertical-align:top}',
+            '.ccv-panel .ccv-editor th{background:var(--dsw-alias-interactive-bg-active,rgba(128,128,128,.18));font-weight:600}',
+            '.ccv-panel .ccv-editor tr:nth-child(even){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08))}',
+            '.ccv-panel .ccv-editor tr:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(59,130,246,.08))}',
+            '.ccv-panel .ccv-editor hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));margin:1em 0}',
+            '.ccv-panel .ccv-editor a{color:#3b82f6;text-decoration:underline;cursor:pointer}',
             // 脚注引用 [1] 和文末 ↩ 不是网页链接，保持无下划线、不做手型
-            '#collab-canvas-panel .ccv-editor a[href^="#fn"]{text-decoration:none;cursor:default}',
-            '#collab-canvas-panel .ccv-editor img{max-width:100%;height:auto;vertical-align:middle}',
-            '#collab-canvas-panel .ccv-editor strong{font-weight:600}',
-            '#collab-canvas-panel .ccv-editor em{font-style:italic}',
-            '#collab-canvas-panel .ccv-editor del{text-decoration:line-through;opacity:.75}'
+            '.ccv-panel .ccv-editor a[href^="#fn"]{text-decoration:none;cursor:default}',
+            '.ccv-panel .ccv-editor img{max-width:100%;height:auto;vertical-align:middle}',
+            '.ccv-panel .ccv-editor strong{font-weight:600}',
+            '.ccv-panel .ccv-editor em{font-style:italic}',
+            '.ccv-panel .ccv-editor del{text-decoration:line-through;opacity:.75}'
           ].join('\n');
           document.head.appendChild(ms);
         }
@@ -2142,15 +2483,47 @@ if (!document.getElementById('ccv-cc-constrain-js')) {
   } catch (e) {}
 }
       }
-      // 注册话布按钮
-      ctx.slots.inject("conversation.session.header.utilities", () =>
-        ctx.slots.register({
-          name: "conversation.session.header.utilities",
-          id: "collab-canvas-toggle",
-          order: 50,
-          label: () => "话布"
-        }, CanvasToggle)
-      );
+      // ─── 顶栏「话布」按钮：默认不挂载（入口已在右侧栏门厅页）────────
+      // 2026-09-12 撤下。理由：官方右侧栏的「开始」页已有「话布」入口卡片，
+      // 顶栏按钮与它功能重复；且悬浮停用后按钮只剩「在右侧栏打开话布」一个作用，
+      // 而这一步在门厅页点一下就是。留着只是占地方。
+      // 只在 CCV_FLOAT_ENABLED = true（重新启用悬浮）时才注册回来 ——
+      // 悬浮开关、拖拽条、停靠/悬浮模式菜单都挂在这个组件上，没有它悬浮无从开启。
+      if (CCV_FLOAT_ENABLED) {
+        ctx.slots.inject("conversation.session.header.utilities", () =>
+          ctx.slots.register({
+            name: "conversation.session.header.utilities",
+            id: "collab-canvas-toggle",
+            order: 50,
+            label: () => "话布"
+          }, CanvasToggle)
+        );
+      }
+
+      // ─── 对外桥接（原先由顶栏按钮组件注册，现改由插件自己提供）──────
+      // 对话里的文档名链接、上传卡片链接（lib/doclink.js）靠这两个全局量打开
+      // 话布、并判断画布是否已打开。撤掉顶栏按钮后若不补上，那些链接会点不动
+      // （doclink 日志里会出现「话布桥接未就绪」）。
+      // __ccvPanelOpen 必须做成"取值即判断"的 getter：doclink 是在点击那一刻读它的，
+      // 要反映此刻有没有画布，而不是某个组件的挂载状态。
+      window.__ccvCanvasToggle = function () {
+        var svc = null;
+        try { svc = ctx.sidebarRight; } catch (_) {}
+        if (!svc || typeof svc.openTab !== "function") {
+          ccvLog("打开话布失败：拿不到右侧栏接口");
+          return false;
+        }
+        try { svc.openTab(CCV_DOCK_KIND); return true; }
+        catch (e) { ccvLog("打开话布失败: " + (e && e.message)); return false; }
+      };
+      try {
+        Object.defineProperty(window, "__ccvPanelOpen", {
+          configurable: true,
+          get: function () {
+            try { return !!document.querySelector(".ccv-panel"); } catch (_) { return false; }
+          }
+        });
+      } catch (e) { ccvLog("注册画布状态桥接失败: " + (e && e.message)); }
       // 注册输入桥（隐藏组件，暴露 inputActions.setDraft 给划词栏）
       ctx.slots.inject("conversation.input.dock", () =>
         ctx.slots.register({
@@ -2160,6 +2533,39 @@ if (!document.getElementById('ccv-cc-constrain-js')) {
           label: () => "画布输入桥"
         }, InputBridge)
       );
+
+      // ─── 停靠模式：把真画布挂进 DSH 内置右侧栏 ─────────────────
+      // 两阶段注册，和官方 sidebar-files 完全同款：
+      //   ① 声明一个「页面型」标签类型（不认地址，靠 openTab 打开）
+      //   ② 把正文注册到 sidebar.right.pane.tab 槽位，key = 上面那个 id
+      // 注意：这两个服务必须写进 inject（声明依赖），不能运行时 ctx.xxx 现取 ——
+      // 现取拿不到，而且失败会被静默吞掉，按钮出来了却点不开。
+      try {
+        ctx.effect(function () {
+          return ctx.sidebarRightTabs.register({
+            id: CCV_DOCK_KIND,
+            kind: CCV_DOCK_KIND,
+            priority: "extension",
+            title: function () { return "话布"; },
+            // 门厅页（右侧栏「开始」）的入口胶囊。给了 guide 就出现在那一页，
+            // 点它 = 在本标签的位置打开话布，所以门厅是"门"而不是"常驻页"。
+            // order 越小越靠前（官方的「工作区文件」是 10）。
+            guide: [{
+              order: 20,
+              title: function () { return "话布"; },
+              description: function () { return "画布式文档：随手记与整理，可存进工作区"; },
+              icon: CcvGuideGlyph
+            }]
+          });
+        }, "collab-canvas: 右侧栏 tab 类型");
+        ccvDockTypeOk = true;
+      } catch (e) { ccvLog("右侧栏 tab 类型注册失败: " + (e && e.message)); }
+
+      try {
+        ctx.slots.inject("sidebar.right.pane.tab", function () {
+          return ctx.slots.register({ name: "sidebar.right.pane.tab", key: CCV_DOCK_KIND }, CanvasDockBody);
+        });
+      } catch (e) { ccvLog("右侧栏 tab 正文注册失败: " + (e && e.message)); }
     }
 
     exports.apply = apply;
