@@ -154,6 +154,7 @@ window.__ModuleLoader__.load({
     var ccvCtx = null;                        // 模块级 ctx：tab 正文是独立组件，拿不到 apply 的闭包
     var ccvLiveEditor = null;                 // 当前编辑区 DOM。组件卸载后 React 会把 ref 置空，
     var ccvLiveCanvasId = null;               // 但我们自己留的这份引用仍能读到用户刚敲的字。
+    var ccvLiveVer = 0;                       // 本机已知的服务端版本号（组件内 versionRef 的镜像）
     function ccvDrafts() {
       try { var o = JSON.parse(localStorage.getItem(CCV_DRAFT_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch (_) { return {}; }
     }
@@ -164,10 +165,15 @@ window.__ModuleLoader__.load({
     }
     // 大文档（画布内嵌图片时动辄几百 KB）不进 localStorage：写配额报错比丢草稿更烦人。
     var CCV_DRAFT_MAX = 400 * 1024;
-    function draftSet(id, content) {
+    // base = 这份草稿是基于服务端哪一版写出来的。**必须记**：
+    // loadCanvas 恢复草稿后会补写回服务端，若拿服务端的「当前版本」当 knownVer，
+    // 一份基于旧版本的草稿就会被当成合法写入、直接覆盖新内容 ——
+    // 话布优化文档两次被整段抹掉都是这个路径干的。
+    function draftSet(id, content, base) {
       if (!id || typeof content !== "string") return;
       if (content.length > CCV_DRAFT_MAX) return;
-      try { var all = ccvDrafts(); all[id] = { content: content, at: Date.now() }; localStorage.setItem(CCV_DRAFT_KEY, JSON.stringify(all)); } catch (_) {}
+      var b = (typeof base === "number") ? base : (typeof ccvLiveVer === "number" ? ccvLiveVer : null);
+      try { var all = ccvDrafts(); all[id] = { content: content, at: Date.now(), base: b }; localStorage.setItem(CCV_DRAFT_KEY, JSON.stringify(all)); } catch (_) {}
     }
     function draftDrop(id) {
       if (!id) return;
@@ -788,6 +794,10 @@ window.__ModuleLoader__.load({
       // 把「正在编辑的 DOM + 它属于哪个话布」记到模块级：卸载后 React 会把 ref 置空，
       // 我们留的这份引用还能读到用户刚敲进去的字，用来抢存草稿。
       useEffect(function () { ccvLiveCanvasId = activeId; }, [activeId]);
+      // 把组件内的已知版本号镜像到模块级：draftSet 是模块级函数，读不到 versionRef，
+      // 但草稿必须记住自己的基准版本（见 draftSet 注释）。每次渲染后同步一次即可 ——
+      // versionRef 的每次变更都伴随 setVersion → 必然触发渲染。
+      useEffect(function () { ccvLiveVer = versionRef.current; });
       useEffect(function () {
         ccvLiveEditor = editorRef.current;
         return function () {
@@ -1028,6 +1038,22 @@ window.__ModuleLoader__.load({
           if (!d.ok) return;
           var dft = draftGet(d.id);
           if (dft && dft.content !== d.content) {
+            // ⚠️ 草稿必须先验「基准版本」再用。
+            // 草稿是「本机还没写回服务端」的那一版；但如果服务端在草稿产生之后前进过
+            // （AI 改了文档、或另一处写了新内容），把草稿写回去就是用旧内容覆盖新内容。
+            // 两次「话布优化」被整段抹掉都是这条路径干的：
+            // 恢复草稿 → 用服务端的当前版本当 knownVer → 版本校验通过 → 覆盖成功。
+            var dbase = (typeof dft.base === "number") ? dft.base : null;
+            if (dbase === null || dbase !== d.version) {
+              // 基准对不上（含没有 base 的旧格式草稿）→ 不自动写回，只载入服务端内容。
+              // 草稿仍留在 localStorage 里没被删，用户的内容不会丢。
+              ccvLog("草稿基准不符(草稿 v" + dbase + " / 服务端 v" + d.version + ")，不自动写回: id=" + d.id);
+              setActiveId(d.id); setContent(d.content); setVersion(d.version);
+              versionRef.current = d.version; lastSyncedMd.current = d.content;
+              setRestored(false);
+              if (window.__ccvKit && window.__ccvKit.toast) window.__ccvKit.toast("本地有一份基于旧版本的草稿，为避免覆盖新内容已暂不写回；已载入服务端最新版本", "ccv-draft-stale");
+              return;
+            }
             // 有一份没来得及写盘的草稿：它是用户刚敲的，比服务端那版新，优先恢复它。
             // 恢复后按「停止输入 1.5 秒自动存」的同一规矩补写回服务端，
             // 否则用户切走之后，这段内容只活在浏览器里，AI 在对话里看不到。
