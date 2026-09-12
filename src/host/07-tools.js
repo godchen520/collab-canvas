@@ -30,7 +30,7 @@ ctx.tools.register(defineTool({
     const c = createCanvasDoc(title)
     // 会话清单登记：AI 建的画布归入浏览器最近在看的会话清单（面板轮询可见）
     try { sessAdd(lastBrowserSid, c.id) } catch (_) {}
-    return toolOutput({ ok: true, canvasId: c.id, title: title, hint: '已创建并设为活跃画布，接着可用 canvas_write 写入内容。' })
+    return toolOutput({ ok: true, canvasId: c.id, title: title, hint: '已创建并设为活跃画布，接着可用 canvas_write 写入内容。本轮结束前记得调用 present 声明 "canvas-docs/' + slugify(c.title) + '.md"——它会在回复末尾生成一张可点卡片，点开就是话布面板。' })
   },
 }))
 
@@ -71,7 +71,7 @@ ctx.tools.register(defineTool({
     const w = applyWrite(r.c, args.content, mode, typeof args.baseVersion === 'number' ? args.baseVersion : undefined, 'ai')
     if (w.badMode) return toolOutput(err('E_BAD_ARGS', "mode 仅支持 'replace'|'append'|'prepend'"))
     if (w.conflict) return toolOutput(Object.assign(err('E_CONFLICT', '版本冲突：服务端已是 v' + w.currentVersion + '，请先 canvas_read 再重试'), { currentVersion: w.currentVersion }))
-    return toolOutput({ ok: true, canvasId: r.c.id, title: r.c.title, version: w.version, mode: mode, hint: '已写入画布「' + r.c.title + '」v' + w.version + '，用户可撤销。内容约 1.5 秒后自动落盘。' })
+    return toolOutput({ ok: true, canvasId: r.c.id, title: r.c.title, version: w.version, mode: mode, hint: '已写入画布「' + r.c.title + '」v' + w.version + '，用户可撤销。内容约 1.5 秒后自动落盘。本轮结束前记得调用 present 声明 "canvas-docs/' + slugify(r.c.title) + '.md"——它会在回复末尾生成一张可点卡片，点开就是话布面板。' })
   },
 }))
 
