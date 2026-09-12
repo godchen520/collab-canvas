@@ -83,8 +83,17 @@ function initCanvasHttpEndpoints(ctx, webServer) {
     })
   }
   // GET /api/canvas/list?sid=xxx —— 只返回该会话清单里的画布
+  //                      ?scope=all —— 返回全部画布（跨会话）。客户端做「标题 → 可点链接」
+  //                                    匹配时用：会话清单只含「本会话开过/建过的」，
+  //                                    没登记过的文档标题会匹配不到、转不成链接。
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/list', handler: async (req, res) => {
     const url = new URL(req.url, 'http://x')
+    if (url.searchParams.get('scope') === 'all') {
+      const all = []
+      canvases.forEach((c) => all.push({ id: c.id, title: c.title, version: c.version }))
+      json(res, { ok: true, canvases: all, activeId: activeId, scope: 'all' })
+      return
+    }
     const sid = sessSafe(url.searchParams.get('sid'))
     lastBrowserSid = sid
     const st = sessState(sid)
