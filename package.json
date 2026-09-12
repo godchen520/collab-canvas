@@ -1,6 +1,6 @@
 {
   "name": "collab-canvas",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DSH 协作画布插件：Markdown 渲染/编辑/序列化 + 状态管理 + 工具注册",
   "type": "module",
   "main": "dist/host.js",
