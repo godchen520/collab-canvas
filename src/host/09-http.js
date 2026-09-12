@@ -114,6 +114,15 @@ function initCanvasHttpEndpoints(ctx, webServer) {
     } catch (e) { error(res, 500, { ok: false, error: e.message }) }
   }}))
   // POST /api/canvas/save
+  // ⚠️ 2026-09-12 用引用扫描确认：这个端点**当前没有任何调用方**。
+  //    客户端写内容走的是上面的 /api/canvas/write（`lib/client.js` 只调它）；
+  //    AI 侧虽然有同名的 canvas_save 工具，但它的 execute 是**直调内部 saveCanvas()**，
+  //    不走 HTTP（ctx.tools.register 那一段里没有任何 fetch / /api/ 调用）。
+  //    留着不删的理由：它是 canvas_save 工具的 HTTP 镜像，删掉只省 11 行、却会让
+  //    "从浏览器手工落盘"这条路彻底消失。所以保留，但在这里记明它没有调用方 ——
+  //    读代码的人不必再怀疑"是不是哪里在偷偷用它"。
+  //    与 /write 的区别：/save 会真正写文件（saveCanvas + persistMeta），
+  //    /write 只改内存里的画布内容、由防抖逻辑稍后落盘。
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/save', handler: async (req, res) => {
     try {
       const body = await readBody(req)
