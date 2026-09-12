@@ -1,48 +1,12 @@
 {
-  "activeId": "cv-mty47ltm-1",
-  "rootOverride": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc",
+  "activeId": "cv-mtyd43dz-1",
+  "rootOverride": null,
   "canvases": [
     {
-      "id": "cv-mt85bakw-1",
-      "title": "123",
-      "type": "document",
-      "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/123.md"
-    },
-    {
-      "id": "cv-doubao-study",
-      "title": "豆包文档交互设计研究",
-      "type": "document",
-      "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/豆包文档交互设计研究.md"
-    },
-    {
-      "id": "cv-mtohz2cf-1",
-      "title": "端到端测试",
-      "type": "document",
-      "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/端到端测试.md"
-    },
-    {
-      "id": "cv-mtolfoqk-1",
-      "title": "333",
-      "type": "document",
-      "filePath": null
-    },
-    {
-      "id": "cv-mtpq58dy-1",
-      "title": "dsh会话列表",
-      "type": "document",
-      "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/dsh会话列表.md"
-    },
-    {
-      "id": "cv-mtpsd3hw-1",
-      "title": "dsh会话列表",
-      "type": "document",
-      "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/dsh会话列表.md"
-    },
-    {
-      "id": "cv-mty47ltm-1",
+      "id": "cv-mtyd43dz-1",
       "title": "话布优化",
       "type": "document",
-      "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/话布优化.md"
+      "filePath": null
     }
   ]
 }
