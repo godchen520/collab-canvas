@@ -216,6 +216,48 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       json(res, { ok: true, id: c.id, title: c.title, created: created })
     } catch (e) { error(res, 500, { ok: false, error: e.message }) }
   }}))
+  // ─── 白名单：本地文档「就地」登记为话布 ───────────────────────────
+  // 允许范围 = 会话工作区 ∪ 画布目录 ∪ 文件登记表里登记的文件夹。
+  // 路径先 resolve 归一化再比较，防止 ../ 逃逸；不满足即拒绝（不开全盘口子）。
+  function pathAllowedInTarget(target) {
+    let t
+    try { t = path.resolve(String(target || '')) } catch (_) { return false }
+    const roots = []
+    try { roots.push(path.resolve(sessionWorkspaceDir())) } catch (_) {}
+    try { roots.push(path.resolve(docsDirBase())) } catch (_) {}
+    regFolders.forEach(function (f) { try { roots.push(path.resolve(f)) } catch (_) {} })
+    for (let i = 0; i < roots.length; i++) {
+      const rel = path.relative(roots[i], t)
+      if (rel === '' || (rel.indexOf('..') !== 0 && !path.isAbsolute(rel))) return true
+    }
+    return false
+  }
+  // GET /api/canvas/load-path?path=<绝对路径|工作区相对路径>&sid=xxx
+  // —— 把白名单内的本地文档就地登记为话布：**绑定原路径，保存即写回原文件**（不是副本）。
+  //    与 load-doc 的区别：load-doc 只认 canvas-docs/ 下的文件、复制内容另存；
+  //    这里支持工作区/登记文件夹内的任意 .md/.markdown/.txt，且保持就地编辑语义。
+  ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/load-path', handler: async (req, res) => {
+    try {
+      const url = new URL(req.url, 'http://x')
+      const raw = String(url.searchParams.get('path') || '').trim()
+      if (!raw) { error(res, 400, { ok: false, error: '缺少 path 参数' }); return }
+      if (!/\.(md|markdown|txt|text)$/i.test(raw)) { error(res, 400, { ok: false, error: '仅支持 .md/.markdown/.txt' }); return }
+      const abs = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(sessionWorkspaceDir(), raw)
+      if (!pathAllowedInTarget(abs)) {
+        error(res, 403, { ok: false, error: '路径不在允许范围内（会话工作区 / 画布目录 / 已登记文件夹）' })
+        return
+      }
+      if (!nodefs.existsSync(abs)) { error(res, 404, { ok: false, error: '文件不存在' }); return }
+      let c = null
+      canvases.forEach(function (x) {
+        if (!c && x.filePath) { try { if (path.resolve(x.filePath) === abs) c = x } catch (_) {} }
+      })
+      let created = false
+      if (!c) { c = await loadFileDoc(abs); created = true }
+      sessAdd(url.searchParams.get('sid'), c.id)
+      json(res, { ok: true, id: c.id, title: c.title, filePath: c.filePath, created: created })
+    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+  }}))
   // GET /api/canvas/delete?id=xxx&sid=xxx —— 从当前会话清单移除画布；
   // 若其他会话清单仍引用该画布则只摘引用保留文件，无人引用才连 md 一起删
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/delete', handler: async (req, res) => {
