@@ -100,6 +100,41 @@ window.__ModuleLoader__.load({
       if (!CCV_DEBUG) return;
       try { ccvLog(typeof msg === "function" ? msg() : msg); } catch (_) {}
     }
+    // ─── 子模块共用的小工具 ────────────────────────────────
+    // docdrop.js / doclink.js 是「单文件、由 host 按请求供源码」的模块：改完刷新页面即生效、
+    // 不用重启。代价是它们没法互相 require，只能复制代码 —— 日志、轻提示条、会话查询串
+    // 因此在三处各存了一份。这里挂个全局命名空间给它们取用；取不到就各自退回自带的副本，
+    // 所以加载顺序变了也不会坏。
+    window.__ccvKit = {
+      // 统一走 /api/canvas/log；tag 会前置成 [tag]
+      log: function (msg, tag) {
+        ccvLog(tag ? "[" + tag + "] " + msg : msg);
+      },
+      // 轻提示条。id 由调用方给：原来两处各用自己的 id、各自去重，这里保持同样口径。
+      toast: function (msg, id) {
+        try {
+          var tid = id || "ccv-kit-toast";
+          var old = document.getElementById(tid);
+          if (old) old.remove();
+          var t = document.createElement("div");
+          t.id = tid;
+          t.textContent = msg;
+          t.style.cssText = "position:fixed;left:50%;bottom:96px;transform:translateX(-50%);" +
+            "z-index:2147483000;background:var(--dsw-alias-label-primary,#1a1a1a);" +
+            "color:var(--dsw-alias-bg-overlay,#fff);font-size:13px;padding:8px 14px;" +
+            "border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.25);pointer-events:none;" +
+            "opacity:1;transition:opacity .3s";
+          document.body.appendChild(t);
+          setTimeout(function () { t.style.opacity = "0" }, 2200);
+          setTimeout(function () { if (t.parentNode) t.remove() }, 2600);
+        } catch (_) {}
+      },
+      // 会话查询串片段（形如 "sid=xxx"）。刻意读 window.__ccvSid 而不是直接调 sessionKey()：
+      // 与子模块原来的口径完全一致（首帧 __ccvSid 还没算出来时退成 sid=default）。
+      sidQ: function () {
+        try { var sid = window.__ccvSid; return sid ? "sid=" + encodeURIComponent(sid) : "sid=default"; } catch (_) { return "sid=default"; }
+      }
+    };
     // 会话键同步：轮询当前会话键，变化时更新全局 sid（docdrop/doclink 读取）
     try {
       if (!window.__ccvSidTimer) {
@@ -329,6 +364,491 @@ window.__ModuleLoader__.load({
       return Math.max(dragMin(a), Math.min(byRatio, byMin));
     }
 
+    // ─── Markdown ↔ HTML 转换（纯函数）────────────────────
+    // 2026-09-12 从 CanvasPanel 里搬到这里。理由：这两个只依赖传进来的 DOM / 字符串，
+    // 不碰任何组件状态，却被写在组件内部 —— 组件每渲染一次就重新创建一遍它们，
+    // 而组件在打字时每次输入都会重渲染。搬出来同时让巨型组件少了 413 行。
+    // 搬动有等价性测试守着（工作区 _md_test.js：改前改后 22 个用例的产物逐字节一致）。
+    // ⚠️ 别再搬回组件里 —— 它们和组件状态无关，放回去只会重新引入上面的浪费。
+    function htmlToMd(root) {
+      var fnDefs = [];
+      // 对齐：execCommand('justifyCenter'/'justifyRight') 会在块元素上留 align 属性
+      // 或 text-align 内联样式。markdown 没有对齐语法，存成 ::: center/right 围栏，
+      // 渲染端 renderBlocks 负责转回 <div style="text-align:...">
+      function blockAlign(el) {
+        if (!el || !el.getAttribute) return "";
+        var a = (el.getAttribute("align") || "").toLowerCase();
+        if (a === "center" || a === "right") return a;
+        var m = (el.getAttribute("style") || "").match(/text-align\s*:\s*(center|right)/i);
+        if (m) return m[1].toLowerCase();
+        try { var ta = el.style && el.style.textAlign; if (ta === "center" || ta === "right") return ta; } catch (_) {}
+        return "";
+      }
+      function withAlign(al, md) {
+        if (!al) return md;
+        return "::: " + al + "\n" + md.replace(/\n*$/, "\n") + ":::\n";
+      }
+      function withFence(kind, md) {
+        return "::: " + kind + "\n" + md.replace(/\n*$/, "\n") + ":::\n";
+      }
+      // 编辑器里 <img>/<a> 的 src/href 是 host 读文件接口地址（插入时就要能显示）；
+      // 存盘换回 attachments/ 相对路径，md 文件保持可携带、跟着画布文件夹走
+      function assetMdPath(u) {
+        var m = String(u).match(/^\/api\/canvas\/file\?name=([^&]+)$/);
+        if (m) {
+          try {
+            var d = decodeURIComponent(m[1]);
+            if (d.indexOf("attachments/") === 0) return d;
+          } catch (_) {}
+        }
+        return u;
+      }
+      function w(n) {
+        if (n.nodeType === 3) return n.nodeValue.replace(/\u00a0/g, " ");
+        if (n.nodeType !== 1) return "";
+        // ⚠️ 脚注区域必须在 switch 之前拦截：.footnotes 是 <div>，
+        // 走 case "div" 会把它当普通正文输出，脚注定义就退化成
+        // "脚注 1 的内容 [↩](#fnref-1)" 这种半 markdown 的残渣。
+        if (n.classList && n.classList.contains('footnotes')) {
+          var lis = n.querySelectorAll('li');
+          for (var li2 = 0; li2 < lis.length; li2++) {
+            var liId = lis[li2].getAttribute('id') || '';
+            var liLabel = liId.indexOf('fn-') === 0 ? liId.slice(3) : '';
+            if (!liLabel) continue;
+            // 逐子节点序列化，跳过返回链接 ↩（href="#fnref-*"），保留其余行内格式
+            var parts = [];
+            var kids = lis[li2].childNodes || [];
+            for (var ki = 0; ki < kids.length; ki++) {
+              var kid = kids[ki];
+              if (kid.nodeType === 1) {
+                var kh = (kid.getAttribute && kid.getAttribute('href')) || '';
+                if (kh.indexOf('#fnref-') === 0) continue;
+              }
+              parts.push(w(kid));
+            }
+            var liContent = parts.join('').replace(/\s*↩\s*$/, '').trim();
+            fnDefs.push('[^' + liLabel + ']: ' + liContent);
+          }
+          return '';
+        }
+        var t = n.tagName ? n.tagName.toLowerCase() : "";
+        if (t === "br") return "\n";
+        var inner = Array.prototype.map.call(n.childNodes || [], w).join("");
+        switch (t) {
+          case "div": case "p": {
+            // 高亮块：mdToHtml 渲染 ::: highlight 时打的 class，序列化回围栏
+            if (t === "div" && n.classList && n.classList.contains("ccv-hl")) {
+              return withFence("highlight", inner);
+            }
+            return withAlign(blockAlign(n), inner + "\n");
+          }
+          case "h1": return withAlign(blockAlign(n), "# " + inner + "\n");
+          case "h2": return withAlign(blockAlign(n), "## " + inner + "\n");
+          case "h3": return withAlign(blockAlign(n), "### " + inner + "\n");
+          case "h4": return withAlign(blockAlign(n), "#### " + inner + "\n");
+          case "h5": return withAlign(blockAlign(n), "##### " + inner + "\n");
+          case "h6": return withAlign(blockAlign(n), "###### " + inner + "\n");
+          case "img": {
+            var iSrc = n.getAttribute && n.getAttribute("src") || "";
+            var iAlt = n.getAttribute && n.getAttribute("alt") || "";
+            return iSrc ? "![" + iAlt + "](" + assetMdPath(iSrc) + ")" : "";
+          }
+          case "ul": case "ol": return renderListMd(n, "");
+          case "li": {
+            var pN = n.parentNode;
+            var pOrdered = pN && pN.tagName && pN.tagName.toLowerCase() === "ol";
+            return serializeLi(n, pOrdered ? "1. " : "- ", "", pOrdered ? "   " : "  ");
+          }
+          case "strong": case "b": return inner ? "**" + inner + "**" : "";
+          case "em": case "i": return inner ? "*" + inner + "*" : "";
+          // markdown 没有下划线语法，用 ++文字++ 扩展标记存（渲染端 im 负责转回 <u>）。
+          // 之前直接存 <u> 原始标签，mdToHtml 的 esc 会把它转义成字面文字，重开画布就露馅
+          case "u": case "ins": return inner ? "++" + inner + "++" : "";
+          // 高亮：==文字== ↔ <mark>
+          case "mark": return inner ? "==" + inner + "==" : "";
+          case "strike": case "s": case "del": return inner ? "~~" + inner + "~~" : "";
+          case "code": return "`" + inner + "`";
+          case "pre": return "\n```\n" + (n.textContent || "") + "\n```\n";
+          case "blockquote": return inner.trim() ? inner.trim().split("\n").map(l => "> " + l).join("\n") + "\n" : "";
+          case "table": {
+            // <table> 必须显式序列化成 markdown 表格；走 default 会把单元格文本
+            // 压成一坨（含 ` 的 code 单元格混在一起），重新打开就没格式了
+            var tblTrs = n.querySelectorAll ? n.querySelectorAll("tr") : [];
+            if (!tblTrs.length) return "";
+            var tblRows = [], tblW = 0;
+            for (var trI = 0; trI < tblTrs.length; trI++) {
+              var tds = tblTrs[trI].querySelectorAll("th,td");
+              if (!tds.length) continue;
+              var rowArr = [];
+              for (var tdI = 0; tdI < tds.length; tdI++) {
+                var cellMd = Array.prototype.map.call(tds[tdI].childNodes || [], w).join("");
+                cellMd = cellMd.replace(/\s*\n\s*/g, " ").replace(/\|/g, "\\|").trim();
+                rowArr.push(cellMd);
+              }
+              if (rowArr.length > tblW) tblW = rowArr.length;
+              tblRows.push(rowArr);
+            }
+            if (!tblRows.length) return "";
+            var tblOut = [];
+            for (var trJ = 0; trJ < tblRows.length; trJ++) {
+              while (tblRows[trJ].length < tblW) tblRows[trJ].push("");
+              tblOut.push("| " + tblRows[trJ].join(" | ") + " |");
+              if (trJ === 0) {
+                var sepArr = [];
+                for (var scI = 0; scI < tblW; scI++) sepArr.push("---");
+                tblOut.push("| " + sepArr.join(" | ") + " |");
+              }
+            }
+            return "\n" + tblOut.join("\n") + "\n";
+          }
+          case "a":
+            var href = n.getAttribute && n.getAttribute("href") || "";
+            // 脚注引用链接：<a href="#fn-label">...</a> → [^label]
+            if (href.indexOf("#fn-") === 0) {
+              return "[^" + href.replace("#fn-", "") + "]";
+            }
+            return "[" + inner + "](" + assetMdPath(href) + ")";
+          case "hr": return "\n---\n";
+          case "sup":
+            // 脚注引用：<sup><a href="#fn-label">[label]</a></sup>
+            var aTag = n.querySelector ? n.querySelector('a[href^="#fn-"]') : null;
+            if (!aTag) {
+              // 兼容：遍历子节点找 a
+              var children = Array.prototype.slice.call(n.childNodes);
+              for (var ci = 0; ci < children.length; ci++) {
+                if (children[ci].nodeType === 1 && children[ci].tagName.toLowerCase() === 'a') {
+                  var h = children[ci].getAttribute('href') || '';
+                  if (h.indexOf('#fn-') === 0) { aTag = children[ci]; break; }
+                }
+              }
+            }
+            if (aTag) {
+              var href2 = aTag.getAttribute('href') || '';
+              var label = href2.replace('#fn-', '');
+              return '[^' + label + ']';
+            }
+            return inner;
+          default:
+            // 脚注引用 span：<span id="fnref-label">...</span> → [^label]
+            if (n.id && n.id.indexOf("fnref-") === 0) {
+              return "[^" + n.id.replace("fnref-", "") + "]";
+            }
+            return inner;
+        }
+      }
+      // 列表递归序列化：把 <ul>/<ol>（含嵌套子列表、任务列表复选框）还原成带缩进的 Markdown
+      function renderListMd(node, pad) {
+        var isOl = node.tagName.toLowerCase() === "ol";
+        var unit = isOl ? "   " : "  ";
+        var childPad = pad + unit;
+        var liOut = [];
+        var liNum = 0;
+        var kids = node.childNodes || [];
+        for (var x = 0; x < kids.length; x++) {
+          var el = kids[x];
+          if (!el || el.nodeType !== 1) continue;
+          var lt = el.tagName.toLowerCase();
+          if (lt === "ul" || lt === "ol") {
+            // 子列表作为兄弟节点（contentEditable 偶尔这样存）→ 整体缩进并入上一级
+            var sub = renderListMd(el, childPad).replace(/^\n+/, "").replace(/\n+$/, "");
+            if (sub) liOut.push(sub);
+            continue;
+          }
+          if (lt !== "li") continue;
+          liNum++;
+          var marker = isOl ? (liNum + ". ") : "- ";
+          liOut.push(serializeLi(el, marker, pad, childPad));
+        }
+        if (!liOut.length) return "";
+        return "\n" + liOut.join("\n") + "\n";
+      }
+      function serializeLi(liEl, marker, pad, childPad) {
+        // 任务列表：<li> 内含 <input type="checkbox"> → 还原成 - [ ] / - [x]
+        var cb = liEl.querySelector ? liEl.querySelector('input[type="checkbox"],input[type=checkbox]') : null;
+        var isTask = !!cb;
+        var checked = isTask && (cb.hasAttribute("checked") || cb.checked);
+        var parts = [];
+        var kids = liEl.childNodes || [];
+        for (var k = 0; k < kids.length; k++) {
+          var kid = kids[k];
+          if (kid.nodeType === 1) {
+            var kn = kid.tagName.toLowerCase();
+            if (kn === "input") continue; // 跳过复选框本身
+            if (kn === "ul" || kn === "ol") {
+              parts.push("\n" + renderListMd(kid, childPad).replace(/^\n+/, "").replace(/\n+$/, ""));
+              continue;
+            }
+          }
+          parts.push(w(kid));
+        }
+        var inner = parts.join("").replace(/^\n+/, "").replace(/\n+$/, "");
+        var lns = inner.split("\n");
+        var out = pad + (isTask ? ("- [" + (checked ? "x" : " ") + "] ") : marker) + lns[0];
+        for (var j = 1; j < lns.length; j++) out += "\n" + pad + lns[j];
+        return out;
+      }
+      var md = w(root).replace(/\n{3,}/g, "\n\n").trim();
+      // 追加脚注定义
+      if (fnDefs.length > 0) {
+        md += '\n\n' + fnDefs.join('\n');
+      }
+      return md;
+    }
+
+    function mdToHtml(src) {
+      if (!src) return "";
+      function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+      // 附件相对路径（attachments/…）重写成 host 读文件接口；编辑器里才能显示。
+      // 存盘的 md 始终保持相对路径，画布文件夹整个挪走/换机器都不断链
+      function resolveAssetUrl(u) {
+        if (/^attachments\//.test(u)) return "/api/canvas/file?name=" + encodeURIComponent(u)
+        return u
+      }
+      function im(s) {
+        return esc(s)
+          // 兼容旧版直接存进 md 的 <u> 原始标签（已被 esc 转义成 &lt;u&gt;）→ 转回真下划线
+          .replace(/&lt;u&gt;([\s\S]*?)&lt;\/u&gt;/g, '<u>$1</u>')
+          // 兼容旧版 htmlToMd 产生的 [[label]](#fn-label) 手写链接 → 转成规范脚注引用
+          .replace(/\[\[([^\]]+)\]\]\(#fn-([^)]+)\)/g, '<a href="#fn-$2" id="fnref-$2" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$2]</a>')
+          // ⚠️ 图片必须先于链接规则处理：!\[alt\](src) 里的 [alt](src) 会被链接
+          // 规则啃掉，渲染成 !<a href="src">alt</a> 这种残骸
+          .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (_m0, alt, src) {
+            return '<img src="' + resolveAssetUrl(src) + '" alt="' + alt + '" style="max-width:100%;height:auto;vertical-align:middle"/>'
+          })
+          .replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (_m1, txt, href) {
+            // title 悬停显示 md 里写的原始地址；esc 不管引号，title 属性里自己补 &quot;
+            return '<a href="' + resolveAssetUrl(href) + '" title="' + String(href).replace(/"/g, '&quot;') + '">' + txt + '</a>'
+          })
+          .replace(/`([^`]+)`/g, "<code>$1</code>")
+          .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+          .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+          .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+          .replace(/\+\+([^+]+)\+\+/g, "<u>$1</u>")
+          .replace(/==([^=]+)==/g, "<mark>$1</mark>")
+          .replace(/\[\^([^\]]+)\](?!:)/g, '<a href="#fn-$1" id="fnref-$1" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$1]</a>');
+      }
+      // 块级渲染（可递归：blockquote 内部再走一遍同样的块解析，支持引用里套表格/列表）
+      function buildTable(ls) {
+        var rows = [];
+        for (var k = 0; k < ls.length; k++) {
+          if (k === 1) continue; // 第二行是 |---|---| 分隔行
+          var raw = ls[k].trim().replace(/^\|/, "").replace(/\|$/, "");
+          var cells = raw.split("|").map(function (c) { return im(c.trim()); });
+          rows.push(cells);
+        }
+        var tbl = "<table>";
+        for (var k2 = 0; k2 < rows.length; k2++) {
+          var tag = k2 === 0 ? "th" : "td";
+          tbl += "<tr>" + rows[k2].map(function (c) { return "<" + tag + ">" + c + "</" + tag + ">"; }).join("") + "</tr>";
+        }
+        return tbl + "</table>";
+      }
+      function renderBlocks(src2) {
+        var lines = String(src2).split("\n"), out = [], i = 0, inCode = false, codeBuf = [];
+        while (i < lines.length) {
+          var l = lines[i];
+          if (/^```/.test(l)) { if (!inCode) { inCode = true; codeBuf = []; } else { out.push("<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>"); inCode = false; } i++; continue; }
+          if (inCode) { codeBuf.push(l); i++; continue; }
+          var t = l.trim(); if (!t) { i++; continue; }
+          var h2 = t.match(/^(#{1,6})\s+(.*)$/); if (h2) { out.push("<h" + h2[1].length + ">" + im(h2[2]) + "</h" + h2[1].length + ">"); i++; continue; }
+          if (/^(-{3,}|\*{3,})$/.test(t)) { out.push("<hr/>"); i++; continue; }
+          // ::: 围栏：center/right/left 对齐 + highlight 高亮块，同一套机制，
+          // 支持嵌套（depth 计数），内部递归渲染，标题/列表/引用放进去都行
+          var alM = t.match(/^:::\s*(center|right|left|highlight)\s*$/i);
+          if (alM) {
+            var alInner = [], alDepth = 1;
+            i++;
+            while (i < lines.length) {
+              var alT = lines[i].trim();
+              if (/^:::\s*$/.test(alT)) { alDepth--; if (!alDepth) { i++; break; } }
+              else if (/^:::\s*(center|right|left|highlight)\s*$/i.test(alT)) alDepth++;
+              alInner.push(lines[i]); i++;
+            }
+            var alKind = alM[1].toLowerCase();
+            out.push(alKind === "highlight"
+              ? '<div class="ccv-hl">' + renderBlocks(alInner.join("\n")) + "</div>"
+              : '<div style="text-align:' + alKind + '">' + renderBlocks(alInner.join("\n")) + "</div>");
+            continue;
+          }
+          // 表格：本行含 |，且下一行是 |---|---| 形式的分隔行 → 收集连续 | 行成表
+          if (t.indexOf("|") >= 0 && i + 1 < lines.length) {
+            var next = lines[i + 1].trim();
+            if (next.indexOf("|") >= 0 && next.indexOf("-") >= 0 && /^\|?[\s:|-]+\|?$/.test(next)) {
+              var tblLines = [t];
+              // ⚠️ 只 i+=1：分隔行也要进 tblLines（buildTable 靠 ls[1] 是分隔行来跳过它），
+              // 若在这里 i+=2 跳过分隔行，第一行正文会被 buildTable 当分隔行吃掉
+              i += 1;
+              while (i < lines.length && lines[i].trim() && lines[i].indexOf("|") >= 0) { tblLines.push(lines[i].trim()); i++; }
+              out.push(buildTable(tblLines));
+              continue;
+            }
+          }
+          // 引用：连续 > 行合并为一个 blockquote，内部递归块渲染
+          if (/^>\s?/.test(t)) {
+            var bqLines = [];
+            while (i < lines.length && /^\s*>\s?/.test(lines[i])) { bqLines.push(lines[i].replace(/^\s*>\s?/, "")); i++; }
+            out.push("<blockquote>" + renderBlocks(bqLines.join("\n")) + "</blockquote>");
+            continue;
+          }
+          // 列表（支持嵌套缩进 + 任务列表 - [ ]/- [x]）：连续列表项（含缩进子项）合成嵌套 <ul>/<ol>
+          if (/^\s*[-*+]\s+/.test(t) || /^\s*\d+[.)]\s+/.test(t)) {
+            var listLines = [];
+            while (i < lines.length) {
+              var lm = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+              if (lm) { listLines.push(lines[i]); i++; continue; }
+              break;
+            }
+            out.push(parseList(listLines));
+            continue;
+          }
+          out.push("<p>" + im(t) + "</p>"); i++;
+        }
+      if (inCode) out.push("<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>");
+      return out.join("\n");
+    }
+      // 列表解析：把一组列表行（含缩进子项）解析成嵌套树，再渲染成 <ul>/<ol>。
+      // 支持 - * + 无序、1. 有序、以及任务列表 - [ ] / - [x]（渲染成复选框）。
+      function parseList(listLines) {
+        var items = [];
+        for (var k = 0; k < listLines.length; k++) {
+          var m = listLines[k].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+          if (!m) continue;
+          var indent = m[1].replace(/\t/g, "  ").length;
+          items.push({ indent: indent, ordered: /\d/.test(m[2]), content: m[3] });
+        }
+        if (!items.length) return "";
+        // 栈式嵌套：indent 严格大于栈顶才作为子项
+        var root = { children: [] };
+        var stack = [{ indent: -1, node: root }];
+        for (var a = 0; a < items.length; a++) {
+          var it = items[a];
+          while (stack.length > 1 && it.indent <= stack[stack.length - 1].indent) stack.pop();
+          var parent = stack[stack.length - 1].node;
+          var node = { ordered: it.ordered, content: it.content, children: [] };
+          parent.children.push(node);
+          stack.push({ indent: it.indent, node: node });
+        }
+        function renderNodes(ns) {
+          if (!ns.length) return "";
+          var tag = ns[0].ordered ? "ol" : "ul";
+          var html = "<" + tag + ">";
+          for (var i = 0; i < ns.length; i++) html += "<li>" + renderItem(ns[i]) + "</li>";
+          return html + "</" + tag + ">";
+        }
+        function renderItem(n) {
+          var inner = renderItemContent(n.content);
+          if (n.children && n.children.length) inner += renderNodes(n.children);
+          return inner;
+        }
+        function renderItemContent(content) {
+          var tm = content.match(/^\[([ xX])\]\s+(.*)$/);
+          if (tm) {
+            var ck = tm[1].toLowerCase() === "x" ? " checked" : "";
+            return '<input type="checkbox"' + ck + '> ' + im(tm[2]);
+          }
+          return im(content);
+        }
+        return renderNodes(root.children);
+      }
+      // 第一遍：收集脚注定义（[^label]: 内容），不进正文
+      var lines0 = String(src).split("\n");
+      var footnotes = {}, mainLines = [];
+      var i0 = 0;
+      while (i0 < lines0.length) {
+        var l0 = lines0[i0];
+        var fnDef = l0.match(/^\[\^([^\]]+)\]:\s*(.*)$/);
+        if (fnDef) {
+          var label0 = fnDef[1], content0 = fnDef[2];
+          // 多行脚注定义：后续缩进行属于同一脚注
+          while (i0 + 1 < lines0.length && /^\s+/.test(lines0[i0 + 1]) && !/^\[\^/.test(lines0[i0 + 1].trim())) {
+            i0++;
+            content0 += " " + lines0[i0].trim();
+          }
+          footnotes[label0] = content0;
+          i0++;
+          continue;
+        }
+        mainLines.push(l0);
+        i0++;
+      }
+      var bodyHtml = renderBlocks(mainLines.join("\n"));
+      // 渲染脚注区域
+      var fnKeys = Object.keys(footnotes);
+      if (fnKeys.length > 0) {
+        var fnOut = ['<div class="footnotes"><hr/><ol>'];
+        fnKeys.forEach(function(label, idx) {
+          fnOut.push('<li id="fn-' + label + '">' + im(footnotes[label]) + ' <a href="#fnref-' + label + '" contenteditable="false">↩</a></li>');
+        });
+        fnOut.push('</ol></div>');
+        bodyHtml += "\n" + fnOut.join("\n");
+      }
+      return bodyHtml;
+    }
+
+    // ─── 静态资源（模块级）─────────────────────────────
+    // 2026-09-12 从 CanvasPanel 里搬出来。这些要么是纯常量、要么只依赖彼此，
+    // 与任何组件状态无关 —— 留在组件体内等于每渲染一次就重造一遍（划词栏一弹出就是几十次）。
+    
+    // ─── 黑白线条图标库（stroke=currentColor，随主题/悬停变色，避免 emoji 彩色不统一）──
+    var CCV_ICONS = {
+      ask: '<path d="M4 5h16v11H10l-6 4z"/>',
+      highlight: '<path d="M12 4.5a4.5 4.5 0 0 0-2.6 8.2c.6.4 1.1 1.2 1.1 2v.8h3v-.8c0-.8.5-1.6 1.1-2A4.5 4.5 0 0 0 12 4.5z"/><path d="M9.5 19h5M10.5 21.5h3"/><path d="M12 1.5v2M5.6 3.6L7 5M18.4 3.6L17 5M3 9h2M21.5 9h-2"/>',
+      clear: '<path d="M16 4l4 4-9 9H7l-3-3L16 4z"/><path d="M5 21h14"/><path d="M11 9l4 4"/>',
+      uploadImage: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 16v-5M9.5 13.5L12 11l2.5 2.5"/>',
+      globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c3.2 2.7 3.2 14.3 0 17-3.2-2.7-3.2-14.3 0-17z"/>',
+      file: '<path d="M13.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5L13.5 3z"/><path d="M13.5 3v5.5H19"/>',
+      table: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9.5h18M9.5 9.5V20M15.5 9.5V20"/>',
+      task: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8.5 12.5l2.5 2.5 5-5.5"/>',
+      listUl: '<path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1.2"/><circle cx="4.5" cy="12" r="1.2"/><circle cx="4.5" cy="18" r="1.2"/>',
+      listOl: '<path d="M10 6h10M10 12h10M10 18h10"/><text x="2.5" y="8.5" font-size="7.5" stroke="none" fill="currentColor">1</text><text x="2.5" y="14.5" font-size="7.5" stroke="none" fill="currentColor">2</text><text x="2.5" y="20.5" font-size="7.5" stroke="none" fill="currentColor">3</text>',
+      link: '<path d="M9.5 14.5a4 4 0 0 0 5.7 0l3.2-3.2a4 4 0 1 0-5.7-5.7l-1.6 1.6"/><path d="M14.5 9.5a4 4 0 0 0-5.7 0l-3.2 3.2a4 4 0 1 0 5.7 5.7l1.6-1.6"/>',
+      code: '<path d="M8.5 7.5L4 12l4.5 4.5M15.5 7.5L20 12l-4.5 4.5"/>',
+      codeBlock: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9.5 10L7 12.5 9.5 15M14.5 10l2.5 2.5-2.5 2.5"/>',
+      quote: '<path d="M10 6H5.5v5H9c0 2.5-1.2 3.8-3.5 4M18.5 6H14v5h3.5c0 2.5-1.2 3.8-3.5 4"/>',
+      hr: '<path d="M4 12h16"/>',
+      hlBlock: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7 12h10" stroke-width="2.4"/>',
+      indent: '<path d="M4 5h16M10 10h10M10 14h10M4 19h16M7 9.5L4.5 12 7 14.5"/>',
+      outdent: '<path d="M4 5h16M10 10h10M10 14h10M4 19h16M4.5 9.5L7 12l-2.5 2.5"/>',
+    }
+    function ccvIcon(name, size) {
+      var body = CCV_ICONS[name]
+      if (!body) return ""
+      var s = size || 15
+      return '<svg viewBox="0 0 24 24" width="' + s + '" height="' + s + '" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="display:block">' + body + '</svg>'
+    }
+    
+    var SELBAR_ITEMS = [
+      { label: ccvIcon("ask") + '<span style="margin-left:5px">问AI</span>', title: "将选中文本发送给 AI 问答", isAskAI: true },
+      { type: "sep" },
+      { label: "H", cmd: "formatBlock", val: "<h2>", title: "标题", isHeading: true, hasDropdown: true },
+      { type: "sep" },
+      { label: "≡", title: "对齐", hasDropdown: true, showAlign: true },
+      { type: "sep" },
+      { label: "<b>B</b>", cmd: "bold", title: "粗体" },
+      { label: "<i>I</i>", cmd: "italic", title: "斜体" },
+      { label: "<s>S</s>", cmd: "strikeThrough", title: "删除线" },
+      { label: "U", cmd: "underline", title: "下划线", style: "text-decoration:underline" },
+      { label: ccvIcon("highlight"), cmd: "highlight", title: "高亮" },
+      { label: ccvIcon("clear"), cmd: "clearFormat", title: "清除格式" },
+      { type: "sep" },
+      { label: "⋮", title: "更多功能", hasDropdown: true, showFullMenu: true },
+    ]
+    
+    // ─── 样式常量 ──────────────────────────────────
+    var CCV_STYLE = {
+      // 定位/宽高/边框由注入的 CSS（!important）统一控制，这里只放外观
+      // 内层根 div 必须填满 #collab-canvas-panel 宿主（flex 列、高 100vh），
+      // 否则它没有确定高度 → 编辑区 flex:1 1 0% 解析成 0 → 内容被压没、overflowY 失效、滚轮滚不动。
+      // minWidth/minHeight 必须写 0：flex 子项默认 min-width:auto，会被内容（宽表格、
+      // 长代码块）顶着涨，撑出容器 —— 停靠在窄侧栏里尤其明显。
+      panel: { flex: "1 1 0%", minHeight: 0, minWidth: 0, background: "var(--dsw-alias-bg-layer-1, #fff)", color: "var(--dsw-alias-label-primary, #1a1a1a)", display: "flex", flexDirection: "column", fontFamily: "var(--font-ui, system-ui, sans-serif)" },
+      drag: { position: "absolute", left: -4, top: 0, bottom: 0, width: 8, cursor: "col-resize", zIndex: 10 },
+      // overflowX:auto —— 宽表格/长代码块在窄侧栏里自己横向滚动，而不是把面板撑宽
+      editorWide: { flex: "1 1 0%", minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "auto", padding: "24px 32px", outline: "none", fontSize: 14, lineHeight: 1.75, wordBreak: "break-word" },
+    // 窄屏/窄侧栏：内边距收紧，省下的宽度留给内容
+      editorCompact: { flex: "1 1 0%", minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "auto", padding: "14px 16px", outline: "none", fontSize: 14, lineHeight: 1.75, wordBreak: "break-word" }
+    };
+
     // ─── 编辑器面板组件 ─────────────────────────────────
     // embedded=true：画布作为「右侧栏标签正文」渲染。此时它不再是一个 fixed 悬浮层，
     // 宽度/高度由标签页决定，拖拽条和全屏按钮交给侧栏自己，宽度也不再需要挤压对话列。
@@ -353,6 +873,11 @@ window.__ModuleLoader__.load({
       const panelRef = useRef(null);
       const meterRef = useRef(null);
       const panelW = embedded ? selfW : (width || 500);
+      // 兜底宽度用 ref 存一份。下面几个测量 effect 只在「挂载 / 全屏切换」时重跑一次，
+      // 若把 panelW 写进依赖数组，就会绕成「量宽度 → setSelfW → panelW 变 → 又去量」的圈。
+      // 用 ref 读最新值：既拿不到过期的数（原来的隐患），也不会多跑。
+      const panelWRef = useRef(panelW);
+      panelWRef.current = panelW;
       const draftTimer = useRef(null);
       // 停靠模式下，"窄"由面板自己的宽度决定，而不是整个窗口 ——
       // 窗口 1600 宽、侧栏只给 315 时，面板也是窄的，得用紧凑内边距。
@@ -391,23 +916,28 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         var t = setTimeout(function () {
           var el = panelRef.current;
-          var w = el ? el.getBoundingClientRect().width : panelW;
+          var w = el ? el.getBoundingClientRect().width : panelWRef.current;
           if (embedded) setSelfW(Math.round(w));
-          updateMeter(w, measureAvail());
+          // 停靠模式下 updateMeter 第一句就 return，量出来的 avail 根本用不上 ——
+          // 而 measureAvail() 要走一遍祖先链，这里省掉。
+          updateMeter(w, embedded ? null : measureAvail());
         }, 0);
         return function () { clearTimeout(t); };
       }, [isFull, embedded]);
-      // 对话列尺寸一变（左侧栏收放、窗口缩放）就刷新读数
+      // 对话列尺寸一变（左侧栏收放、窗口缩放）就刷新读数。
+      // 停靠模式下这个观察者其实不该再跑：面板的宽度由右侧栏给，跟对话列没关系。
+      // 但它在悬浮模式下有用（那时面板会挤压对话列，两者宽度联动），所以保留，只是停靠时直接退出。
       useEffect(() => {
+        if (embedded) return;
         var col = conversationColumn();
         if (!col) return;
         var ro = new ResizeObserver(function () {
-          var w = panelRef.current ? panelRef.current.getBoundingClientRect().width : panelW;
+          var w = panelRef.current ? panelRef.current.getBoundingClientRect().width : panelWRef.current;
           updateMeter(w, measureAvail());
         });
         ro.observe(col);
         return function () { ro.disconnect(); };
-      }, [isFull]);
+      }, [isFull, embedded]);
 
       // 停靠模式：宽度由右侧栏标签页给，自己量。拖宽拖窄标签页时跟着变。
       useEffect(function () {
@@ -834,449 +1364,10 @@ window.__ModuleLoader__.load({
       }
 
       // ─── Markdown ↔ HTML ──────────────────────────
-      function htmlToMd(root) {
-        var fnDefs = [];
-        // 对齐：execCommand('justifyCenter'/'justifyRight') 会在块元素上留 align 属性
-        // 或 text-align 内联样式。markdown 没有对齐语法，存成 ::: center/right 围栏，
-        // 渲染端 renderBlocks 负责转回 <div style="text-align:...">
-        function blockAlign(el) {
-          if (!el || !el.getAttribute) return "";
-          var a = (el.getAttribute("align") || "").toLowerCase();
-          if (a === "center" || a === "right") return a;
-          var m = (el.getAttribute("style") || "").match(/text-align\s*:\s*(center|right)/i);
-          if (m) return m[1].toLowerCase();
-          try { var ta = el.style && el.style.textAlign; if (ta === "center" || ta === "right") return ta; } catch (_) {}
-          return "";
-        }
-        function withAlign(al, md) {
-          if (!al) return md;
-          return "::: " + al + "\n" + md.replace(/\n*$/, "\n") + ":::\n";
-        }
-        function withFence(kind, md) {
-          return "::: " + kind + "\n" + md.replace(/\n*$/, "\n") + ":::\n";
-        }
-        // 编辑器里 <img>/<a> 的 src/href 是 host 读文件接口地址（插入时就要能显示）；
-        // 存盘换回 attachments/ 相对路径，md 文件保持可携带、跟着画布文件夹走
-        function assetMdPath(u) {
-          var m = String(u).match(/^\/api\/canvas\/file\?name=([^&]+)$/);
-          if (m) {
-            try {
-              var d = decodeURIComponent(m[1]);
-              if (d.indexOf("attachments/") === 0) return d;
-            } catch (_) {}
-          }
-          return u;
-        }
-        function w(n) {
-          if (n.nodeType === 3) return n.nodeValue.replace(/\u00a0/g, " ");
-          if (n.nodeType !== 1) return "";
-          // ⚠️ 脚注区域必须在 switch 之前拦截：.footnotes 是 <div>，
-          // 走 case "div" 会把它当普通正文输出，脚注定义就退化成
-          // "脚注 1 的内容 [↩](#fnref-1)" 这种半 markdown 的残渣。
-          if (n.classList && n.classList.contains('footnotes')) {
-            var lis = n.querySelectorAll('li');
-            for (var li2 = 0; li2 < lis.length; li2++) {
-              var liId = lis[li2].getAttribute('id') || '';
-              var liLabel = liId.indexOf('fn-') === 0 ? liId.slice(3) : '';
-              if (!liLabel) continue;
-              // 逐子节点序列化，跳过返回链接 ↩（href="#fnref-*"），保留其余行内格式
-              var parts = [];
-              var kids = lis[li2].childNodes || [];
-              for (var ki = 0; ki < kids.length; ki++) {
-                var kid = kids[ki];
-                if (kid.nodeType === 1) {
-                  var kh = (kid.getAttribute && kid.getAttribute('href')) || '';
-                  if (kh.indexOf('#fnref-') === 0) continue;
-                }
-                parts.push(w(kid));
-              }
-              var liContent = parts.join('').replace(/\s*↩\s*$/, '').trim();
-              fnDefs.push('[^' + liLabel + ']: ' + liContent);
-            }
-            return '';
-          }
-          var t = n.tagName ? n.tagName.toLowerCase() : "";
-          if (t === "br") return "\n";
-          var inner = Array.prototype.map.call(n.childNodes || [], w).join("");
-          switch (t) {
-            case "div": case "p": {
-              // 高亮块：mdToHtml 渲染 ::: highlight 时打的 class，序列化回围栏
-              if (t === "div" && n.classList && n.classList.contains("ccv-hl")) {
-                return withFence("highlight", inner);
-              }
-              return withAlign(blockAlign(n), inner + "\n");
-            }
-            case "h1": return withAlign(blockAlign(n), "# " + inner + "\n");
-            case "h2": return withAlign(blockAlign(n), "## " + inner + "\n");
-            case "h3": return withAlign(blockAlign(n), "### " + inner + "\n");
-            case "h4": return withAlign(blockAlign(n), "#### " + inner + "\n");
-            case "h5": return withAlign(blockAlign(n), "##### " + inner + "\n");
-            case "h6": return withAlign(blockAlign(n), "###### " + inner + "\n");
-            case "img": {
-              var iSrc = n.getAttribute && n.getAttribute("src") || "";
-              var iAlt = n.getAttribute && n.getAttribute("alt") || "";
-              return iSrc ? "![" + iAlt + "](" + assetMdPath(iSrc) + ")" : "";
-            }
-            case "ul": case "ol": return renderListMd(n, "");
-            case "li": {
-              var pN = n.parentNode;
-              var pOrdered = pN && pN.tagName && pN.tagName.toLowerCase() === "ol";
-              return serializeLi(n, pOrdered ? "1. " : "- ", "", pOrdered ? "   " : "  ");
-            }
-            case "strong": case "b": return inner ? "**" + inner + "**" : "";
-            case "em": case "i": return inner ? "*" + inner + "*" : "";
-            // markdown 没有下划线语法，用 ++文字++ 扩展标记存（渲染端 im 负责转回 <u>）。
-            // 之前直接存 <u> 原始标签，mdToHtml 的 esc 会把它转义成字面文字，重开画布就露馅
-            case "u": case "ins": return inner ? "++" + inner + "++" : "";
-            // 高亮：==文字== ↔ <mark>
-            case "mark": return inner ? "==" + inner + "==" : "";
-            case "strike": case "s": case "del": return inner ? "~~" + inner + "~~" : "";
-            case "code": return "`" + inner + "`";
-            case "pre": return "\n```\n" + (n.textContent || "") + "\n```\n";
-            case "blockquote": return inner.trim() ? inner.trim().split("\n").map(l => "> " + l).join("\n") + "\n" : "";
-            case "table": {
-              // <table> 必须显式序列化成 markdown 表格；走 default 会把单元格文本
-              // 压成一坨（含 ` 的 code 单元格混在一起），重新打开就没格式了
-              var tblTrs = n.querySelectorAll ? n.querySelectorAll("tr") : [];
-              if (!tblTrs.length) return "";
-              var tblRows = [], tblW = 0;
-              for (var trI = 0; trI < tblTrs.length; trI++) {
-                var tds = tblTrs[trI].querySelectorAll("th,td");
-                if (!tds.length) continue;
-                var rowArr = [];
-                for (var tdI = 0; tdI < tds.length; tdI++) {
-                  var cellMd = Array.prototype.map.call(tds[tdI].childNodes || [], w).join("");
-                  cellMd = cellMd.replace(/\s*\n\s*/g, " ").replace(/\|/g, "\\|").trim();
-                  rowArr.push(cellMd);
-                }
-                if (rowArr.length > tblW) tblW = rowArr.length;
-                tblRows.push(rowArr);
-              }
-              if (!tblRows.length) return "";
-              var tblOut = [];
-              for (var trJ = 0; trJ < tblRows.length; trJ++) {
-                while (tblRows[trJ].length < tblW) tblRows[trJ].push("");
-                tblOut.push("| " + tblRows[trJ].join(" | ") + " |");
-                if (trJ === 0) {
-                  var sepArr = [];
-                  for (var scI = 0; scI < tblW; scI++) sepArr.push("---");
-                  tblOut.push("| " + sepArr.join(" | ") + " |");
-                }
-              }
-              return "\n" + tblOut.join("\n") + "\n";
-            }
-            case "a":
-              var href = n.getAttribute && n.getAttribute("href") || "";
-              // 脚注引用链接：<a href="#fn-label">...</a> → [^label]
-              if (href.indexOf("#fn-") === 0) {
-                return "[^" + href.replace("#fn-", "") + "]";
-              }
-              return "[" + inner + "](" + assetMdPath(href) + ")";
-            case "hr": return "\n---\n";
-            case "sup":
-              // 脚注引用：<sup><a href="#fn-label">[label]</a></sup>
-              var aTag = n.querySelector ? n.querySelector('a[href^="#fn-"]') : null;
-              if (!aTag) {
-                // 兼容：遍历子节点找 a
-                var children = Array.prototype.slice.call(n.childNodes);
-                for (var ci = 0; ci < children.length; ci++) {
-                  if (children[ci].nodeType === 1 && children[ci].tagName.toLowerCase() === 'a') {
-                    var h = children[ci].getAttribute('href') || '';
-                    if (h.indexOf('#fn-') === 0) { aTag = children[ci]; break; }
-                  }
-                }
-              }
-              if (aTag) {
-                var href2 = aTag.getAttribute('href') || '';
-                var label = href2.replace('#fn-', '');
-                return '[^' + label + ']';
-              }
-              return inner;
-            default:
-              // 脚注引用 span：<span id="fnref-label">...</span> → [^label]
-              if (n.id && n.id.indexOf("fnref-") === 0) {
-                return "[^" + n.id.replace("fnref-", "") + "]";
-              }
-              return inner;
-          }
-        }
-        // 列表递归序列化：把 <ul>/<ol>（含嵌套子列表、任务列表复选框）还原成带缩进的 Markdown
-        function renderListMd(node, pad) {
-          var isOl = node.tagName.toLowerCase() === "ol";
-          var unit = isOl ? "   " : "  ";
-          var childPad = pad + unit;
-          var liOut = [];
-          var liNum = 0;
-          var kids = node.childNodes || [];
-          for (var x = 0; x < kids.length; x++) {
-            var el = kids[x];
-            if (!el || el.nodeType !== 1) continue;
-            var lt = el.tagName.toLowerCase();
-            if (lt === "ul" || lt === "ol") {
-              // 子列表作为兄弟节点（contentEditable 偶尔这样存）→ 整体缩进并入上一级
-              var sub = renderListMd(el, childPad).replace(/^\n+/, "").replace(/\n+$/, "");
-              if (sub) liOut.push(sub);
-              continue;
-            }
-            if (lt !== "li") continue;
-            liNum++;
-            var marker = isOl ? (liNum + ". ") : "- ";
-            liOut.push(serializeLi(el, marker, pad, childPad));
-          }
-          if (!liOut.length) return "";
-          return "\n" + liOut.join("\n") + "\n";
-        }
-        function serializeLi(liEl, marker, pad, childPad) {
-          // 任务列表：<li> 内含 <input type="checkbox"> → 还原成 - [ ] / - [x]
-          var cb = liEl.querySelector ? liEl.querySelector('input[type="checkbox"],input[type=checkbox]') : null;
-          var isTask = !!cb;
-          var checked = isTask && (cb.hasAttribute("checked") || cb.checked);
-          var parts = [];
-          var kids = liEl.childNodes || [];
-          for (var k = 0; k < kids.length; k++) {
-            var kid = kids[k];
-            if (kid.nodeType === 1) {
-              var kn = kid.tagName.toLowerCase();
-              if (kn === "input") continue; // 跳过复选框本身
-              if (kn === "ul" || kn === "ol") {
-                parts.push("\n" + renderListMd(kid, childPad).replace(/^\n+/, "").replace(/\n+$/, ""));
-                continue;
-              }
-            }
-            parts.push(w(kid));
-          }
-          var inner = parts.join("").replace(/^\n+/, "").replace(/\n+$/, "");
-          var lns = inner.split("\n");
-          var out = pad + (isTask ? ("- [" + (checked ? "x" : " ") + "] ") : marker) + lns[0];
-          for (var j = 1; j < lns.length; j++) out += "\n" + pad + lns[j];
-          return out;
-        }
-        var md = w(root).replace(/\n{3,}/g, "\n\n").trim();
-        // 追加脚注定义
-        if (fnDefs.length > 0) {
-          md += '\n\n' + fnDefs.join('\n');
-        }
-        return md;
-      }
+      // ⚠️ htmlToMd / mdToHtml 已搬到模块级，见文件上方「Markdown ↔ HTML 转换（纯函数）」。
+      //    找不到不是被删了 —— 往上翻。
 
-      function mdToHtml(src) {
-        if (!src) return "";
-        function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-        // 附件相对路径（attachments/…）重写成 host 读文件接口；编辑器里才能显示。
-        // 存盘的 md 始终保持相对路径，画布文件夹整个挪走/换机器都不断链
-        function resolveAssetUrl(u) {
-          if (/^attachments\//.test(u)) return "/api/canvas/file?name=" + encodeURIComponent(u)
-          return u
-        }
-        function im(s) {
-          return esc(s)
-            // 兼容旧版直接存进 md 的 <u> 原始标签（已被 esc 转义成 &lt;u&gt;）→ 转回真下划线
-            .replace(/&lt;u&gt;([\s\S]*?)&lt;\/u&gt;/g, '<u>$1</u>')
-            // 兼容旧版 htmlToMd 产生的 [[label]](#fn-label) 手写链接 → 转成规范脚注引用
-            .replace(/\[\[([^\]]+)\]\]\(#fn-([^)]+)\)/g, '<a href="#fn-$2" id="fnref-$2" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$2]</a>')
-            // ⚠️ 图片必须先于链接规则处理：!\[alt\](src) 里的 [alt](src) 会被链接
-            // 规则啃掉，渲染成 !<a href="src">alt</a> 这种残骸
-            .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (_m0, alt, src) {
-              return '<img src="' + resolveAssetUrl(src) + '" alt="' + alt + '" style="max-width:100%;height:auto;vertical-align:middle"/>'
-            })
-            .replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (_m1, txt, href) {
-              // title 悬停显示 md 里写的原始地址；esc 不管引号，title 属性里自己补 &quot;
-              return '<a href="' + resolveAssetUrl(href) + '" title="' + String(href).replace(/"/g, '&quot;') + '">' + txt + '</a>'
-            })
-            .replace(/`([^`]+)`/g, "<code>$1</code>")
-            .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-            .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-            .replace(/~~([^~]+)~~/g, "<del>$1</del>")
-            .replace(/\+\+([^+]+)\+\+/g, "<u>$1</u>")
-            .replace(/==([^=]+)==/g, "<mark>$1</mark>")
-            .replace(/\[\^([^\]]+)\](?!:)/g, '<a href="#fn-$1" id="fnref-$1" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[$1]</a>');
-        }
-        // 块级渲染（可递归：blockquote 内部再走一遍同样的块解析，支持引用里套表格/列表）
-        function buildTable(ls) {
-          var rows = [];
-          for (var k = 0; k < ls.length; k++) {
-            if (k === 1) continue; // 第二行是 |---|---| 分隔行
-            var raw = ls[k].trim().replace(/^\|/, "").replace(/\|$/, "");
-            var cells = raw.split("|").map(function (c) { return im(c.trim()); });
-            rows.push(cells);
-          }
-          var tbl = "<table>";
-          for (var k2 = 0; k2 < rows.length; k2++) {
-            var tag = k2 === 0 ? "th" : "td";
-            tbl += "<tr>" + rows[k2].map(function (c) { return "<" + tag + ">" + c + "</" + tag + ">"; }).join("") + "</tr>";
-          }
-          return tbl + "</table>";
-        }
-        function renderBlocks(src2) {
-          var lines = String(src2).split("\n"), out = [], i = 0, inCode = false, codeBuf = [];
-          while (i < lines.length) {
-            var l = lines[i];
-            if (/^```/.test(l)) { if (!inCode) { inCode = true; codeBuf = []; } else { out.push("<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>"); inCode = false; } i++; continue; }
-            if (inCode) { codeBuf.push(l); i++; continue; }
-            var t = l.trim(); if (!t) { i++; continue; }
-            var h2 = t.match(/^(#{1,6})\s+(.*)$/); if (h2) { out.push("<h" + h2[1].length + ">" + im(h2[2]) + "</h" + h2[1].length + ">"); i++; continue; }
-            if (/^(-{3,}|\*{3,})$/.test(t)) { out.push("<hr/>"); i++; continue; }
-            // ::: 围栏：center/right/left 对齐 + highlight 高亮块，同一套机制，
-            // 支持嵌套（depth 计数），内部递归渲染，标题/列表/引用放进去都行
-            var alM = t.match(/^:::\s*(center|right|left|highlight)\s*$/i);
-            if (alM) {
-              var alInner = [], alDepth = 1;
-              i++;
-              while (i < lines.length) {
-                var alT = lines[i].trim();
-                if (/^:::\s*$/.test(alT)) { alDepth--; if (!alDepth) { i++; break; } }
-                else if (/^:::\s*(center|right|left|highlight)\s*$/i.test(alT)) alDepth++;
-                alInner.push(lines[i]); i++;
-              }
-              var alKind = alM[1].toLowerCase();
-              out.push(alKind === "highlight"
-                ? '<div class="ccv-hl">' + renderBlocks(alInner.join("\n")) + "</div>"
-                : '<div style="text-align:' + alKind + '">' + renderBlocks(alInner.join("\n")) + "</div>");
-              continue;
-            }
-            // 表格：本行含 |，且下一行是 |---|---| 形式的分隔行 → 收集连续 | 行成表
-            if (t.indexOf("|") >= 0 && i + 1 < lines.length) {
-              var next = lines[i + 1].trim();
-              if (next.indexOf("|") >= 0 && next.indexOf("-") >= 0 && /^\|?[\s:|-]+\|?$/.test(next)) {
-                var tblLines = [t];
-                // ⚠️ 只 i+=1：分隔行也要进 tblLines（buildTable 靠 ls[1] 是分隔行来跳过它），
-                // 若在这里 i+=2 跳过分隔行，第一行正文会被 buildTable 当分隔行吃掉
-                i += 1;
-                while (i < lines.length && lines[i].trim() && lines[i].indexOf("|") >= 0) { tblLines.push(lines[i].trim()); i++; }
-                out.push(buildTable(tblLines));
-                continue;
-              }
-            }
-            // 引用：连续 > 行合并为一个 blockquote，内部递归块渲染
-            if (/^>\s?/.test(t)) {
-              var bqLines = [];
-              while (i < lines.length && /^\s*>\s?/.test(lines[i])) { bqLines.push(lines[i].replace(/^\s*>\s?/, "")); i++; }
-              out.push("<blockquote>" + renderBlocks(bqLines.join("\n")) + "</blockquote>");
-              continue;
-            }
-            // 列表（支持嵌套缩进 + 任务列表 - [ ]/- [x]）：连续列表项（含缩进子项）合成嵌套 <ul>/<ol>
-            if (/^\s*[-*+]\s+/.test(t) || /^\s*\d+[.)]\s+/.test(t)) {
-              var listLines = [];
-              while (i < lines.length) {
-                var lm = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
-                if (lm) { listLines.push(lines[i]); i++; continue; }
-                break;
-              }
-              out.push(parseList(listLines));
-              continue;
-            }
-            out.push("<p>" + im(t) + "</p>"); i++;
-          }
-        if (inCode) out.push("<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>");
-        return out.join("\n");
-      }
-      // 列表解析：把一组列表行（含缩进子项）解析成嵌套树，再渲染成 <ul>/<ol>。
-      // 支持 - * + 无序、1. 有序、以及任务列表 - [ ] / - [x]（渲染成复选框）。
-      function parseList(listLines) {
-        var items = [];
-        for (var k = 0; k < listLines.length; k++) {
-          var m = listLines[k].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
-          if (!m) continue;
-          var indent = m[1].replace(/\t/g, "  ").length;
-          items.push({ indent: indent, ordered: /\d/.test(m[2]), content: m[3] });
-        }
-        if (!items.length) return "";
-        // 栈式嵌套：indent 严格大于栈顶才作为子项
-        var root = { children: [] };
-        var stack = [{ indent: -1, node: root }];
-        for (var a = 0; a < items.length; a++) {
-          var it = items[a];
-          while (stack.length > 1 && it.indent <= stack[stack.length - 1].indent) stack.pop();
-          var parent = stack[stack.length - 1].node;
-          var node = { ordered: it.ordered, content: it.content, children: [] };
-          parent.children.push(node);
-          stack.push({ indent: it.indent, node: node });
-        }
-        function renderNodes(ns) {
-          if (!ns.length) return "";
-          var tag = ns[0].ordered ? "ol" : "ul";
-          var html = "<" + tag + ">";
-          for (var i = 0; i < ns.length; i++) html += "<li>" + renderItem(ns[i]) + "</li>";
-          return html + "</" + tag + ">";
-        }
-        function renderItem(n) {
-          var inner = renderItemContent(n.content);
-          if (n.children && n.children.length) inner += renderNodes(n.children);
-          return inner;
-        }
-        function renderItemContent(content) {
-          var tm = content.match(/^\[([ xX])\]\s+(.*)$/);
-          if (tm) {
-            var ck = tm[1].toLowerCase() === "x" ? " checked" : "";
-            return '<input type="checkbox"' + ck + '> ' + im(tm[2]);
-          }
-          return im(content);
-        }
-        return renderNodes(root.children);
-      }
-        // 第一遍：收集脚注定义（[^label]: 内容），不进正文
-        var lines0 = String(src).split("\n");
-        var footnotes = {}, mainLines = [];
-        var i0 = 0;
-        while (i0 < lines0.length) {
-          var l0 = lines0[i0];
-          var fnDef = l0.match(/^\[\^([^\]]+)\]:\s*(.*)$/);
-          if (fnDef) {
-            var label0 = fnDef[1], content0 = fnDef[2];
-            // 多行脚注定义：后续缩进行属于同一脚注
-            while (i0 + 1 < lines0.length && /^\s+/.test(lines0[i0 + 1]) && !/^\[\^/.test(lines0[i0 + 1].trim())) {
-              i0++;
-              content0 += " " + lines0[i0].trim();
-            }
-            footnotes[label0] = content0;
-            i0++;
-            continue;
-          }
-          mainLines.push(l0);
-          i0++;
-        }
-        var bodyHtml = renderBlocks(mainLines.join("\n"));
-        // 渲染脚注区域
-        var fnKeys = Object.keys(footnotes);
-        if (fnKeys.length > 0) {
-          var fnOut = ['<div class="footnotes"><hr/><ol>'];
-          fnKeys.forEach(function(label, idx) {
-            fnOut.push('<li id="fn-' + label + '">' + im(footnotes[label]) + ' <a href="#fnref-' + label + '" contenteditable="false">↩</a></li>');
-          });
-          fnOut.push('</ol></div>');
-          bodyHtml += "\n" + fnOut.join("\n");
-        }
-        return bodyHtml;
-      }
-
-      // ─── 黑白线条图标库（stroke=currentColor，随主题/悬停变色，避免 emoji 彩色不统一）──
-      var CCV_ICONS = {
-        ask: '<path d="M4 5h16v11H10l-6 4z"/>',
-        highlight: '<path d="M12 4.5a4.5 4.5 0 0 0-2.6 8.2c.6.4 1.1 1.2 1.1 2v.8h3v-.8c0-.8.5-1.6 1.1-2A4.5 4.5 0 0 0 12 4.5z"/><path d="M9.5 19h5M10.5 21.5h3"/><path d="M12 1.5v2M5.6 3.6L7 5M18.4 3.6L17 5M3 9h2M21.5 9h-2"/>',
-        clear: '<path d="M16 4l4 4-9 9H7l-3-3L16 4z"/><path d="M5 21h14"/><path d="M11 9l4 4"/>',
-        uploadImage: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 16v-5M9.5 13.5L12 11l2.5 2.5"/>',
-        globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c3.2 2.7 3.2 14.3 0 17-3.2-2.7-3.2-14.3 0-17z"/>',
-        file: '<path d="M13.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5L13.5 3z"/><path d="M13.5 3v5.5H19"/>',
-        table: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9.5h18M9.5 9.5V20M15.5 9.5V20"/>',
-        task: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8.5 12.5l2.5 2.5 5-5.5"/>',
-        listUl: '<path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1.2"/><circle cx="4.5" cy="12" r="1.2"/><circle cx="4.5" cy="18" r="1.2"/>',
-        listOl: '<path d="M10 6h10M10 12h10M10 18h10"/><text x="2.5" y="8.5" font-size="7.5" stroke="none" fill="currentColor">1</text><text x="2.5" y="14.5" font-size="7.5" stroke="none" fill="currentColor">2</text><text x="2.5" y="20.5" font-size="7.5" stroke="none" fill="currentColor">3</text>',
-        link: '<path d="M9.5 14.5a4 4 0 0 0 5.7 0l3.2-3.2a4 4 0 1 0-5.7-5.7l-1.6 1.6"/><path d="M14.5 9.5a4 4 0 0 0-5.7 0l-3.2 3.2a4 4 0 1 0 5.7 5.7l1.6-1.6"/>',
-        code: '<path d="M8.5 7.5L4 12l4.5 4.5M15.5 7.5L20 12l-4.5 4.5"/>',
-        codeBlock: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9.5 10L7 12.5 9.5 15M14.5 10l2.5 2.5-2.5 2.5"/>',
-        quote: '<path d="M10 6H5.5v5H9c0 2.5-1.2 3.8-3.5 4M18.5 6H14v5h3.5c0 2.5-1.2 3.8-3.5 4"/>',
-        hr: '<path d="M4 12h16"/>',
-        hlBlock: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7 12h10" stroke-width="2.4"/>',
-        indent: '<path d="M4 5h16M10 10h10M10 14h10M4 19h16M7 9.5L4.5 12 7 14.5"/>',
-        outdent: '<path d="M4 5h16M10 10h10M10 14h10M4 19h16M4.5 9.5L7 12l-2.5 2.5"/>',
-      }
-      function ccvIcon(name, size) {
-        var body = CCV_ICONS[name]
-        if (!body) return ""
-        var s = size || 15
-        return '<svg viewBox="0 0 24 24" width="' + s + '" height="' + s + '" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="display:block">' + body + '</svg>'
-      }
-
+      // ↑ 已提到模块级：见文件上方「静态资源（模块级）」
       // ─── 划词栏（参考豆包样式）──────────────────────
       // 选区保存
       // ⚠️ savedRange 建在组件函数体内，每次重渲染都会被重置为 null。
@@ -1731,23 +1822,7 @@ window.__ModuleLoader__.load({
         })
       }
 
-      var SELBAR_ITEMS = [
-        { label: ccvIcon("ask") + '<span style="margin-left:5px">问AI</span>', title: "将选中文本发送给 AI 问答", isAskAI: true },
-        { type: "sep" },
-        { label: "H", cmd: "formatBlock", val: "<h2>", title: "标题", isHeading: true, hasDropdown: true },
-        { type: "sep" },
-        { label: "≡", title: "对齐", hasDropdown: true, showAlign: true },
-        { type: "sep" },
-        { label: "<b>B</b>", cmd: "bold", title: "粗体" },
-        { label: "<i>I</i>", cmd: "italic", title: "斜体" },
-        { label: "<s>S</s>", cmd: "strikeThrough", title: "删除线" },
-        { label: "U", cmd: "underline", title: "下划线", style: "text-decoration:underline" },
-        { label: ccvIcon("highlight"), cmd: "highlight", title: "高亮" },
-        { label: ccvIcon("clear"), cmd: "clearFormat", title: "清除格式" },
-        { type: "sep" },
-        { label: "⋮", title: "更多功能", hasDropdown: true, showFullMenu: true },
-      ]
-
+      // ↑ 已提到模块级：见文件上方「静态资源（模块级）」
       // ─── 全功能菜单（⋮：移动端唯一入口，格式+插入都在）──────────────
       function showFullMenu(anchor) {
         var items = [
@@ -1905,28 +1980,16 @@ window.__ModuleLoader__.load({
         })
       }
 
-      // ─── 样式 ──────────────────────────────────────
-      var S = {
-        // 定位/宽高/边框由注入的 CSS（!important）统一控制，这里只放外观
-        // 内层根 div 必须填满 #collab-canvas-panel 宿主（flex 列、高 100vh），
-        // 否则它没有确定高度 → 编辑区 flex:1 1 0% 解析成 0 → 内容被压没、overflowY 失效、滚轮滚不动。
-        // minWidth/minHeight 必须写 0：flex 子项默认 min-width:auto，会被内容（宽表格、
-        // 长代码块）顶着涨，撑出容器 —— 停靠在窄侧栏里尤其明显。
-        panel: { flex: "1 1 0%", minHeight: 0, minWidth: 0, background: "var(--dsw-alias-bg-layer-1, #fff)", color: "var(--dsw-alias-label-primary, #1a1a1a)", display: "flex", flexDirection: "column", fontFamily: "var(--font-ui, system-ui, sans-serif)" },
-        drag: { position: "absolute", left: -4, top: 0, bottom: 0, width: 8, cursor: "col-resize", zIndex: 10 },
-        // overflowX:auto —— 宽表格/长代码块在窄侧栏里自己横向滚动，而不是把面板撑宽
-        editor: { flex: "1 1 0%", minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "auto", padding: compact ? "14px 16px" : "24px 32px", outline: "none", fontSize: 14, lineHeight: 1.75, wordBreak: "break-word" }
-      };
-
+      // ↑ 已提到模块级：见文件上方「静态资源（模块级）」
       // 当前话布标题：canvases 里找 activeId 对应的那条
       let curTitle = "";
       for (let i = 0; i < canvases.length; i++) {
         if (canvases[i].id === activeId) { curTitle = canvases[i].title; break; }
       }
 
-      return h("div", { ref: panelRef, className: "ccv-panel" + (embedded ? " ccv-docked" : ""), style: S.panel },
+      return h("div", { ref: panelRef, className: "ccv-panel" + (embedded ? " ccv-docked" : ""), style: CCV_STYLE.panel },
         // 窄屏没有分栏，也就不需要拖拽条；停靠模式下宽度由标签页给，同样不需要
-        (narrow || embedded) ? null : h("div", { style: S.drag, onMouseDown: onDragStart }),
+        (narrow || embedded) ? null : h("div", { style: CCV_STYLE.drag, onMouseDown: onDragStart }),
         h("div", {
           className: "ccv-head",
           // 读数平时透明，鼠标移进顶栏才浮现
@@ -2001,7 +2064,7 @@ window.__ModuleLoader__.load({
           )
         ),
         h("div", {
-          ref: editorRef, className: "ccv-editor", contentEditable: true, suppressContentEditableWarning: true, style: S.editor,
+          ref: editorRef, className: "ccv-editor", contentEditable: true, suppressContentEditableWarning: true, style: compact ? CCV_STYLE.editorCompact : CCV_STYLE.editorWide,
           dangerouslySetInnerHTML: { __html: mdToHtml(content) },
           onInput: () => { scheduleDraft(); clearTimeout(saveTimer.current); saveTimer.current = setTimeout(saveCanvas, 1500); },
           onMouseUp: onEditorMouseUp,
@@ -2332,16 +2395,25 @@ window.__ModuleLoader__.load({
 
     const inject = ["slots", "conversation", "sidebarRightTabs", "sidebarRight"];
 
+    // 幂等注入一段 CSS：同一个 id 只插一次，重复调用是空操作。
+    // 悬浮面板与停靠标签页是两份不同的组件树，apply 可能被走多遍 —— 靠这里去重。
+    function ensureStyle(id, cssText) {
+      if (typeof document === 'undefined') return;
+      if (document.getElementById(id)) return;   // 已注入过，不重复插
+      var el = document.createElement('style');
+      el.id = id;
+      el.textContent = cssText;
+      document.head.appendChild(el);
+    }
+
     function apply(ctx) {
       ccvCtx = ctx;   // tab 正文是另一个组件，用的就是这个引用
       // ─── 会话内容限流 ──────────────────────────────
       // DSH 的会话消息不主动给 <img> 设 max-width，AI 生成的大图 / 截图会撑破
       // 会话列宽；右侧一旦打开话布（position:fixed、高 z-index），溢出的图片
       // 就被压在话布底下看不见。在 apply 入口注入一次，按列宽缩放。
-      if (typeof document !== 'undefined' && !document.getElementById('ccv-cc-constrain')) {
-        var s = document.createElement('style');
-        s.id = 'ccv-cc-constrain';
-        s.textContent =
+      ensureStyle('ccv-cc-constrain',
+
           // 全局兜底：DSH 各处都可能塞大图（AI 截图、代码块配图、Markdown 预览、
           // React Portal 灯箱等），都得按父容器宽缩放。图标通常有自己的显式
           // width/height，加这两条只对它们是"上限"，不影响已设的尺寸。
@@ -2371,18 +2443,15 @@ window.__ModuleLoader__.load({
           '.ccv-panel.ccv-panel .ccv-editor pre{' +
             'max-width:100%!important;' +
             'overflow-x:auto!important;' +
-          '}';
-        document.head.appendChild(s);
-      }
+          '}'
+      );
       // ─── 两行顶栏样式 ────────────────────────────
       // 上行管话布（＋新建 / 文件名切换 / 全屏），下行管当前文档（保存 / 重载 / 关闭）。
       // hover 与 disabled 用内联 style 表达不了（内联优先级还会盖掉 CSS 的 hover），
       // 所以走 className + 注入 CSS；选择器统一带 .ccv-panel 前缀提权（面板根自己的
       // class，悬浮/停靠两种摆法都命中），因此不需要 !important。
-      if (typeof document !== 'undefined' && !document.getElementById('ccv-hdr2-style')) {
-        var hs = document.createElement('style');
-        hs.id = 'ccv-hdr2-style';
-        hs.textContent = [
+      ensureStyle('ccv-hdr2-style',
+         [
           '.ccv-panel .ccv-head{display:flex;flex-direction:column;flex:0 0 auto;min-width:0;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.25))}',
           '.ccv-panel .ccv-row{display:flex;align-items:center;gap:6px;padding:5px 8px;flex-wrap:nowrap;overflow:visible;min-width:0}',
           '.ccv-panel .ccv-row-top{position:relative}',
@@ -2418,14 +2487,11 @@ window.__ModuleLoader__.load({
           '.ccv-panel .ccv-editor .footnotes ol{margin:0;padding-left:20px}',
           '.ccv-panel .ccv-editor .footnotes li{margin:4px 0;line-height:1.6}',
           '.ccv-panel .ccv-editor .footnotes a{color:#3b82f6;text-decoration:none}'
-        ].join('\n');
-        document.head.appendChild(hs);
-      }
+        ].join('\n')
+      );
       // ─── Markdown 渲染样式（新 editor 用 .ccv-editor；旧 03-styles.js 的 .ccv-wysiwyg 已弃用）
-      if (typeof document !== 'undefined' && !document.getElementById('ccv-md-style')) {
-        var ms = document.createElement('style');
-        ms.id = 'ccv-md-style';
-        ms.textContent = [
+      ensureStyle('ccv-md-style',
+         [
           '.ccv-panel .ccv-editor > *:first-child{margin-top:0}',
           '.ccv-panel .ccv-editor > *:last-child{margin-bottom:0}',
           '.ccv-panel .ccv-editor h1{font-size:1.6em;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));padding-bottom:.2em;margin:.6em 0 .4em;font-weight:600;line-height:1.3}',
@@ -2464,9 +2530,8 @@ window.__ModuleLoader__.load({
           '.ccv-panel .ccv-editor strong{font-weight:600}',
           '.ccv-panel .ccv-editor em{font-style:italic}',
           '.ccv-panel .ccv-editor del{text-decoration:line-through;opacity:.75}'
-        ].join('\n');
-        document.head.appendChild(ms);
-      }
+        ].join('\n')
+      );
       // ─── JS 终极兜底 ──────────────────────────────
       // 即使 CSS 选择器漏、即使 inline style 用了 !important (CSS 覆盖不了
       // inline !important) 都能压住。每秒 + 任何 DOM 新增都重扫一遍。
