@@ -1,5 +1,5 @@
 {
-  "activeId": "cv-mtpsd3hw-1",
+  "activeId": "cv-mty47ltm-1",
   "rootOverride": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc",
   "canvases": [
     {
@@ -37,6 +37,12 @@
       "title": "dsh会话列表",
       "type": "document",
       "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/dsh会话列表.md"
+    },
+    {
+      "id": "cv-mty47ltm-1",
+      "title": "话布优化",
+      "type": "document",
+      "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/话布优化.md"
     }
   ]
 }
