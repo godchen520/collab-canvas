@@ -14,7 +14,6 @@ function createCanvasDoc(title) {
   const c = { id: id, title: title, type: 'document', content: '', version: 1, filePath: null, history: [], redoStack: [], dirty: true, updatedAt: Date.now() }
   canvases.set(id, c)
   activeId = id
-  emit(EV.CANVAS_CREATED, { canvasId: id, title: title })
   persistMeta()
   debouncedFlush()
   return c
@@ -33,11 +32,6 @@ function applyWrite(c, content, mode, baseVersion, source) {
   c.dirty = true
   c.updatedAt = Date.now()
   pushHistory(c, before, c.content, source, c.version)
-  emit(EV.CONTENT_CHANGED, { canvasId: c.id, version: c.version, source: source })
-  if (source === 'ai') {
-    const opId = 'op-' + Date.now().toString(36) + '-' + (++idSeq)
-    emit(EV.AI_EDIT_APPLIED, { canvasId: c.id, opId: opId })
-  }
   debouncedFlush()
   return { version: c.version }
 }
@@ -49,7 +43,6 @@ async function loadFileDoc(filePath, title) {
   const c = { id: id, title: t, type: 'document', content: content, version: 1, filePath: filePath, history: [], redoStack: [], dirty: false, updatedAt: Date.now() }
   canvases.set(id, c)
   activeId = id
-  emit(EV.FILE_LOADED, { canvasId: id, filePath: filePath })
   persistMeta()
   return c
 }

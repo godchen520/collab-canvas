@@ -48,7 +48,6 @@ harness.handle('canvas.undo', async function (args) {
   c.version += 1
   c.dirty = true
   c.updatedAt = Date.now()
-  emit(EV.CONTENT_CHANGED, { canvasId: c.id, version: c.version, source: 'undo' })
   debouncedFlush()
   return { ok: true, content: c.content, version: c.version }
 })
@@ -63,7 +62,6 @@ harness.handle('canvas.redo', async function (args) {
   c.version += 1
   c.dirty = true
   c.updatedAt = Date.now()
-  emit(EV.CONTENT_CHANGED, { canvasId: c.id, version: c.version, source: 'redo' })
   debouncedFlush()
   return { ok: true, content: c.content, version: c.version }
 })
@@ -116,7 +114,6 @@ harness.handle('canvas.delete', async function (args) {
     const first = canvases.keys().next()
     activeId = first.done ? null : first.value
   }
-  emit(EV.CANVAS_CLOSED, { canvasId: c.id })
   await persistMeta()
   return { ok: true, activeId: activeId, note: '文件保留在磁盘' + (c.filePath ? '：' + c.filePath : '（未落盘）') + '，可手动清理' }
 })

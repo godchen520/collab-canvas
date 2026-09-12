@@ -155,7 +155,6 @@ ctx.tools.register(defineTool({
       const first = canvases.keys().next()
       activeId = first.done ? null : first.value
     }
-    emit && emit(EV.CANVAS_CLOSED, { canvasId: id })
     try { await persistMeta() } catch (e) { console.error('[collab-canvas] delete persist failed:', e.message) }
     return toolOutput({ ok: true, canvasId: id, activeId: activeId, note: '文件保留在磁盘' + (c.filePath ? '：' + c.filePath : '（未落盘）') + '，可手动清理' })
   },

@@ -42,7 +42,6 @@ async function saveCanvas(c, filePath) {
     await writeFile(primary, c.content)
     c.filePath = primary
     c.dirty = false
-    emit(EV.FILE_SAVED, { canvasId: c.id, filePath: primary })
     return { path: primary, relocated: false }
   } catch (e) {
     // 显式指定路径失败不静默改道；默认目录被拒则回退到沙箱认可区
@@ -51,7 +50,6 @@ async function saveCanvas(c, filePath) {
     await writeFile(p2, c.content)
     c.filePath = p2
     c.dirty = false
-    emit(EV.FILE_SAVED, { canvasId: c.id, filePath: p2 })
     return { path: p2, relocated: true }
   }
 }
