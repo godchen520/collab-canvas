@@ -1,5 +1,5 @@
 {
-  "activeId": "cv-mty47ltm-1",
+  "activeId": "cv-mtyi95g2-1",
   "rootOverride": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc",
   "canvases": [
     {
@@ -27,12 +27,6 @@
       "filePath": null
     },
     {
-      "id": "cv-mtpq58dy-1",
-      "title": "dsh会话列表",
-      "type": "document",
-      "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/dsh会话列表.md"
-    },
-    {
       "id": "cv-mtpsd3hw-1",
       "title": "dsh会话列表",
       "type": "document",
@@ -43,6 +37,12 @@
       "title": "话布优化",
       "type": "document",
       "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/话布优化.md"
+    },
+    {
+      "id": "cv-mtyi95g2-1",
+      "title": "DSH启动崩溃_会话路径错位_修复说明_2026-09-12",
+      "type": "document",
+      "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/DSH启动崩溃_会话路径错位_修复说明_2026-09-12.md"
     }
   ]
 }

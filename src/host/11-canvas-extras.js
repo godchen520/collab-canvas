@@ -204,6 +204,17 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       const content = nodefs.readFileSync(full, 'utf8')
       const title = rel.split('/').pop().replace(/\.(md|markdown)$/i, '')
       let c = null
+      // 先按标题找；找不到再按「已绑定到同一个文件」找。
+      // 只按标题去重是不够的：标题不同但指向同一文件时仍会新建一条，
+      // 于是同一文件挂两条记录，旧的那条内容过期、保存即覆盖。
+      let fullKey
+      try { fullKey = path.resolve(full) } catch (_) { fullKey = full }
+      canvases.forEach(function (x) {
+        if (c || !x.filePath) return
+        let k
+        try { k = path.resolve(String(x.filePath)) } catch (_) { k = String(x.filePath) }
+        if (k === fullKey) c = x
+      })
       canvases.forEach(function (x) { if (!c && x.title === title) c = x })
       let created = false
       if (!c) {

@@ -95,7 +95,22 @@ async function restore() {
   if (!meta) { console.log('[collab-canvas]', 'no previous meta (first run)'); return }
   try {
     if (typeof meta.rootOverride === 'string' && meta.rootOverride.length > 2) rootOverride = meta.rootOverride
+    // 兜底去重：历史 meta 里可能已经存了「同一文件挂多条记录」。
+    // 两条记录各自持有内存内容，过期的旧记录一旦保存就会把文件覆盖回去，
+    // 所以恢复阶段就要把重复挡掉（按归一化后的 filePath 判重，先到先得）。
+    const seenFiles = new Set()
+    let skippedDup = 0
     for (const m of meta.canvases || []) {
+      if (m.filePath) {
+        let key
+        try { key = path.resolve(String(m.filePath)) } catch (_) { key = String(m.filePath) }
+        if (seenFiles.has(key)) {
+          skippedDup++
+          console.error('[collab-canvas] restore: 跳过重复文件记录', m.id, '->', m.filePath)
+          continue
+        }
+        seenFiles.add(key)
+      }
       let content = ''
       if (m.filePath) {
         try { content = await fs.readText(await fs.resolve(m.filePath)) }
@@ -107,6 +122,7 @@ async function restore() {
         dirty: false, updatedAt: Date.now(),
       })
     }
+    if (skippedDup) console.error('[collab-canvas] restore: 共跳过', skippedDup, '条重复记录')
     activeId = meta.activeId && canvases.has(meta.activeId) ? meta.activeId : (meta.canvases && meta.canvases[0] && meta.canvases[0].id) || null
     console.log('[collab-canvas]', 'restored', canvases.size, 'canvas(es), root =', docsDirBase())
   } catch (e) {

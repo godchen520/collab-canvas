@@ -226,8 +226,10 @@ check('img 还原 ![alt](src)', mdImg.indexOf('![图](data:image/png;base64,AAA)
 // ─── 8. 任务列表 + 嵌套 ─────────────────────────────
 console.log('--- 8. 任务列表 / 嵌套 ---')
 const taskHtml = mdToHtml('- [ ] 待办\n- [x] 完成')
-check('未勾选渲染成复选框', taskHtml.indexOf('<input type="checkbox" disabled> 待办') >= 0)
-check('已勾选渲染成 checked 复选框', taskHtml.indexOf('<input type="checkbox" disabled checked> 完成') >= 0)
+// 复选框是有意做成「可点击」的（不带 disabled，CSS 给了 cursor:pointer），
+// 所以这里断言不带 disabled；勾选状态靠 htmlToMd 读 .checked 回写。
+check('未勾选渲染成复选框', taskHtml.indexOf('<input type="checkbox"> 待办') >= 0)
+check('已勾选渲染成 checked 复选框', taskHtml.indexOf('<input type="checkbox" checked> 完成') >= 0)
 check('任务项仍在同一个 <ul>', (taskHtml.match(/<ul>/g) || []).length === 1)
 
 function buildTaskDom() {
