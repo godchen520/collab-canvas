@@ -154,7 +154,9 @@ window.__ModuleLoader__.load({
     // 加载的是哪一版（本环境开不了控制台，日志是唯一的核对通道）。
     //   v1  2026-09-12 起：并发保护（knownVer + 冲突处理）、草稿基准版本校验、
     //      行内规则先抽出后还原、列表往返修复
-    var CCV_CLIENT_VERSION = 1;
+    //   v2  2026-09-12：引用块带上来源 @md 路径（ccvDocMention），
+    //      多行选区逐行加 ">" 引号
+    var CCV_CLIENT_VERSION = 2;
     var CCV_DRAFT_KEY = "ccv-draft-cache";    // { [canvasId]: { content, at, base } }
     var ccvCtx = null;                        // 模块级 ctx：tab 正文是独立组件，拿不到 apply 的闭包
     var ccvLiveEditor = null;                 // 当前编辑区 DOM。组件卸载后 React 会把 ref 置空，
@@ -1410,12 +1412,36 @@ window.__ModuleLoader__.load({
         html += "</table><div><br></div>"
         document.execCommand("insertHTML", false, html)
       }
+      // 引用来源的 @ 提及：算出当前话布对应的 md 相对路径。
+      // 为什么要带来源：用户引用一段文字问 AI 时，如果两篇文档含同样的文字，
+      // 光看引用块 AI 无从判断该改哪一篇 —— 只能靠记忆猜，猜错就改了错的文档，
+      // 而且是静默的（用户看不到任何变化）。带上 @路径 这一步就变成事实判断。
+      // 用 DSH 官方的 @file 语法（dsh-file-reference）：无空格路径直接用 @path，
+      // 路径里的空格在 canvas-docs 侧已被 slugify 换成 '-'，所以不需要引号形式。
+      function ccvDocMention(id) {
+        var c = null
+        try {
+          (canvases || []).forEach(function (x) { if (x && x.id === id) c = x })
+        } catch (_) {}
+        if (!c || !c.title) return ''
+        // 与 host 端 slugify 保持同一规则（01-utils.js）
+        var slug = String(c.title).replace(/[\\/:*?"<>|#%]+/g, '').trim().replace(/\s+/g, '-')
+        if (!slug) slug = 'untitled'
+        return '@canvas-docs/' + slug + '.md'
+      }
+
       // 问 AI：选中文本以引用块格式塞进 DSH 输入框（划词栏💬与右键菜单共用）
       function askAiFromSelection() {
         var sel = document.getSelection()
         var text = sel ? sel.toString().trim() : ''
         if (!text) { alert('请先选中要问 AI 的文本'); return }
         hideSelbar()
+        // ⚠️ 必须留一个空格：@ 提及 token 由空白字符终止，
+        //    写成 "@xxx>内容" 会把 ">" 并进路径里。
+        var mention = ccvDocMention(activeId)
+        // 多行选区每一行都要带 ">"，否则只有首行是引用块
+        var quoted = text.split('\n').map(function (l) { return '> ' + l }).join('\n')
+        var body = (mention ? mention + ' ' : '') + quoted
         var input =
           document.querySelector('div[data-composer-input="true"]') ||
           document.querySelector('[data-slot="conversation.input"] textarea') ||
@@ -1429,7 +1455,7 @@ window.__ModuleLoader__.load({
           document.querySelector('[contenteditable="true"][role="textbox"]')
         if (input) {
           if (input.tagName === 'TEXTAREA') {
-            var quote = '> ' + text + '\n\n'
+            var quote = body + '\n\n'
             var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
             nativeInputValueSetter.call(input, quote + input.value)
             input.dispatchEvent(new Event('input', { bubbles: true }))
@@ -1437,15 +1463,16 @@ window.__ModuleLoader__.load({
             // 新版 DSH 用 Lexical 编辑器：优先走官方 inputActions.setDraft（能保留换行）
             var draftState = window.__ccvInputState
             var curDraft = (draftState && draftState.draft) ? draftState.draft : ''
-            var newDraft = '> ' + text + '\n\n' + curDraft
+            var newDraft = body + '\n\n' + curDraft
             if (window.__ccvInputActions && window.__ccvInputActions.setDraft) {
               window.__ccvInputActions.setDraft(newDraft)
             } else {
               // fallback: 直接写 DOM + 派发 input
               var escTxt = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-              var quoteHtml = '<div>> ' + escTxt + '</div><div><br></div><div><br></div>'
+              var escMention = mention ? String(mention).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + ' ' : ''
+              var quoteHtml = '<div>' + escMention + '&gt; ' + escTxt + '</div><div><br></div><div><br></div>'
               input.innerHTML = quoteHtml + input.innerHTML
-              input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '> ' + text }))
+              input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: body }))
             }
           }
           input.focus()
