@@ -86,11 +86,14 @@ function initCanvasHttpEndpoints(ctx, webServer) {
   //                      ?scope=all —— 返回全部画布（跨会话）。客户端做「标题 → 可点链接」
   //                                    匹配时用：会话清单只含「本会话开过/建过的」，
   //                                    没登记过的文档标题会匹配不到、转不成链接。
+  // 每条都带 path：md 文件的**真实绝对路径**（正斜杠）。客户端生成 @ 引用、
+  // 显示位置都要用真实路径，不能自己拼相对路径 —— 存储根被 rootOverride
+  // 固定到别处后，相对路径会指向工作区里的残留目录。
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/list', handler: async (req, res) => {
     const url = new URL(req.url, 'http://x')
     if (url.searchParams.get('scope') === 'all') {
       const all = []
-      canvases.forEach((c) => all.push({ id: c.id, title: c.title, version: c.version }))
+      canvases.forEach((c) => all.push({ id: c.id, title: c.title, version: c.version, path: canvasMdPath(c) }))
       json(res, { ok: true, canvases: all, activeId: activeId, scope: 'all' })
       return
     }
@@ -98,7 +101,7 @@ function initCanvasHttpEndpoints(ctx, webServer) {
     lastBrowserSid = sid
     const st = sessState(sid)
     const arr = []
-    st.ids.forEach((id) => { const c = canvases.get(id); if (c) arr.push({ id: c.id, title: c.title, version: c.version }) })
+    st.ids.forEach((id) => { const c = canvases.get(id); if (c) arr.push({ id: c.id, title: c.title, version: c.version, path: canvasMdPath(c) }) })
     json(res, { ok: true, canvases: arr, activeId: st.activeId })
   }}))
   // GET /api/canvas/read?id=xxx —— 打开过就记入该会话清单
@@ -109,7 +112,7 @@ function initCanvasHttpEndpoints(ctx, webServer) {
     if (!c) { error(res, 404, { ok: false, error: '画布不存在' }); return }
     sessAdd(url.searchParams.get('sid'), c.id)
     lastBrowserSid = sessSafe(url.searchParams.get('sid'))
-    json(res, { ok: true, id: c.id, title: c.title, content: c.content, version: c.version })
+    json(res, { ok: true, id: c.id, title: c.title, content: c.content, version: c.version, path: canvasMdPath(c) })
   }}))
   // POST /api/canvas/write
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/write', handler: async (req, res) => {

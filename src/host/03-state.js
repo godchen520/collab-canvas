@@ -35,3 +35,17 @@ function docsDirBase() {
 }
 function docsDir() { return joinPath(docsDirBase(), 'canvas-docs') }
 function metaPath() { return joinPath(docsDir(), '.canvases.json') }
+
+// 画布对应的 md 文件「真实路径」（绝对、正斜杠）。
+// filePath 为空时按存储根 + slugify(标题) 推算（与 saveCanvas 的落盘规则一致）。
+//
+// ⚠️ 别再让调用方自己拼 "canvas-docs/<标题>.md"：那是**相对**路径，只有当
+//    「会话工作区 == 存储根」时才成立。存储根被 canvas_configure 固定到别处后
+//    （rootOverride），它指向的是工作区里的残留目录 —— 文件根本不在那儿。
+//    2026-09-12 另一会话据此报过一次「引用给出的路径不存在」。
+function canvasMdPath(c) {
+  if (!c) return ''
+  let p = c.filePath
+  if (!p) { try { p = joinPath(docsDir(), slugify(c.title) + '.md') } catch (_) { p = '' } }
+  return String(p).replace(/\\/g, '/')
+}

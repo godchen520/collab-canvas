@@ -156,7 +156,9 @@ window.__ModuleLoader__.load({
     //      行内规则先抽出后还原、列表往返修复
     //   v2  2026-09-12：引用块带上来源 @md 路径（ccvDocMention），
     //      多行选区逐行加 ">" 引号
-    var CCV_CLIENT_VERSION = 2;
+    //   v3  2026-09-12：@ 来源改用 host 给的真实绝对路径（含空格走 @"..." 引号形式），
+    //      不再自己拼相对路径 canvas-docs/<标题>.md
+    var CCV_CLIENT_VERSION = 3;
     var CCV_DRAFT_KEY = "ccv-draft-cache";    // { [canvasId]: { content, at, base } }
     var ccvCtx = null;                        // 模块级 ctx：tab 正文是独立组件，拿不到 apply 的闭包
     var ccvLiveEditor = null;                 // 当前编辑区 DOM。组件卸载后 React 会把 ref 置空，
@@ -1412,19 +1414,31 @@ window.__ModuleLoader__.load({
         html += "</table><div><br></div>"
         document.execCommand("insertHTML", false, html)
       }
-      // 引用来源的 @ 提及：算出当前话布对应的 md 相对路径。
+      // 引用来源的 @ 提及：算出当前话布对应的 md 真实路径。
       // 为什么要带来源：用户引用一段文字问 AI 时，如果两篇文档含同样的文字，
       // 光看引用块 AI 无从判断该改哪一篇 —— 只能靠记忆猜，猜错就改了错的文档，
       // 而且是静默的（用户看不到任何变化）。带上 @路径 这一步就变成事实判断。
-      // 用 DSH 官方的 @file 语法（dsh-file-reference）：无空格路径直接用 @path，
-      // 路径里的空格在 canvas-docs 侧已被 slugify 换成 '-'，所以不需要引号形式。
+      //
+      // ⚠️ 必须用 host 给的真实绝对路径，不能自己拼 "canvas-docs/<标题>.md"：
+      //    那是相对路径，只在「会话工作区 == 存储根」时才成立。存储根被
+      //    canvas_configure 固定到别处后（rootOverride），它指向的是工作区里
+      //    的残留目录 —— 文件根本不在那儿（2026-09-12 另一会话据此报过）。
+      //
+      // ⚠️ 真实路径几乎必然含空格（"DSH project"、"OneDrive - …"），必须用
+      //    DSH 的引号形式 @"path"：@ token 由空白终止，裸写会在第一个空格处截断。
+      //    规则与 dsh-file-reference 的 formatFileMention 一致。
       function ccvDocMention(id) {
         var c = null
         try {
           (canvases || []).forEach(function (x) { if (x && x.id === id) c = x })
         } catch (_) {}
-        if (!c || !c.title) return ''
-        // 与 host 端 slugify 保持同一规则（01-utils.js）
+        if (!c) return ''
+        if (c.path) {
+          var abs = String(c.path).replace(/\\/g, '/')
+          return /\s/.test(abs) ? '@"' + abs + '"' : '@' + abs
+        }
+        if (!c.title) return ''
+        // 兜底：拿不到真实路径时（旧版 host 没返回 path 字段）退回相对形式
         var slug = String(c.title).replace(/[\\/:*?"<>|#%]+/g, '').trim().replace(/\s+/g, '-')
         if (!slug) slug = 'untitled'
         return '@canvas-docs/' + slug + '.md'
