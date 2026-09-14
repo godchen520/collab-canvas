@@ -155,3 +155,31 @@ rootOverride（持久化 meta）> sessions.cwd > workspaceRegistry > 部署根
 ⚠️ `sessions.list()` 报告的 cwd = GUI 槽位 ≠ 用户项目目录
 ⚠️ meta 必须双写所有候选位置（冷启动任何一份都带 override）
 ⚠️ composition 下 `docsDirBase()` 初始可能是部署根（`E:\DeepSeek Harness\canvas-docs`），restore 会读取 meta 里的 rootOverride 纠正到项目目录
+
+---
+
+## 八、改话布文档必须走画布，不能直接改文件（重要）
+
+`canvas-docs/*.md` 的内容有**两份**：
+
+| 位置 | 谁在用 |
+| --- | --- |
+| **画布内存**（host 的 `canvases` Map） | 画布面板显示的就是这份 |
+| **磁盘文件** | git、外部工具、AI 读文件时看的是这份 |
+
+**直接写文件只更新磁盘，画布内存仍是旧内容**，后果有两个：
+
+1. 面板里看到的还是旧版本（用户以为你没改）
+2. **面板下一次自动保存会把内存里的旧内容写回文件** —— 反过来覆盖掉你在文件上做的修正
+
+**正确做法（三选一）：**
+
+- `canvas_write` 工具（AI 用）
+- `POST /api/canvas/write`，带 `knownVer`（脚本用）
+- 直接改文件之后，**必须**再把文件内容写回画布同步一次
+
+> 2026-09-14 实际踩到：用脚本直接改了设计稿的日期与代码围栏语言，
+> 文件是对的、面板里还是旧的；靠用户引用那一行才发现。
+
+同理，**恢复/改写文档时不要直接 `writeFileSync`** —— 用带 `knownVer` 的写回，
+它同时更新内存与磁盘，且能挡住并发覆盖。
