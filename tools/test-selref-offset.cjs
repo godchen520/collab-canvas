@@ -480,6 +480,41 @@ async function main() {
   utext = await captured.codec.serialize(String(rec.code))
   ok("输出里不出现定位行", utext.indexOf("定位：") < 0 && utext.indexOf("⚠️") < 0)
 
+  console.log("\n【20】定位行必须始终是**一行**（换行要现形，不能把句尾顶下去）")
+  // 主人 09-14 截图实测的毛病：一整行连续相同的字，选中中间那几个，
+  // 扩到唯一时"后面的内容"正好含一个换行 → 句尾那个省略号被顶到下一行，
+  // 末尾孤零零一个「…」。换行必须换成看得见的符号。
+  const ROW = "1".repeat(14)
+  const twoEditor = new E("DIV", [new E("DIV", [new T(ROW)]), new E("DIV", [new T(ROW)])])
+  withBridge(null, twoEditor, fakeRange(twoEditor.childNodes[0].childNodes[0], 0, "1".repeat(5)))
+  rec = capture()
+  eq("同一行重复 → 出现次数", rec.dupCount, (ROW.length - 5 + 1) * 2)
+  ok("拿到唯一上下文", rec.anchorOk)
+  eq("选区就在文首 → 前面没有多余省略号", rec.anchorBefore, "")
+  // 最小唯一窗口 = 整行 + 换行 + 下一行的头一个字；去掉选中的 5 个就是后面这部分
+  eq("后面的内容（含一个换行）", rec.anchorAfter, ROW.slice(5) + "\n" + ROW.charAt(0))
+
+  dtext = await captured.codec.serialize(String(rec.code))
+  dlines = dtext.split("\n")
+  eq("含换行的上下文也不能把消息撑成 4 行", dlines.length, 3)
+  eq("定位行整体形状（换行显示为 ↵，前面不摆指向虚空的省略号）",
+    dlines[2], "定位：【" + "1".repeat(5) + "】" + ROW.slice(5) + "↵" + ROW.charAt(0) + "…")
+  ok("换行确实被换成了看得见的符号", dlines[2].indexOf("↵") > 0)
+  eq("【】里仍然是原文", dlines[2].slice(dlines[2].indexOf("【") + 1, dlines[2].indexOf("】")), "1".repeat(5))
+
+  console.log("\n【21】选区在行尾（上下都跨行）→ 定位行仍不许被拆散")
+  // 选最后一行末尾那几个：往前扩必须跨过上一行的换行
+  const tailNode = twoEditor.childNodes[1].childNodes[0]
+  withBridge(null, twoEditor, fakeRange(tailNode, ROW.length - 5, "1".repeat(5)))
+  rec = capture()
+  ok("拿到了唯一上下文", rec.anchorOk)
+  ok("前面带有内容（跨到了上一行的换行）", rec.anchorBefore.length > 0)
+  dtext = await captured.codec.serialize(String(rec.code))
+  dlines = dtext.split("\n")
+  eq("仍是 3 行", dlines.length, 3)
+  ok("前后的换行都现形了", dlines[2].indexOf("↵") > 0)
+  ok("【】里仍是那 5 个字", dlines[2].indexOf("【" + "1".repeat(5) + "】") > 0)
+
   console.log("\n────────────────────────────────")
   console.log("通过 " + pass + " 项，失败 " + fail + " 项")
   process.exit(fail ? 1 : 0)
