@@ -159,3 +159,138 @@ ctx.tools.register(defineTool({
     return toolOutput({ ok: true, canvasId: id, activeId: activeId, note: '文件保留在磁盘' + (c.filePath ? '：' + c.filePath : '（未落盘）') + '，可手动清理' })
   },
 }))
+
+// ═══ canvas_locate：把「这段原文到底是哪一处」讲清楚 ═══════════════
+// 为什么要有它（2026-09-14 主人拍板）：
+//   @话布选区 的引用本身只有「路径 + 行号 + 原文」两行。同一段原文在文档里
+//   出现多次时，**模型没法只凭行号认出是哪一处** —— 而把"前后文坐标"塞进
+//   引用正文既长又难读（主人原话：不够优雅），模型照样得自己数。
+//   所以改成"模型按需来问"：它想问的时候问一次，我们当场算给它。
+// 顺带的好处：这里读的是**当前**文档，所以"这段引用是不是已经失效"也一并答了。
+//
+// [[CCV-LOCATE-BEGIN]] —— 下面到 END 之间是这块功能的全部代码。
+//   tools/test-host-locate.cjs 靠这两个标记把这段**真代码**切出来单独跑，
+//   不是照抄一份来测。挪动或删除标记会让那份测试失效。
+function occIndexes(text, needle) {
+  const out = []
+  let i = 0
+  while ((i = text.indexOf(needle, i)) >= 0) { out.push(i); i += 1 }   // 允许重叠
+  return out
+}
+// 某一处在 Markdown 源码里的行号 / 列号（都从 1 数）。
+function lineColOf(text, idx) {
+  const before = text.slice(0, idx)
+  return { line: before.split('\n').length, col: idx - (before.lastIndexOf('\n') + 1) + 1 }
+}
+// 摘要里出现换行会把结构拆散，换成看得见的符号；长度不变、意思不丢。
+function asOneLine(s) { return String(s).replace(/\n/g, '↵') }
+
+// 按 canvasId / path 找文档；都没给就用活跃画布。
+// 引用里给的是**文件路径**，所以要支持按路径匹配。
+function findCanvasByArg(args) {
+  const id = args && typeof args.canvasId === 'string' ? args.canvasId : ''
+  if (id) return canvases.get(id) || null
+  const raw = args && typeof args.path === 'string' ? args.path : ''
+  if (raw) {
+    const norm = (s) => String(s).replace(/\\/g, '/').replace(/^"+|"+$/g, '')
+    const want = norm(raw)
+    let hit = null
+    canvases.forEach(function (c) { if (!hit && c.filePath && norm(c.filePath) === want) hit = c })
+    if (hit) return hit
+    // 兜底：模型可能只给了文件名的一部分 —— 用标题去认
+    canvases.forEach(function (c) {
+      if (!hit && c.title && want.indexOf(norm(c.title).replace(/\.md$/i, '')) >= 0) hit = c
+    })
+    if (hit) return hit
+  }
+  return activeId ? canvases.get(activeId) || null : null
+}
+
+ctx.tools.register(defineTool({
+  name: 'canvas_locate',
+  description: '在话布文档里精确找出「一段原文」所处的位置（第几处、每处长什么样），'
+    + '并在原文已不在文档里时明确告知这段引用已经失效。'
+    + '⚠️ 用户用 @话布选区 引用了一段文字、且引用标签上标着「多处」时，动手改之前必须先调用它确认是哪一处；'
+    + '标签里的「第 N 处」直接传 ordinal 就能定住（它比行号可靠 —— 同一行里可能有好几处一模一样的文字）。'
+    + '没标「多处」时也可以用它复核。原文重复时不要自己挑一处改 —— 改错地方比不回答更糟。',
+  parameters: {
+    text: { type: 'string', required: true, description: '要定位的原文（引用里「」中的内容，请一字不差地照抄）' },
+    canvasId: { type: 'string', description: '画布 id；缺省用活跃画布' },
+    path: { type: 'string', description: '文档路径（引用里的 @ 路径）；给了它就不必给 canvasId' },
+    line: { type: 'number', description: '引用标签里给的第几行，用于优先核对' },
+    ordinal: { type: 'number', description: '引用标签里给的「第 N 处」；给了它就直接定位到这一处，优先于 line' },
+  },
+  output: { schema: { type: 'string' }, render: function (_a, v) { return [{ type: 'text', text: v }] } },
+  execute: async function (args) {
+    const text = args && typeof args.text === 'string' ? args.text : ''
+    if (!text) return toolOutput(err('E_BAD_ARGS', 'text 必须为非空字符串（引用里「」中的那段原文）'))
+    const c = findCanvasByArg(args)
+    if (!c) return toolOutput(err('E_NOT_FOUND', '没找到对应的话布文档；可先用 canvas_list 看看有哪些'))
+    const content = String(c.content || '')
+    const idxs = occIndexes(content, text)
+
+    // 找不到 → 引用已经失效。这时候**绝不能**让它去找"相似内容"照着改。
+    if (!idxs.length) {
+      return toolOutput({
+        ok: false,
+        error: { code: 'E_GONE', message: '这段原文已经不在《' + c.title + '》里了' },
+        canvasId: c.id, title: c.title, version: c.version,
+        hint: '这段引用很可能已经失效（用户发出引用之后文档被改过）。'
+          + '请让用户重新划一次要引用的段落，**不要**去找相似的内容按猜测改。',
+      })
+    }
+
+    const askedLine = args && typeof args.line === 'number' ? args.line : -1
+    const askedOrd = args && typeof args.ordinal === 'number' ? args.ordinal : -1
+    const CTX = 20    // 每处前后各带多少字
+    const MAX = 8     // 最多列几处，避免输出爆炸
+    const spots = idxs.map(function (idx) {
+      const lc = lineColOf(content, idx)
+      const a = Math.max(0, idx - CTX)
+      const b = Math.min(content.length, idx + text.length + CTX)
+      return {
+        line: lc.line,
+        col: lc.col,
+        excerpt: (a > 0 ? '…' : '') + asOneLine(content.slice(a, idx))
+          + '【' + asOneLine(text) + '】'
+          + asOneLine(content.slice(idx + text.length, b)) + (b < content.length ? '…' : ''),
+        likelyTarget: false,   // 下面统一算：只有**恰好一处**吻合行号时才置 true
+      }
+    })
+    // 定位优先级：
+    //   ① 引用给的「第 N 处」最可靠 —— 同一行里可能有好几处一模一样的文字，行号根本分不开
+    //   ② 退而用行号，且只有**恰好一处**吻合时才认
+    //   ③ 都定不住 → 一处都不标，把每一处摆出来让用户确认
+    if (askedOrd > 0 && askedOrd <= spots.length) {
+      spots[askedOrd - 1].likelyTarget = true
+    } else {
+      const nearIdx = []
+      if (askedLine > 0) spots.forEach(function (s, i) { if (Math.abs(s.line - askedLine) <= 2) nearIdx.push(i) })
+      if (nearIdx.length === 1) spots[nearIdx[0]].likelyTarget = true
+    }
+    const shown = spots.slice(0, MAX)
+    const near = spots.filter(function (s) { return s.likelyTarget })
+    let hint
+    if (spots.length === 1) {
+      hint = '原文在文中只有这一处，就是它。'
+    } else if (askedOrd > 0 && askedOrd <= spots.length) {
+      hint = '按引用标签给的「第 ' + askedOrd + ' 处」（全文共 ' + spots.length + ' 处），目标就是标了 likelyTarget 的那一处；'
+        + '请照 excerpt 核对一次再动手。'
+    } else if (near.length === 1) {
+      hint = '共 ' + spots.length + ' 处；与引用给出的第 ' + askedLine + ' 行对得上的那一处已标 likelyTarget，多半就是它 ——'
+        + '但仍请照 excerpt 核对一次再动手。'
+    } else {
+      hint = '共 ' + spots.length + ' 处，仅凭行号分不出来。请把每处的 excerpt 摆给用户，让他确认改哪一处，不要自己挑一处改。'
+    }
+    return toolOutput({
+      ok: true,
+      canvasId: c.id, title: c.title, version: c.version,
+      total: spots.length, shown: shown.length,
+      note: spots.length > shown.length ? '只列了前 ' + shown.length + ' 处。' : '',
+      lineNote: '这里的行号按 Markdown 源码数；引用标签里的行号按编辑器渲染结果数，两者可能有偏差，请以 excerpt 为准。',
+      spots: shown,
+      hint: hint,
+    })
+  },
+}))
+// [[CCV-LOCATE-END]]

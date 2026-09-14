@@ -215,9 +215,10 @@ async function main() {
   eq("选区起点下标 = 第 2 行开头", rec.offset, L1)
   eq("行号（第 2 行）", rec.line, 2)
   eq("最近小标题", rec.heading, "第一节 总览")
-  eq("前文指纹（不足 24 字 → 取到全文开头）", rec.before, "第一节 总览\n")
-  const restOfDoc = ["", "前面加粗后面", "列表甲", "列表乙", LONG, ""].join("\n")
-  eq("后文指纹（24 字截断）", rec.after, restOfDoc.slice(0, 24))
+  // 前后文指纹**有意不再记录**：定位已交给 host 侧的 canvas_locate 按需回答，
+  // 记录里留着它等于存了一份没人用的死数据（而且它会被表格摊成一串噪音）。
+  ok("不再记录前后文指纹（定位改由 canvas_locate 回答）",
+    rec.before === undefined && rec.after === undefined)
 
   console.log("\n【2】行内加粗不虚增行号")
   // tP2b 是 <b> 里的文字节点：第 3 行开头 = L1+L2，再跳过「前面」2 字
@@ -225,9 +226,6 @@ async function main() {
   rec = capture()
   eq("选区起点下标（<b> 内）", rec.offset, L1 + L2 + 2)
   eq("行号仍是第 3 行（没有被 <b> 顶到第 4 行）", rec.line, 3)
-  eq("前文指纹", rec.before, "第一节 总览\n写入方基于哪一版\n前面")
-  const tailAfterP2 = "后面\n列表甲\n列表乙\n" + LONG + "\n"
-  eq("后文指纹", rec.after, tailAfterP2.slice(0, 24))
 
   console.log("\n【3】列表项之间要断行")
   const li2Start = L1 + L2 + L3 + L4
@@ -414,173 +412,102 @@ async function main() {
   eq("控制器抛错时外侧不抛", threw, false)
   eq("并且老老实实返回 false（让主模块退回老做法）", val, false)
 
-  // ═══ 定位精度：原文在全文里重复时，必须能唯一指认是哪一处 ═══════
-  // 主人举的例子：想把 `1111111111111` 改成 `1111121111111`，
-  // 可一行里可能有好几段一模一样的 —— 只报行号 + 原文，AI 只能猜。
-  const DUP = "1111111111111"
+  // ═══ 定位：引用要「优雅」（两行），但两行里必须带够信息 ═══════════
+  // 主人举的例子：想把 `1111111111111` 改成 `1111121111111`，可一行里
+  // 可能有好几段一模一样的 —— 只报行号 + 原文，AI 只能猜。
+  // 做法：标签里标出「多处（第 N 处）」，正文不塞坐标；
+  // 「每一处长什么样」交给 host 侧的 canvas_locate 工具。
 
-  console.log("\n【16】原文重复 → 扩到唯一的上下文再报")
-  // 两段一模一样的心内容，前后各挂一个不同的字，让"唯一"是有解的
+  console.log("\n【16】原文重复 → 引用里标「多处（第 N 处）」，正文仍只有两行")
+  const DUP = "1111111111111"
   const d1 = new T("甲乙" + DUP + "丙丁")
   const d2 = new T("戊己" + DUP + "庚辛")
   const dupEditor = new E("DIV", [new E("DIV", [d1]), new E("DIV", [d2])])
-  // 期望值照样程序算，不手数
-  const DUP_TEXT = "甲乙" + DUP + "丙丁\n戊己" + DUP + "庚辛\n"
-  eq("假编辑区摊平结果自检", flatOf(dupEditor).text, DUP_TEXT)
 
   withBridge(null, dupEditor, fakeRange(d1, 2, DUP))
   rec = capture()
   eq("选中文字", rec.selected, DUP)
   eq("原文在全文出现几次", rec.dupCount, 2)
-  ok("拿到了唯一上下文", rec.anchorOk)
-  eq("往前扩一个字就够（左边那个字）", rec.anchorBefore, "乙")
-  eq("—— 左边这一个字就唯一了，所以右面一个字都不多带", rec.anchorAfter, "")
+  eq("你选的是第 1 处", rec.ordinal, 1)
   eq("行号仍是第 1 行", rec.line, 1)
-  eq("列号（甲乙之后 → 第 3 字起）", rec.col, "甲乙".length + 1)
 
-  let dtext = await captured.codec.serialize(String(rec.code))
-  let dlines = dtext.split("\n")
-  eq("从 @ 打头不变", dlines[0], '@"/x/话布优化.md" > 第 1 行')
-  eq("第二行仍是原文", dlines[1], "「" + DUP + "」")
-  eq("第三行 = 唯一上下文，原文用【】标出来",
-    dlines[2], "定位：…乙【" + DUP + "】（只改【】里的）")
-  ok("确实只多这一行", dlines.length === 3)
+  const dTextA = await captured.codec.serialize(String(rec.code))
+  const dLinesA = dTextA.split("\n")
+  eq("第一行 = 路径 + 标签（歧义与序数都在标签里）",
+    dLinesA[0], '@"/x/话布优化.md" > 第 1 行 · 多处（第 1 处）')
+  eq("第二行 = 原文", dLinesA[1], "「" + DUP + "」")
+  eq("**永远只有两行** —— 定位不再塞进正文", dLinesA.length, 2)
+  ok("正文里不再出现定位坐标", dTextA.indexOf("定位：") < 0)
+  ok("正文里也不再出现方括号", dTextA.indexOf("【") < 0)
 
-  console.log("\n【17】原文唯一 → 一个字都不多加（不能白变长）")
+  console.log("\n【17】选第二处 → 序数跟着变（这才是「分得开」的关键）")
+  withBridge(null, dupEditor, fakeRange(d2, 2, DUP))
+  rec = capture()
+  eq("同一段原文的第二次出现", rec.ordinal, 2)
+  eq("行号变成第 2 行", rec.line, 2)
+  eq("总次数不变", rec.dupCount, 2)
+  const dTextB = await captured.codec.serialize(String(rec.code))
+  ok("两次引用**必须不一样**（否则 AI 无从分辨是哪一处）", dTextB !== dTextA)
+  eq("第二处的标签", dTextB.split("\n")[0], '@"/x/话布优化.md" > 第 2 行 · 多处（第 2 处）')
+
+  console.log("\n【18】原文唯一 → 连「多处」都不标（日常情况一个字都不多）")
   withBridge(null, dupEditor, fakeRange(d1, 0, "甲乙"))
   rec = capture()
-  eq("原文唯一时出现次数就是 1", rec.dupCount, 1)
-  ok("不算上下文（没必要的开销不花）", rec.anchorBefore === "" && rec.anchorAfter === "")
-  let utext = await captured.codec.serialize(String(rec.code))
-  ok("输出里不出现「定位」这一行", utext.indexOf("定位：") < 0)
-  eq("仍是 2 行", utext.split("\n").length, 2)
+  eq("原文唯一", rec.dupCount, 1)
+  eq("唯一时不算序数（没有意义）", rec.ordinal, 0)
+  const uText = await captured.codec.serialize(String(rec.code))
+  eq("仍是两行", uText.split("\n").length, 2)
+  ok("不标「多处」", uText.indexOf("多处") < 0)
+  eq("第一行就是干净的标签", uText.split("\n")[0], '@"/x/话布优化.md" > 第 1 行')
 
-  console.log("\n【18】通篇同一个字 → 认输，报列号让人来定，绝不让 AI 猜")
-  // 极端情况：整段都是 1，怎么扩都不唯一
-  const solid = new T("1".repeat(200))
-  const solidEditor = new E("DIV", [new E("DIV", [solid])])
-  const solidText = "1".repeat(200) + "\n"
-  withBridge(null, solidEditor, fakeRange(solid, 0, "1".repeat(13)))
+  console.log("\n【19】重复次数与序数都要数得准（允许重叠）")
+  // 独立实现算一遍做交叉验证 —— 这两个数决定引用标签怎么写
+  function occ(t, n) { let c = 0, i = 0; while ((i = t.indexOf(n, i)) >= 0) { c++; i++ } return c }
+  const OV = "aaaa"
+  const ovNode = new T(OV)
+  const ovEditor = new E("DIV", [new E("DIV", [ovNode])])
+  withBridge(null, ovEditor, fakeRange(ovNode, 1, "aa"))
   rec = capture()
-  eq("出现次数（程序算，不手数）", rec.dupCount, solidText.length - 1 - 13 + 1)
-  ok("明确标记为「定不住」", rec.anchorOk === false)
-  dtext = await captured.codec.serialize(String(rec.code))
-  dlines = dtext.split("\n")
-  eq("行数仍是 3（多的是警告那一行）", dlines.length, 3)
-  ok("如实说明重复了多少次", dlines[2].indexOf("出现 " + rec.dupCount + " 次") > 0)
-  ok("带上「第几行第几字」当兜底线索", dlines[2].indexOf("（第 1 行第 1 字起）") > 0)
-  ok("明确要求先问用户、不许猜", dlines[2].indexOf("不要猜") > 0)
-  ok("并且不用【】假造一个上下文", dlines[2].indexOf("【") < 0)
+  eq("`aaaa` 里的 `aa` 有 3 处（重叠也要算）", rec.dupCount, occ(OV, "aa"))
+  eq("确实是 3", rec.dupCount, 3)
+  eq("从下标 1 起选 → 是第 2 处", rec.ordinal, 2)
 
-  console.log("\n【19】取不到偏移时不许误报「重复」")
-  // off = -1（选区起点不在编辑区里）→ 定位数据未知，不能编一个重复次数出来
+  console.log("\n【20】取不到偏移时不许谎报「多处」")
   withBridge(null, root, fakeRange(new T("野节点"), 0, "写入方基于哪一版"))
   rec = capture()
   eq("偏移取不到 → 行号为 -1", rec.line, -1)
-  eq("偏移取不到 → 不谎报重复次数", rec.dupCount, 0)
-  utext = await captured.codec.serialize(String(rec.code))
-  ok("输出里不出现定位行", utext.indexOf("定位：") < 0 && utext.indexOf("⚠️") < 0)
+  eq("偏移取不到 → 重复次数记 0，不编一个出来", rec.dupCount, 0)
+  eq("序数同样记 0", rec.ordinal, 0)
+  const gText = await captured.codec.serialize(String(rec.code))
+  ok("因此也不会误标「多处」", gText.indexOf("多处") < 0)
 
-  console.log("\n【20】定位行必须始终是**一行**（换行要现形，不能把句尾顶下去）")
-  // 主人 09-14 截图实测的毛病：一整行连续相同的字，选中中间那几个，
-  // 扩到唯一时"后面的内容"正好含一个换行 → 句尾那个省略号被顶到下一行，
-  // 末尾孤零零一个「…」。换行必须换成看得见的符号。
-  const ROW = "1".repeat(14)
-  const twoEditor = new E("DIV", [new E("DIV", [new T(ROW)]), new E("DIV", [new T(ROW)])])
-  withBridge(null, twoEditor, fakeRange(twoEditor.childNodes[0].childNodes[0], 0, "1".repeat(5)))
-  rec = capture()
-  eq("同一行重复 → 出现次数", rec.dupCount, (ROW.length - 5 + 1) * 2)
-  ok("拿到唯一上下文", rec.anchorOk)
-  eq("选区就在文首 → 前面没有多余省略号", rec.anchorBefore, "")
-  // 最小唯一窗口 = 整行 + 换行 + 下一行的头一个字；去掉选中的 5 个就是后面这部分
-  eq("后面的内容（含一个换行）", rec.anchorAfter, ROW.slice(5) + "\n" + ROW.charAt(0))
-
-  dtext = await captured.codec.serialize(String(rec.code))
-  dlines = dtext.split("\n")
-  eq("含换行的上下文也不能把消息撑成 4 行", dlines.length, 3)
-  eq("定位行整体形状（换行显示为 ↵，前面不摆指向虚空的省略号）",
-    dlines[2], "定位：【" + "1".repeat(5) + "】" + ROW.slice(5) + "↵" + ROW.charAt(0) + "…（只改【】里的）")
-  ok("换行确实被换成了看得见的符号", dlines[2].indexOf("↵") > 0)
-  eq("【】里仍然是原文", dlines[2].slice(dlines[2].indexOf("【") + 1, dlines[2].indexOf("】")), "1".repeat(5))
-
-  console.log("\n【21】选区在行尾（上下都跨行）→ 定位行仍不许被拆散")
-  // 选最后一行末尾那几个：往前扩必须跨过上一行的换行
-  const tailNode = twoEditor.childNodes[1].childNodes[0]
-  withBridge(null, twoEditor, fakeRange(tailNode, ROW.length - 5, "1".repeat(5)))
-  rec = capture()
-  ok("拿到了唯一上下文", rec.anchorOk)
-  ok("前面带有内容（跨到了上一行的换行）", rec.anchorBefore.length > 0)
-  eq("往前带够就够了，后面不再带（那个孤零零的换行因此不会再出现）", rec.anchorAfter, "")
-  dtext = await captured.codec.serialize(String(rec.code))
-  dlines = dtext.split("\n")
-  eq("仍是 3 行", dlines.length, 3)
-  ok("前面的换行现形了", dlines[2].indexOf("↵") > 0)
-  ok("【】里仍是那 5 个字", dlines[2].indexOf("【" + "1".repeat(5) + "】") > 0)
-
-  console.log("\n【22】主人举的反例：一句话里同一个名字出现两次")
-  // 「小明在笑，小明在闹」—— 选第一个小明 / 选第二个小明，都要能唯一指认。
-  // 这是主人 09-14 提出的质疑：「我选第一个小明，又要怎么办」
+  console.log("\n【21】主人举的反例：一句话里同一个名字出现两次")
+  // 主人 09-14 追问：「我觉得你这个方法不行，如果一句话是【小明在笑，小明在闹】
+  // 我选第一个小明，又要怎么办呢」
+  // 客户端的责任是**如实把歧义和序数写进引用**；
+  // 「每一处长什么样」由 host 侧的 canvas_locate 回答（见 tools/test-host-locate.cjs）。
+  // 两个数合起来就把位置说清了，而且引用保持两行。
   const SENT = "小明在笑，小明在闹"
   const sNode = new T(SENT)
   const sentEditor = new E("DIV", [new E("DIV", [sNode])])
-  const flatSent = flatOf(sentEditor).text
 
-  // 独立实现一遍"某串在全文出现几次"，用来**交叉验证** selref 自己的数法
-  function occ(t, n) { let c = 0, i = 0; while ((i = t.indexOf(n, i)) >= 0) { c++; i++ } return c }
-
-  eq("「小明」在句中出现", occ(flatSent, "小明"), 2)
-
-  // ① 选第一个小明
   withBridge(null, sentEditor, fakeRange(sNode, 0, "小明"))
   rec = capture()
-  eq("两个小明 → 确实需要定位", rec.dupCount, 2)
-  ok("拿到了唯一上下文", rec.anchorOk)
-  eq("第一个小明：前面没字了", rec.anchorBefore, "")
-  eq("第一个小明：往后带到「小明在笑」才唯一", rec.anchorAfter, "在笑")
-  // 🔴 核心正确性：把「前文 + 原文 + 后文」整串拿去全文里数，必须只有一处
-  eq("整串在全文里只出现一次（这才叫定得住）",
-    occ(flatSent, rec.anchorBefore + rec.selected + rec.anchorAfter), 1)
+  eq("两个小明 → 必须标出来", rec.dupCount, 2)
+  eq("选第一个 → 第 1 处", rec.ordinal, 1)
   const t1 = await captured.codec.serialize(String(rec.code))
 
-  // ② 选第二个小明
   withBridge(null, sentEditor, fakeRange(sNode, 5, "小明"))
   const rec2 = capture()
-  ok("第二个小明：也拿到唯一上下文", rec2.anchorOk)
-  eq("第二个小明：往前带一个逗号就够（不必把右边的「在」也拖进来）", rec2.anchorBefore, "，")
-  eq("第二个小明：因此后面一个字都不多带", rec2.anchorAfter, "")
-  eq("整串在全文里同样只出现一次",
-    occ(flatSent, rec2.anchorBefore + rec2.selected + rec2.anchorAfter), 1)
+  eq("选第二个 → 第 2 处", rec2.ordinal, 2)
   const t2 = await captured.codec.serialize(String(rec2.code))
 
-  ok("两次输出必须不一样（否则等于没区分开）", t1 !== t2)
-  eq("第一个小明的定位行", t1.split("\n")[2], "定位：【小明】在笑…（只改【】里的）")
-  eq("第二个小明的定位行", t2.split("\n")[2], "定位：…，【小明】（只改【】里的）")
-
-  console.log("\n【23】够用就停：绝不为了凑长度把另一侧也带上")
-  // 主人在同一句上再追一问的延伸场景 —— 三种扩法里，短的那条先够用就用它
-  const ONLYLEFT = "乙小明甲甲甲"      // 「小明」唯一，压根不该有定位行
-  const oNode = new T(ONLYLEFT)
-  const oEditor = new E("DIV", [new E("DIV", [oNode])])
-  withBridge(null, oEditor, fakeRange(oNode, 1, "小明"))
-  rec = capture()
-  eq("原文唯一时不做任何扩展", rec.dupCount, 1)
-  eq("也不带任何上下文", rec.anchorBefore + rec.anchorAfter, "")
-
-  // 同一侧能解决时，另一侧必须保持为空（这是"够用就停"的硬指标）
-  // 「小明小明小明」末尾那个小明：只往后带一个换行就唯一了，
-  // 没必要把左边的「明」也带上 —— 老的"两边同时扩"写法就会白多带一个字。
-  const RIGHTONLY = "小明小明小明"
-  const rNode = new T(RIGHTONLY)
-  const rEditor = new E("DIV", [new E("DIV", [rNode])])
-  const flatRight = flatOf(rEditor).text
-  withBridge(null, rEditor, fakeRange(rNode, 4, "小明"))   // 选最后那一个
-  rec = capture()
-  eq("「小明」出现三次 → 需要定位", rec.dupCount, 3)
-  ok("拿到了唯一上下文", rec.anchorOk)
-  eq("挑了「只往后」这条更短的路，左边一个字都不带", rec.anchorBefore, "")
-  eq("只往后带了行尾那个换行", rec.anchorAfter, "\n")
-  eq("整串在全文里只出现一次",
-    occ(flatRight, rec.anchorBefore + rec.selected + rec.anchorAfter), 1)
+  ok("两次都标了「多处」", t1.indexOf("多处") >= 0 && t2.indexOf("多处") >= 0)
+  ok("而且两次**不一样**（AI 据此就能分辨，不必再猜）", t1 !== t2)
+  eq("第一个小明的引用", t1.split("\n")[0], '@"/x/话布优化.md" > 第 1 行 · 多处（第 1 处）')
+  eq("第二个小明的引用", t2.split("\n")[0], '@"/x/话布优化.md" > 第 1 行 · 多处（第 2 处）')
+  ok("两次的行号相同（所以只靠行号分不开，靠的是序数）",
+    t1.split(" · 多处")[0] === t2.split(" · 多处")[0])
 
   console.log("\n────────────────────────────────")
   console.log("通过 " + pass + " 项，失败 " + fail + " 项")
