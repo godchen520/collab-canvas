@@ -269,19 +269,29 @@ async function main() {
   eq("排序在官方之后", captured.order, 50)
   eq("显示分组标题", captured.showGroupTitle, true)
 
-  console.log("\n【8】翻译规则 · 正常路径")
+  console.log("\n【8】翻译规则 · 正常路径（要求短）")
   withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
   rec = capture()
   const text = await captured.codec.serialize(String(rec.code))
-  ok("含来源（文档名 + 小标题）", text.indexOf("【话布选区】引用来源：话布优化 · 第一节 总览") === 0)
-  ok("含文件 @ 路径（带引号，路径含空格也不会被截断）", text.indexOf('文件：@"/x/话布优化.md"') >= 0)
-  ok("含选中原文", text.indexOf("选中文字：「写入方基于哪一版」") >= 0)
-  ok("含行号", text.indexOf("约第 2 行") >= 0)
-  ok("含上下文指纹（供 AI 核对是不是这一处）", text.indexOf("上下文核对：") >= 0)
+  const textLines = text.split("\n")
+  eq("首行 = 文档名 · 小标题 · 行号", textLines[0], "【话布选区】话布优化 · 第一节 总览 · 第 2 行")
+  eq("第二行 = @ 路径（带引号，路径含空格也不截断）", textLines[1], '@"/x/话布优化.md"')
+  eq("末行 = 选中原文", textLines[2], "「写入方基于哪一版」")
+  eq("总共只有 3 行", textLines.length, 3)
+  ok("不塞前后文指纹（实测它会把表格摊成一串噪音）", text.indexOf("上下文核对") < 0)
+  ok("不塞字符偏移 / 字数这类对模型没用的东西", text.indexOf("字起") < 0 && text.indexOf("文中第") < 0)
+
+  console.log("\n【8b】小标题与文档名同名时，只写一次")
+  // 实测出现过「话布优化 · 话布优化」—— 文档的 h1 就叫这个名字。
+  withBridge({ title: "第一节 总览" }, root, fakeRange(tP1, 0, "写入方基于哪一版"))
+  const recSame = capture()
+  const textSame = await captured.codec.serialize(String(recSame.code))
+  eq("同名不重复", textSame.split("\n")[0], "【话布选区】第一节 总览 · 第 2 行")
 
   console.log("\n【9】翻译规则 · 兜底路径（不许抛错）")
   const orphan = await captured.codec.serialize("99999")
-  ok("记录找不到 → 明说未取到，并禁止猜", orphan.indexOf("未取到精确位置") >= 0 && orphan.indexOf("不要凭猜测定位") >= 0)
+  ok("记录找不到 → 明说没了，并禁止猜", orphan.indexOf("记录已经没了") >= 0 && orphan.indexOf("不要凭猜测定位") >= 0)
+  eq("兜底也是一行，不啰嗦", orphan.split("\n").length, 1)
 
   const weird = [null, undefined, "", "abc", "{}", "1e999", "-1"].map(String)
   let allResolved = true
