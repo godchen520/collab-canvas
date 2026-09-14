@@ -276,5 +276,31 @@ check('混合还原 - [ ] 主任务', mdMixed.indexOf('- [ ] 主任务') >= 0)
 check('混合还原嵌套 - 子说明', mdMixed.indexOf('  - 子说明') >= 0)
 check('混合还原嵌套 - [x] 子任务', mdMixed.indexOf('  - [x] 子任务') >= 0)
 
+// ─── 行内强调：斜体 / 粗体 / 混排 ────────────────────
+// 补这段的原因：这份测试此前只测了 **粗体**，没测 *斜体*，
+// 而实测出现过「斜体记号在文档保存后消失」的现象。当时没法判断是我们转换的锅
+// 还是编辑时丢的 —— 把斜体也钉住，下次再遇到就能立刻二分。
+// （2026-09-14 实测结论：转换本身是好的，见下面几条。）
+console.log('--- 行内强调 ---')
+const mdEm = htmlToMd(el('div', {}, [
+  text('让「'), el('em', {}, [text('写入方基于哪一版')]), text('」这件事'),
+  el('strong', {}, [text('显式化')]), text('：'),
+]))
+check('斜体 <em> → *…*', mdEm.indexOf('*写入方基于哪一版*') >= 0)
+check('粗体 <strong> → **…**', mdEm.indexOf('**显式化**') >= 0)
+check('斜体后面的中文没被吃掉（「」这件事 还在）', mdEm.indexOf('」这件事') >= 0)
+
+const mdI = htmlToMd(el('div', {}, [el('i', {}, [text('斜')])]))
+check('<i>（execCommand italic 的产物）也能还原', mdI.indexOf('*斜*') >= 0)
+
+check('md→html：*斜体* → <em>', mdToHtml('这是 *斜体* 一行').indexOf('<em>斜体</em>') >= 0)
+check('md→html：**粗体** → <strong>', mdToHtml('这是 **粗体** 一行').indexOf('<strong>粗体</strong>') >= 0)
+check('md→html：「*内*」也认作斜体（引号不影响）', mdToHtml('让「*写入*」这件事').indexOf('<em>写入</em>') >= 0)
+check('md→html：斜体与粗体同在一行，两边都对',
+  (function () {
+    const one = mdToHtml('让「*写入方基于哪一版*」这件事**显式化**：')
+    return one.indexOf('<em>写入方基于哪一版</em>') >= 0 && one.indexOf('<strong>显式化</strong>') >= 0
+  })())
+
 console.log(pass ? '\nALL PASS' : '\nHAS FAILURES')
 process.exit(pass ? 0 : 1)
