@@ -96,16 +96,27 @@ const L4 = "列表甲\n".length                // 第 4 行
 
 // ─── 载入侧模块（沙箱里跑，不碰真 window / fetch / document）───
 const src = fs.readFileSync(path.join(__dirname, "..", "lib", "selref.js"), "utf8")
-const sandbox = { window: {}, console, setTimeout: () => 0, clearTimeout: () => {} }
+// 定时器用真的：自动两步的"等菜单就绪再点"就是靠定时器轮询的，
+// 用假定时器等于把要测的那段换掉了。
+const sandbox = { window: {}, console, setTimeout, clearTimeout, setInterval, clearInterval }
 
 // 预置一个假的 cordis 上下文，让 boot() 在加载时直接跑完并注册引用源。
 // 这样我们能拿到真的 source 对象来测翻译规则，而不是照抄一份来测。
+// sessions.scope / inputTriggers.sessionOf 两个口子供"自动两步"测试替换，
+// 默认不给（= 拿不到会话手柄），需要时用 setController() 装上。
 let captured = null
+const scopeResult = { current: undefined }   // sessions.scope() 的返回值
+const controllerRef = { current: null }      // inputTriggers.sessionOf() 的返回值
+sandbox.window.__ccvSessionId = "sess-test"
+sandbox.window.__ccvInputState = { draft: "", draftRev: 1, occurrences: [] }
 sandbox.window.__ccvCtx = {
-  sessions: {},
+  sessions: {
+    scope: function () { return scopeResult.current }
+  },
   conversation: {},
   inputTriggers: {
-    registerSource: function (s) { captured = s; return function () {} }
+    registerSource: function (s) { captured = s; return function () {} },
+    sessionOf: function () { return controllerRef.current }
   }
 }
 sandbox.window.fetch = () => Promise.resolve({ ok: true })
@@ -113,11 +124,66 @@ vm.createContext(sandbox)
 vm.runInContext(src, sandbox, { filename: "lib/selref.js" })
 
 const capture = sandbox.window.__ccvSelRefCapture
+const auto = sandbox.window.__ccvSelRefAuto
 const info = sandbox.window.__ccvSelRefInfo
 const flatOf = sandbox.window.__ccvSelRefFlat
 if (typeof capture !== "function" || typeof info !== "function" || typeof flatOf !== "function") {
   console.log("✗ 侧模块没有挂出预期的那几个诊断口（__ccvSelRefCapture / Info / Flat）")
   process.exit(1)
+}
+if (typeof auto !== "function") {
+  console.log("✗ 侧模块没有挂出 __ccvSelRefAuto")
+  process.exit(1)
+}
+
+// ─── 假控制器：把官方那套"先 pending 再 ready"的行为做出来 ───────
+// 关键细节：官方 pick 在组没 ready 之前会**静默什么都不做**，
+// 所以这里必须能造出"还没就绪"和"永远不就绪"两种状态。
+function makeController(opts) {
+  opts = opts || {}
+  const calls = { toggle: null, picks: [], dismiss: 0 }
+  let state = { open: false, groups: [] }
+  const ctl = {
+    calls,
+    menu: { getSnapshot: () => state },
+    toggleSource(name, hit) {
+      calls.toggle = { name, hit }
+      state = { open: true, groups: [{ source: name, status: "pending", items: [] }] }
+      if (opts.neverReady) return
+      setTimeout(() => {
+        if (!state.open) return
+        state = {
+          open: true,
+          groups: [{
+            source: name,
+            status: "ready",
+            items: opts.emptyItems ? [] : [{ name: "某段话", value: "1" }]
+          }]
+        }
+      }, opts.readyAfter || 0)
+    },
+    pick(name, index) {
+      calls.picks.push({ name, index })
+      if (opts.pickNoop) return
+      // 模拟插入成功：草稿里多出一个胶囊
+      const cur = sandbox.window.__ccvInputState
+      sandbox.window.__ccvInputState = {
+        draft: cur.draft,
+        draftRev: (cur.draftRev || 0) + 1,
+        occurrences: (cur.occurrences || []).concat([{ ref: "1" }])
+      }
+    },
+    dismiss() { calls.dismiss++; state = { open: false, groups: [] } }
+  }
+  return ctl
+}
+function setController(ctl) {
+  controllerRef.current = ctl
+  scopeResult.current = { fake: "session-scope" }   // 非 undefined 就算拿到了作用域
+}
+function noSessionScope() {
+  controllerRef.current = null
+  scopeResult.current = undefined
 }
 
 // 用主模块的取数桥把假 DOM 喂进去（bridge 的接口是 doc/editor/range）
@@ -253,6 +319,82 @@ async function main() {
     pickOk = !!(p && p.insert && p.insert.label)
   } catch (e) { pickOk = false }
   ok("畸形候选 → 仍有可插入的胶囊，不抛错", pickOk)
+
+  // ═══ 自动两步：点「问AI」直接出胶囊 ═══════════════════════════
+  // 这段最容易"看着点了、其实没插进去"（官方 pick 在组没就绪前静默返回），
+  // 所以每条失败路径都要单独验一遍。
+  console.log("\n【12】自动两步 · 正常路径")
+  withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
+  capture()
+  sandbox.window.__ccvInputState = { draft: "", draftRev: 7, occurrences: [] }
+  let ctl = makeController({ readyAfter: 10 })
+  setController(ctl)
+  let result = await auto()
+  eq("返回成功", result, true)
+  eq("打开的是我们这一栏", ctl.calls.toggle.name, "话布选区")
+  eq("选中第 1 条", ctl.calls.picks.length, 1)
+  eq("pick 的索引是 0", ctl.calls.picks[0].index, 0)
+  eq("菜单初始就是开着的（toggleSource 负责开）", !!ctl.calls.toggle.hit, true)
+
+  console.log("\n【13】自动两步 · 合成出来的「位置」对不对")
+  const h = ctl.calls.toggle.hit
+  eq("触发器", h.trigger, "@")
+  eq("查询词为空（不是用户敲的）", h.query, "")
+  eq("不是带引号的 token", h.quoted, false)
+  eq("草稿为空 → leading", h.position, "leading")
+  ok("零宽选区（起止相同）", h.span.start === h.span.end)
+  eq("选区落在草稿末尾", h.span.start, 0)
+  eq("带上当前草稿版本号（官方靠它做版本比对）", h.span.draftRev, 7)
+
+  sandbox.window.__ccvInputState = { draft: "前面已经写了字", draftRev: 9, occurrences: [] }
+  ctl = makeController({ readyAfter: 10 })
+  setController(ctl)
+  await auto()
+  eq("草稿非空 → inline", ctl.calls.toggle.hit.position, "inline")
+  eq("口子开在末尾（14 个字之后）", ctl.calls.toggle.hit.span.start, 7)
+
+  console.log("\n【14】自动两步 · 失败一律返回 false，且绝不抛错")
+  // ① 菜单永远是 pending（官方取候选迟迟不回来）
+  sandbox.window.__ccvInputState = { draft: "", draftRev: 11, occurrences: [] }
+  ctl = makeController({ neverReady: true })
+  setController(ctl)
+  eq("等不到就绪 → false", await auto(), false)
+  ok("放弃时顺手把菜单关掉（不留个空菜单挂在那）", ctl.calls.dismiss > 0)
+
+  // ② 就绪了，但点下去草稿里没多出胶囊（版本对不上之类）
+  ctl = makeController({ readyAfter: 5, pickNoop: true })
+  setController(ctl)
+  eq("点了但没插进去 → false", await auto(), false)
+
+  // ③ 就绪了但候选是空的
+  ctl = makeController({ readyAfter: 5, emptyItems: true })
+  setController(ctl)
+  eq("候选为空 → false", await auto(), false)
+
+  // ④ 拿不到会话手柄（sessionId / 服务没到位）
+  noSessionScope()
+  eq("拿不到会话手柄 → false", await auto(), false)
+
+  // ⑤ 读不到草稿版本号（输入框状态还没挂上）
+  setController(makeController({ readyAfter: 5 }))
+  const savedState = sandbox.window.__ccvInputState
+  sandbox.window.__ccvInputState = { draft: "" }
+  eq("读不到版本号 → false", await auto(), false)
+  sandbox.window.__ccvInputState = savedState
+
+  console.log("\n【15】自动两步 · 异常也不许把「问AI」拖垮")
+  const boom = {
+    menu: { getSnapshot: () => { throw new Error("故意炸一下") } },
+    toggleSource: () => {},
+    pick: () => {},
+    dismiss: () => {}
+  }
+  setController(boom)
+  let threw = false
+  let val = null
+  try { val = await auto() } catch (e) { threw = true }
+  eq("控制器抛错时外侧不抛", threw, false)
+  eq("并且老老实实返回 false（让主模块退回老做法）", val, false)
 
   console.log("\n────────────────────────────────")
   console.log("通过 " + pass + " 项，失败 " + fail + " 项")
