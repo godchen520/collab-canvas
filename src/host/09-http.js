@@ -114,6 +114,19 @@ function initCanvasHttpEndpoints(ctx, webServer) {
     lastBrowserSid = sessSafe(url.searchParams.get('sid'))
     json(res, { ok: true, id: c.id, title: c.title, content: c.content, version: c.version, path: canvasMdPath(c) })
   }}))
+  // GET /api/canvas/changes?since=N —— 画布端轮询「AI 刚改了哪儿」
+  // 为什么用轮询而不是推送：客户端已经有现成的取数习惯（读文档、报日志都是普通请求），
+  // 加一条推送通道要新增一套连接生命周期管理，收益不值当。
+  // 轮询间隔 1.2 秒 —— AI 改完到主人看向屏幕本来就有间隔，这点延迟无感。
+  // 只回 since **之后**的新条目：画布端记住自己处理到的 seq，取过的不会再要一次。
+  ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/changes', handler: async (req, res) => {
+    const url = new URL(req.url, 'http://x')
+    const raw = url.searchParams.get('since')
+    const since = (raw === null || raw === '') ? 0 : parseInt(raw, 10)
+    if (isNaN(since)) { error(res, 400, { ok: false, error: 'since 必须是数字' }); return }
+    const out = aiChanges.filter((x) => x.seq > since)
+    json(res, { ok: true, latest: aiChangeSeq, changes: out })
+  }}))
   // POST /api/canvas/write
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/write', handler: async (req, res) => {
     try {

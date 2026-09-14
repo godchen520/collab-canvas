@@ -127,6 +127,13 @@ const capture = sandbox.window.__ccvSelRefCapture
 const auto = sandbox.window.__ccvSelRefAuto
 const info = sandbox.window.__ccvSelRefInfo
 const flatOf = sandbox.window.__ccvSelRefFlat
+const findOf = sandbox.window.__ccvSelRefFind
+const squashOf = sandbox.window.__ccvSelRefSquash
+const nodeAtOf = sandbox.window.__ccvSelRefNodeAt
+if (typeof findOf !== "function" || typeof squashOf !== "function" || typeof nodeAtOf !== "function") {
+  console.log("✗ 侧模块没有挂出「AI 改完跳过去」的那几个诊断口（Find / Squash / NodeAt）")
+  process.exit(1)
+}
 if (typeof capture !== "function" || typeof info !== "function" || typeof flatOf !== "function") {
   console.log("✗ 侧模块没有挂出预期的那几个诊断口（__ccvSelRefCapture / Info / Flat）")
   process.exit(1)
@@ -508,6 +515,115 @@ async function main() {
   eq("第二个小明的引用", t2.split("\n")[0], '@"/x/话布优化.md" > 第 1 行 · 多处（第 2 处）')
   ok("两次的行号相同（所以只靠行号分不开，靠的是序数）",
     t1.split(" · 多处")[0] === t2.split(" · 多处")[0])
+
+  console.log("\n【22】归一化：两边（源码 vs 渲染后）靠它才能对上")
+  // 服务端给的是 **Markdown 源码**里的文字，客户端手里是**渲染之后**的文字。
+  // 记号（`**` `#` 之类）与空白在两边的形态不同 —— 不归一化就永远找不到。
+  eq("去掉了加粗记号", squashOf("这一段**加粗**了"), "这一段加粗了")
+  eq("去掉了标题记号", squashOf("# 话布优化"), "话布优化")
+  eq("去掉了空白", squashOf("甲 乙\n丙"), "甲乙丙")
+  eq("去掉了行内码记号", squashOf("看 `这段` 代码"), "看这段代码")
+  eq("去掉了引用记号", squashOf("> 引用"), "引用")
+  eq("两边归一化之后一样（这就是能对上的原因）",
+    squashOf("这一段**加粗**了"), squashOf("这一段加粗了"))
+
+  console.log("\n【23】改动后的新文字找得到 → 跳转点就是它的起点")
+  // 造一段"渲染后"的编辑区：标题 + 段落（源码里**加粗**了，渲染后没有记号）
+  const rH1 = new T("话布优化")
+  const rP = new T("这一段加粗了，改动在这里：新文字。")
+  const rRoot = new E("DIV", [new E("H1", [rH1]), new E("DIV", [rP])])
+  const rFlat = flatOf(rRoot).text
+  {
+    // 这一条记录的形状**完全按服务端产出的来**：源码里带 ** 记号
+    const rec = { added: "新文字", head: "这一段**加粗**了，改动在这里：", tail: "。", removedChars: 3, addedChars: 3 }
+    const hit = findOf(rec, rRoot)
+    ok("找得到", !!hit)
+    // 独立算一遍期望值：渲染文字里「新文字」的真实位置
+    eq("找到的位置 = 新文字在渲染文字里的真实位置", hit.pos, rFlat.indexOf("新文字"))
+    // 最强断言：位置自带校验 —— 从它开始切出来就该是那段新文字
+    eq("从该位置切出来正好是新文字", rFlat.slice(hit.pos, hit.pos + 3), "新文字")
+    eq("全文唯一 → 标记为可信", hit.unique, true)
+  }
+
+  console.log("\n【24】新文字为空（纯删除）→ 退回用「改动点之前的文字」")
+  {
+    const rec = { added: "", head: "改动在这里：", tail: "新文字。", removedChars: 5, addedChars: 0 }
+    const hit = findOf(rec, rRoot)
+    ok("找得到", !!hit)
+    ok("位置落在前锚点之后（也就是被删掉的地方）", rFlat.slice(0, hit.pos).endsWith("改动在这里："))
+    eq("前锚点用完后紧接着就是它", rFlat.slice(hit.pos, hit.pos + 3), "新文字")
+    eq("唯一", hit.unique, true)
+  }
+
+  console.log("\n【25】前锚点也对不上 → 再退一步，用「改动点之后的文字」")
+  {
+    const rec = { added: "", head: "这段文字服务端有、渲染后没有", tail: "改动在这里", removedChars: 5, addedChars: 0 }
+    const hit = findOf(rec, rRoot)
+    ok("找得到", !!hit)
+    eq("位置 = 后锚点的起点", hit.pos, rFlat.indexOf("改动在这里"))
+  }
+
+  console.log("\n【26】🔴 三条线索全对不上 → 返回 null，**绝不猜着跳**")
+  // 这是这个功能最危险的失败方式：随便挑个位置跳过去，
+  // 主人看到的是一段没变的文字，会以为 AI 没改对。
+  {
+    const rec = { added: "完全不存在的文字", head: "也不存在", tail: "还是不存文字", removedChars: 1, addedChars: 1 }
+    eq("返回 null（不是 0，也不是随便挑一处）", findOf(rec, rRoot), null)
+  }
+
+  console.log("\n【27】改动落在文档最开头（前锚点为空）→ 也能找到")
+  {
+    const rec = { added: "话布优化", head: "", tail: "这一段加粗了", removedChars: 0, addedChars: 4 }
+    const hit = findOf(rec, rRoot)
+    eq("找到开头", hit.pos, rFlat.indexOf("话布优化"))
+  }
+
+  console.log("\n【27b】🔴 线索在全文重复时，取**唯一**的那条，而不是最靠前的那条")
+  // 「找到」不等于「找对」：拿一段在文里出现两次的文字去 indexOf，
+  // 只会拿到第一次出现的位置 —— 跳到那儿就是错的。所以要先判"唯不唯一"。
+  const dA = new T("重复词")
+  const dB = new T("中间文字")
+  const dC = new T("重复词")
+  const dD = new T("独一的尾巴")
+  const dRoot = new E("DIV", [
+    new E("DIV", [dA]), new E("DIV", [dB]), new E("DIV", [dC]), new E("DIV", [dD])
+  ])
+  const dFlat = flatOf(dRoot).text
+  {
+    // added 是重复的（出现两次），head 是唯一的 → 必须听 head 的
+    const rec = { added: "重复词", head: "中间文字", tail: "", removedChars: 1, addedChars: 3 }
+    const hit = findOf(rec, dRoot)
+    ok("找得到", !!hit)
+    eq("取的是唯一那条线索定出的位置（不是最靠前的那个「重复词」）",
+      hit.pos, dFlat.indexOf("重复词", 5))
+    ok("而且不是文档开头那个", hit.pos !== dFlat.indexOf("重复词"))
+    eq("全文唯一 → 标记为可信", hit.unique, true)
+  }
+  {
+    // 三条线索全都重复 → 只能退回最靠前的那条，但**必须如实说不准**
+    const rec = { added: "重复词", head: "重复词", tail: "", removedChars: 1, addedChars: 3 }
+    const hit = findOf(rec, dRoot)
+    ok("仍然给出一个位置（不唯一也比不给强，但要说实话）", !!hit)
+    eq("退回最靠前的那条", hit.pos, dFlat.indexOf("重复词"))
+    eq("并如实标记为不可信（提示里会写「请核对」）", hit.unique, false)
+  }
+
+  console.log("\n【28】摊平下标 → DOM 位置（offsetOf 的反向操作）")
+  {
+    const flat = flatOf(rRoot)
+    // 期望：文档开头的下标 0 落在标题那个文字节点里，偏移 0
+    const a = nodeAtOf(flat, 0)
+    eq("下标 0 → 标题节点", a.node, rH1)
+    eq("节点内偏移 0", a.offset, 0)
+    // 段落里的某个位置
+    const pOff = flat.text.indexOf("改动")
+    const b = nodeAtOf(flat, pOff)
+    eq("段落里的下标 → 段落节点", b.node, rP)
+    eq("节点内偏移对得上", rP.data.charAt(b.offset), "改")
+    // 正向反向来回一趟必须回到原处（这才是真正要保证的不变量）
+    const back = flat.startOf.get(b.node) + b.offset
+    eq("换算回下标 = 原下标", back, pOff)
+  }
 
   console.log("\n────────────────────────────────")
   console.log("通过 " + pass + " 项，失败 " + fail + " 项")
