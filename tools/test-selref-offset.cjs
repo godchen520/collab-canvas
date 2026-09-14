@@ -414,6 +414,72 @@ async function main() {
   eq("控制器抛错时外侧不抛", threw, false)
   eq("并且老老实实返回 false（让主模块退回老做法）", val, false)
 
+  // ═══ 定位精度：原文在全文里重复时，必须能唯一指认是哪一处 ═══════
+  // 主人举的例子：想把 `1111111111111` 改成 `1111121111111`，
+  // 可一行里可能有好几段一模一样的 —— 只报行号 + 原文，AI 只能猜。
+  const DUP = "1111111111111"
+
+  console.log("\n【16】原文重复 → 扩到唯一的上下文再报")
+  // 两段一模一样的心内容，前后各挂一个不同的字，让"唯一"是有解的
+  const d1 = new T("甲乙" + DUP + "丙丁")
+  const d2 = new T("戊己" + DUP + "庚辛")
+  const dupEditor = new E("DIV", [new E("DIV", [d1]), new E("DIV", [d2])])
+  // 期望值照样程序算，不手数
+  const DUP_TEXT = "甲乙" + DUP + "丙丁\n戊己" + DUP + "庚辛\n"
+  eq("假编辑区摊平结果自检", flatOf(dupEditor).text, DUP_TEXT)
+
+  withBridge(null, dupEditor, fakeRange(d1, 2, DUP))
+  rec = capture()
+  eq("选中文字", rec.selected, DUP)
+  eq("原文在全文出现几次", rec.dupCount, 2)
+  ok("拿到了唯一上下文", rec.anchorOk)
+  eq("往前扩一个字就够（左边那个字）", rec.anchorBefore, "乙")
+  eq("往后扩一个字就够（右边那个字）", rec.anchorAfter, "丙")
+  eq("行号仍是第 1 行", rec.line, 1)
+  eq("列号（甲乙之后 → 第 3 字起）", rec.col, "甲乙".length + 1)
+
+  let dtext = await captured.codec.serialize(String(rec.code))
+  let dlines = dtext.split("\n")
+  eq("从 @ 打头不变", dlines[0], '@"/x/话布优化.md" > 第 1 行')
+  eq("第二行仍是原文", dlines[1], "「" + DUP + "」")
+  eq("第三行 = 唯一上下文，原文用【】标出来", dlines[2], "定位：…乙【" + DUP + "】丙…")
+  ok("确实只多这一行", dlines.length === 3)
+
+  console.log("\n【17】原文唯一 → 一个字都不多加（不能白变长）")
+  withBridge(null, dupEditor, fakeRange(d1, 0, "甲乙"))
+  rec = capture()
+  eq("原文唯一时出现次数就是 1", rec.dupCount, 1)
+  ok("不算上下文（没必要的开销不花）", rec.anchorBefore === "" && rec.anchorAfter === "")
+  let utext = await captured.codec.serialize(String(rec.code))
+  ok("输出里不出现「定位」这一行", utext.indexOf("定位：") < 0)
+  eq("仍是 2 行", utext.split("\n").length, 2)
+
+  console.log("\n【18】通篇同一个字 → 认输，报列号让人来定，绝不让 AI 猜")
+  // 极端情况：整段都是 1，怎么扩都不唯一
+  const solid = new T("1".repeat(200))
+  const solidEditor = new E("DIV", [new E("DIV", [solid])])
+  const solidText = "1".repeat(200) + "\n"
+  withBridge(null, solidEditor, fakeRange(solid, 0, "1".repeat(13)))
+  rec = capture()
+  eq("出现次数（程序算，不手数）", rec.dupCount, solidText.length - 1 - 13 + 1)
+  ok("明确标记为「定不住」", rec.anchorOk === false)
+  dtext = await captured.codec.serialize(String(rec.code))
+  dlines = dtext.split("\n")
+  eq("行数仍是 3（多的是警告那一行）", dlines.length, 3)
+  ok("如实说明重复了多少次", dlines[2].indexOf("出现 " + rec.dupCount + " 次") > 0)
+  ok("带上「第几行第几字」当兜底线索", dlines[2].indexOf("（第 1 行第 1 字起）") > 0)
+  ok("明确要求先问用户、不许猜", dlines[2].indexOf("不要猜") > 0)
+  ok("并且不用【】假造一个上下文", dlines[2].indexOf("【") < 0)
+
+  console.log("\n【19】取不到偏移时不许误报「重复」")
+  // off = -1（选区起点不在编辑区里）→ 定位数据未知，不能编一个重复次数出来
+  withBridge(null, root, fakeRange(new T("野节点"), 0, "写入方基于哪一版"))
+  rec = capture()
+  eq("偏移取不到 → 行号为 -1", rec.line, -1)
+  eq("偏移取不到 → 不谎报重复次数", rec.dupCount, 0)
+  utext = await captured.codec.serialize(String(rec.code))
+  ok("输出里不出现定位行", utext.indexOf("定位：") < 0 && utext.indexOf("⚠️") < 0)
+
   console.log("\n────────────────────────────────")
   console.log("通过 " + pass + " 项，失败 " + fail + " 项")
   process.exit(fail ? 1 : 0)
