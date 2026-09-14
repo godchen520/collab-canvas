@@ -434,7 +434,7 @@ async function main() {
   eq("原文在全文出现几次", rec.dupCount, 2)
   ok("拿到了唯一上下文", rec.anchorOk)
   eq("往前扩一个字就够（左边那个字）", rec.anchorBefore, "乙")
-  eq("往后扩一个字就够（右边那个字）", rec.anchorAfter, "丙")
+  eq("—— 左边这一个字就唯一了，所以右面一个字都不多带", rec.anchorAfter, "")
   eq("行号仍是第 1 行", rec.line, 1)
   eq("列号（甲乙之后 → 第 3 字起）", rec.col, "甲乙".length + 1)
 
@@ -442,7 +442,8 @@ async function main() {
   let dlines = dtext.split("\n")
   eq("从 @ 打头不变", dlines[0], '@"/x/话布优化.md" > 第 1 行')
   eq("第二行仍是原文", dlines[1], "「" + DUP + "」")
-  eq("第三行 = 唯一上下文，原文用【】标出来", dlines[2], "定位：…乙【" + DUP + "】丙…")
+  eq("第三行 = 唯一上下文，原文用【】标出来",
+    dlines[2], "定位：…乙【" + DUP + "】（只改【】里的）")
   ok("确实只多这一行", dlines.length === 3)
 
   console.log("\n【17】原文唯一 → 一个字都不多加（不能白变长）")
@@ -498,7 +499,7 @@ async function main() {
   dlines = dtext.split("\n")
   eq("含换行的上下文也不能把消息撑成 4 行", dlines.length, 3)
   eq("定位行整体形状（换行显示为 ↵，前面不摆指向虚空的省略号）",
-    dlines[2], "定位：【" + "1".repeat(5) + "】" + ROW.slice(5) + "↵" + ROW.charAt(0) + "…")
+    dlines[2], "定位：【" + "1".repeat(5) + "】" + ROW.slice(5) + "↵" + ROW.charAt(0) + "…（只改【】里的）")
   ok("换行确实被换成了看得见的符号", dlines[2].indexOf("↵") > 0)
   eq("【】里仍然是原文", dlines[2].slice(dlines[2].indexOf("【") + 1, dlines[2].indexOf("】")), "1".repeat(5))
 
@@ -509,11 +510,77 @@ async function main() {
   rec = capture()
   ok("拿到了唯一上下文", rec.anchorOk)
   ok("前面带有内容（跨到了上一行的换行）", rec.anchorBefore.length > 0)
+  eq("往前带够就够了，后面不再带（那个孤零零的换行因此不会再出现）", rec.anchorAfter, "")
   dtext = await captured.codec.serialize(String(rec.code))
   dlines = dtext.split("\n")
   eq("仍是 3 行", dlines.length, 3)
-  ok("前后的换行都现形了", dlines[2].indexOf("↵") > 0)
+  ok("前面的换行现形了", dlines[2].indexOf("↵") > 0)
   ok("【】里仍是那 5 个字", dlines[2].indexOf("【" + "1".repeat(5) + "】") > 0)
+
+  console.log("\n【22】主人举的反例：一句话里同一个名字出现两次")
+  // 「小明在笑，小明在闹」—— 选第一个小明 / 选第二个小明，都要能唯一指认。
+  // 这是主人 09-14 提出的质疑：「我选第一个小明，又要怎么办」
+  const SENT = "小明在笑，小明在闹"
+  const sNode = new T(SENT)
+  const sentEditor = new E("DIV", [new E("DIV", [sNode])])
+  const flatSent = flatOf(sentEditor).text
+
+  // 独立实现一遍"某串在全文出现几次"，用来**交叉验证** selref 自己的数法
+  function occ(t, n) { let c = 0, i = 0; while ((i = t.indexOf(n, i)) >= 0) { c++; i++ } return c }
+
+  eq("「小明」在句中出现", occ(flatSent, "小明"), 2)
+
+  // ① 选第一个小明
+  withBridge(null, sentEditor, fakeRange(sNode, 0, "小明"))
+  rec = capture()
+  eq("两个小明 → 确实需要定位", rec.dupCount, 2)
+  ok("拿到了唯一上下文", rec.anchorOk)
+  eq("第一个小明：前面没字了", rec.anchorBefore, "")
+  eq("第一个小明：往后带到「小明在笑」才唯一", rec.anchorAfter, "在笑")
+  // 🔴 核心正确性：把「前文 + 原文 + 后文」整串拿去全文里数，必须只有一处
+  eq("整串在全文里只出现一次（这才叫定得住）",
+    occ(flatSent, rec.anchorBefore + rec.selected + rec.anchorAfter), 1)
+  const t1 = await captured.codec.serialize(String(rec.code))
+
+  // ② 选第二个小明
+  withBridge(null, sentEditor, fakeRange(sNode, 5, "小明"))
+  const rec2 = capture()
+  ok("第二个小明：也拿到唯一上下文", rec2.anchorOk)
+  eq("第二个小明：往前带一个逗号就够（不必把右边的「在」也拖进来）", rec2.anchorBefore, "，")
+  eq("第二个小明：因此后面一个字都不多带", rec2.anchorAfter, "")
+  eq("整串在全文里同样只出现一次",
+    occ(flatSent, rec2.anchorBefore + rec2.selected + rec2.anchorAfter), 1)
+  const t2 = await captured.codec.serialize(String(rec2.code))
+
+  ok("两次输出必须不一样（否则等于没区分开）", t1 !== t2)
+  eq("第一个小明的定位行", t1.split("\n")[2], "定位：【小明】在笑…（只改【】里的）")
+  eq("第二个小明的定位行", t2.split("\n")[2], "定位：…，【小明】（只改【】里的）")
+
+  console.log("\n【23】够用就停：绝不为了凑长度把另一侧也带上")
+  // 主人在同一句上再追一问的延伸场景 —— 三种扩法里，短的那条先够用就用它
+  const ONLYLEFT = "乙小明甲甲甲"      // 「小明」唯一，压根不该有定位行
+  const oNode = new T(ONLYLEFT)
+  const oEditor = new E("DIV", [new E("DIV", [oNode])])
+  withBridge(null, oEditor, fakeRange(oNode, 1, "小明"))
+  rec = capture()
+  eq("原文唯一时不做任何扩展", rec.dupCount, 1)
+  eq("也不带任何上下文", rec.anchorBefore + rec.anchorAfter, "")
+
+  // 同一侧能解决时，另一侧必须保持为空（这是"够用就停"的硬指标）
+  // 「小明小明小明」末尾那个小明：只往后带一个换行就唯一了，
+  // 没必要把左边的「明」也带上 —— 老的"两边同时扩"写法就会白多带一个字。
+  const RIGHTONLY = "小明小明小明"
+  const rNode = new T(RIGHTONLY)
+  const rEditor = new E("DIV", [new E("DIV", [rNode])])
+  const flatRight = flatOf(rEditor).text
+  withBridge(null, rEditor, fakeRange(rNode, 4, "小明"))   // 选最后那一个
+  rec = capture()
+  eq("「小明」出现三次 → 需要定位", rec.dupCount, 3)
+  ok("拿到了唯一上下文", rec.anchorOk)
+  eq("挑了「只往后」这条更短的路，左边一个字都不带", rec.anchorBefore, "")
+  eq("只往后带了行尾那个换行", rec.anchorAfter, "\n")
+  eq("整串在全文里只出现一次",
+    occ(flatRight, rec.anchorBefore + rec.selected + rec.anchorAfter), 1)
 
   console.log("\n────────────────────────────────")
   console.log("通过 " + pass + " 项，失败 " + fail + " 项")
