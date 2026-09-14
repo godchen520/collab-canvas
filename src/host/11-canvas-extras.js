@@ -426,10 +426,11 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       req.on('error', reject)
     })
   }
-  // GET /api/canvas/docdrop.js、/api/canvas/doclink.js —— 提供独立客户端模块源码
+  // GET /api/canvas/docdrop.js、doclink.js、selref.js —— 提供独立客户端模块源码
   //（client 入口动态挂载；每次读盘，改完刷新页面即生效，无需重启）。
   // 注意：运行时路径相对于部署目录的 dist/host.js 解析（../lib/…）
-  ;['docdrop.js', 'doclink.js'].forEach(function (modFile) {
+  // ⚠️ 这个名单是服务端常量，新增一项需要重启 dsh web 才认得出该端点。
+  ;['docdrop.js', 'doclink.js', 'selref.js'].forEach(function (modFile) {
     ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/' + modFile, handler: async (req, res) => {
       try {
         const srcPath = new URL('../lib/' + modFile, import.meta.url)
