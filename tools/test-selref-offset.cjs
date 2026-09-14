@@ -269,15 +269,16 @@ async function main() {
   eq("排序在官方之后", captured.order, 50)
   eq("显示分组标题", captured.showGroupTitle, true)
 
-  console.log("\n【8】翻译规则 · 正常路径（要求短）")
+  console.log("\n【8】翻译规则 · 正常路径（要求短、且 @ 打头）")
   withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
   rec = capture()
   const text = await captured.codec.serialize(String(rec.code))
   const textLines = text.split("\n")
-  eq("首行 = 文档名 · 小标题 · 行号", textLines[0], "【话布选区】话布优化 · 第一节 总览 · 第 2 行")
-  eq("第二行 = @ 路径（带引号，路径含空格也不截断）", textLines[1], '@"/x/话布优化.md"')
-  eq("末行 = 选中原文", textLines[2], "「写入方基于哪一版」")
-  eq("总共只有 3 行", textLines.length, 3)
+  // @ 必须打头 —— 官方要靠它把这一行折成一张文件卡片（主人实测的线索）
+  eq("首行 = @路径 +「> 小标题 · 行号」", textLines[0], '@"/x/话布优化.md" > 第一节 总览 · 第 2 行')
+  eq("第二行 = 原文", textLines[1], "「写入方基于哪一版」")
+  eq("总共只有 2 行", textLines.length, 2)
+  ok("首字符就是 @", text.charAt(0) === "@")
   ok("不塞前后文指纹（实测它会把表格摊成一串噪音）", text.indexOf("上下文核对") < 0)
   ok("不塞字符偏移 / 字数这类对模型没用的东西", text.indexOf("字起") < 0 && text.indexOf("文中第") < 0)
 
@@ -286,7 +287,14 @@ async function main() {
   withBridge({ title: "第一节 总览" }, root, fakeRange(tP1, 0, "写入方基于哪一版"))
   const recSame = capture()
   const textSame = await captured.codec.serialize(String(recSame.code))
-  eq("同名不重复", textSame.split("\n")[0], "【话布选区】第一节 总览 · 第 2 行")
+  eq("同名不重复", textSame.split("\n")[0], '@"/x/话布优化.md" > 第 2 行')
+
+  console.log("\n【8c】拿不到真实路径时，退回纯文字标签（不丢信息）")
+  withBridge({ mention: "" }, root, fakeRange(tP1, 0, "写入方基于哪一版"))
+  const recNoPath = capture()
+  const textNoPath = await captured.codec.serialize(String(recNoPath.code))
+  eq("没有路径 → 退回「【话布选区】文档名 · 小标题 · 行号」",
+    textNoPath.split("\n")[0], "【话布选区】话布优化 · 第一节 总览 · 第 2 行")
 
   console.log("\n【9】翻译规则 · 兜底路径（不许抛错）")
   const orphan = await captured.codec.serialize("99999")
