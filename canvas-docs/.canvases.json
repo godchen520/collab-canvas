@@ -1,5 +1,5 @@
 {
-  "activeId": "cv-mtyi95g2-1",
+  "activeId": "cv-mu0raffc-1",
   "rootOverride": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc",
   "canvases": [
     {
@@ -43,6 +43,12 @@
       "title": "DSH启动崩溃_会话路径错位_修复说明_2026-09-12",
       "type": "document",
       "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/DSH启动崩溃_会话路径错位_修复说明_2026-09-12.md"
+    },
+    {
+      "id": "cv-mu0raffc-1",
+      "title": "话布选区引用方案",
+      "type": "document",
+      "filePath": "H:\\WPSCloud\\OneDrive - 星河游\\文档\\DSH project\\DSH Collab Doc/canvas-docs/话布选区引用方案.md"
     }
   ]
 }
