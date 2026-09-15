@@ -256,9 +256,24 @@ async function main() {
     // 这一条在 applyWrite 里，不在切出来的这段；改用源码文本核对，
     // 因为「有没有那道 source 判断」是**整条功能会不会误跳**的关键。
     ok("applyWrite 里带了 source === 'ai' 的判断",
-      hostSrc.indexOf("if (source === 'ai') noteAiChange(c, before, c.content)") >= 0)
+      hostSrc.indexOf("if (source === 'ai') {") >= 0)
     const n = hostSrc.split("noteAiChange(c, before, c.content)").length - 1
     eq("而且只有一处（不会重复记）", n, 1)
+  }
+
+  console.log("\n【15】AI 写入立刻落盘，不等那 1.5 秒防抖")
+  {
+    // 为什么值得单独钉住：主人改完马上去看磁盘 / 让别的工具读这个文件时，
+    // 1.5 秒的空窗会让他看到上一版内容 —— 然后以为「根本没写进去」。
+    // 这是**静默的误导**，不是性能问题。
+    ok("AI 分支调了立即落盘", hostSrc.indexOf("saveSerial(c).then(") >= 0)
+    // 而人的连续打字仍然走防抖（防抖存在的理由就是合并连续输入，别一起砍掉）
+    ok("debouncedFlush 仍在（人的输入照旧走防抖）", hostSrc.indexOf("debouncedFlush()") >= 0)
+    ok("落盘串成一条链", hostSrc.indexOf("var p = saveChain.then(") >= 0
+      && hostSrc.indexOf("saveChain = p.then(") >= 0)
+    ok("某一次失败不会把链弄断（后面该写还得写）",
+      hostSrc.indexOf("saveChain = p.then(function () {}, function () {})") >= 0)
+    ok("防抖那条路径也走同一个串行链", hostSrc.indexOf("await saveSerial(c)") >= 0)
   }
 
   console.log("\n【14】这个功能的接口在 host 上暴露齐了")

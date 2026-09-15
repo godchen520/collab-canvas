@@ -125,7 +125,18 @@ function applyWrite(c, content, mode, baseVersion, source) {
   c.updatedAt = Date.now()
   pushHistory(c, before, c.content, source, c.version)
   // 只记 AI 的改动 —— 主人自己打字/自动保存不该触发"跳过去给你看"
-  if (source === 'ai') noteAiChange(c, before, c.content)
+  if (source === 'ai') {
+    noteAiChange(c, before, c.content)
+    // 🔴 AI 的改动**立刻落盘**，不等那 1.5 秒防抖。
+    // 为什么要区别对待：防抖是为「人在连续打字」准备的（合并成一次写），
+    // 而 AI 一次改动就是一次，没有可合并的东西，等 1.5 秒只有坏处 ——
+    // 主人改完马上去看磁盘、或让别的工具读这个文件，看到的还是上一版，
+    // 会以为「根本没写进去」（2026-09-15 实测报告过）。这是**静默的误导**。
+    // 失败不影响内存结果（内存里已经是新内容），防抖那次还会兜底重试一遍。
+    saveSerial(c).then(function () { return persistMeta() }).catch(function (e) {
+      console.error('[collab-canvas] ai 立即落盘失败（防抖那次会重试）:', c.title, e && e.message)
+    })
+  }
   debouncedFlush()
   return { version: c.version }
 }

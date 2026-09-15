@@ -67,12 +67,25 @@ async function persistMeta() {
   if (!okCount) console.error('[collab-canvas] meta persist failed at all locations')
 }
 
+// 所有落盘**串成一条链**。为什么必须串：
+//   `saveCanvas` 是 async，写的是 c.content。两次写并发时，如果「第二次先完成、
+//   第一次后完成」，文件最后会停在**旧内容**上 —— 而且两边都报成功，没人会发现。
+//   串起来之后一次只写一个，顺序就是调用顺序。
+// 返回的还是**原始** promise（调用方仍能 catch 到失败），只是把链接续上了 ——
+// 链本身不因某一次失败而断掉，后面的写该发还得发。
+var saveChain = Promise.resolve()
+function saveSerial(c) {
+  var p = saveChain.then(function () { return saveCanvas(c) })
+  saveChain = p.then(function () {}, function () {})
+  return p
+}
+
 async function flushDirty() {
   const dirty = []
   canvases.forEach(function (c) { if (c.dirty) dirty.push(c) })
   let failed = 0
   for (const c of dirty) {
-    try { await saveCanvas(c) } catch (e) { failed++; console.error('[collab-canvas] autosave failed:', c.title, e.message) }
+    try { await saveSerial(c) } catch (e) { failed++; console.error('[collab-canvas] autosave failed:', c.title, e.message) }
   }
   if (dirty.length > failed) persistMeta()
 }

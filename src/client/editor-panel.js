@@ -1119,8 +1119,48 @@ window.__ModuleLoader__.load({
         return () => clearInterval(t);
       }, []);
 
+      // 把编辑器里**还没写出去**的内容立刻落一次。返回 Promise：
+      //   resolve(null)           没有待写内容（没编辑器 / 内容与服务端一致）
+      //   resolve({ ok:true,… })  写成功
+      //   resolve({ conflict:… }) 服务端版本已前进，本机这一份没写进去
+      //
+      // 🔴 2026-09-15 新增，修的是一个**静默丢字**：
+      //    以前「重载」和「切走文档」都只做 clearTimeout，把等待中的自动保存**直接丢掉**，
+      //    然后拿服务端内容覆盖界面。于是「刚敲完就点重载」= 自己敲的字被取消，
+      //    界面又变回旧内容 —— 主人报的「改了却看不到 / 改了又变回去」正是这条路径。
+      //    clearTimeout 本身没错（它防的是响应乱序），错在**只取消、不落地**。
+      //    这里两件事都做：先取消定时器，再亲手把这份内容写出去。
+      function flushPending() {
+        clearTimeout(saveTimer.current);
+        var id = ccvLiveCanvasId;
+        var el = editorRef.current;
+        if (!id || !el) return Promise.resolve(null);
+        var md;
+        try { md = htmlToMd(el); } catch (_) { return Promise.resolve(null); }
+        // 没动过就不必写（和服务端本来就一致），省一次请求
+        if (lastSyncedMd.current === null || md === lastSyncedMd.current) return Promise.resolve(null);
+        ccvLog("重载/切走前先落一次待写内容（不再直接丢弃）");
+        return writeMd(id, md);
+      }
+
       function loadCanvas(id) {
-        clearTimeout(saveTimer.current);   // 防竞态：切换前丢掉旧文档的待写自动保存
+        var sameDoc = (id === ccvLiveCanvasId);
+        flushPending().then(function (res) {
+          // 本机有内容却没写成功（服务端版本已经前进 → 冲突）：
+          // 这时候再拿服务端内容覆盖界面，就是把主人正在编辑的东西从他眼前抹掉。
+          // 所以**保留界面不动**，只告诉他一声，留哪一份由他定。
+          if (sameDoc && res && res.conflict) {
+            ccvLog("重载已中止：本机有未提交的编辑，且服务端也有新版本");
+            if (window.__ccvKit && window.__ccvKit.toast) {
+              window.__ccvKit.toast("你还有没提交的编辑，已为你保留；服务端也有新版本，先确认要留哪一份", "ccv-reload-blocked");
+            }
+            return;
+          }
+          doLoad(id);
+        }).catch(function () { doLoad(id); });
+      }
+
+      function doLoad(id) {
         fetch(canvasApi("/api/canvas/read?id=" + encodeURIComponent(id))).then(r => r.json()).then(d => {
           if (!d.ok) return;
           var dft = draftGet(d.id);
@@ -1211,13 +1251,20 @@ window.__ModuleLoader__.load({
           // 不带的话 typeof baseVersion !== 'number' → 直接跳过校验 → 后写覆盖先写。
           body: JSON.stringify({ id: id, content: md, knownVer: versionRef.current })
         }).then(r => r.json()).then(function (d) {
+          // ⚠️ 只有「写的还是当前打开的这一篇」时才更新本地基准。
+          // 「重载/切走前先落一次」会在切换途中发请求，响应回来时可能已经在看别的文档了；
+          // 那时若照旧更新，就会把**旧文档**的版本号盖到**新文档**身上。
+          var still = (id === ccvLiveCanvasId);
           if (d && d.ok) {
-            setVersion(d.version);
-            versionRef.current = d.version;
-            lastSyncedMd.current = md;
-            draftDropIf(id, md); setRestored(false);
+            if (still) {
+              setVersion(d.version);
+              versionRef.current = d.version;
+              lastSyncedMd.current = md;
+              setRestored(false);
+            }
+            draftDropIf(id, md);
           } else if (d && d.conflict) {
-            resolveConflict(md, d);
+            if (still) resolveConflict(md, d);
           }
           return d;
         }).catch(function () { return null; });
@@ -2051,7 +2098,7 @@ window.__ModuleLoader__.load({
           // ─── 第二行：管当前文档（保存 / 重载）───
           h("div", { className: "ccv-row ccv-row-doc" },
             h("button", { className: "ccv-tbtn", onClick: saveCanvas, disabled: !activeId, title: "保存到服务端（停止输入 1.5 秒后也会自动存）" }, "保存"),
-            h("button", { className: "ccv-tbtn", onClick: () => { if (activeId) loadCanvas(activeId); }, disabled: !activeId, title: "从服务端拉取最新内容 —— AI 在对话里改过话布后用它同步" }, "重载"),
+            h("button", { className: "ccv-tbtn", onClick: () => { if (activeId) loadCanvas(activeId); }, disabled: !activeId, title: "从服务端拉取最新内容 —— AI 在对话里改过话布后用它同步。你还没提交的编辑会先替你保存，不会再被这一下清掉" }, "重载"),
             h("button", { className: "ccv-ibtn", onClick: openFolder, title: "在文件管理器中打开本文档所在的文件夹",
               dangerouslySetInnerHTML: { __html: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:auto"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>' } }),
             h("button", { className: "ccv-tbtn", onClick: manageRegistry, title: "登记文件夹：之后把登记文件夹内的文件拖进 DSH 窗口时，按真实路径 @ 引用（不产生副本）" }, "登记"),
