@@ -27,11 +27,60 @@
 //   tools/test-host-selctx.cjs 靠这两个标记把这段**真代码**切出来单独跑，
 //   不是照抄一份来测。挪动或删除标记会让那份测试失效。
 
-// ── 一、从会话里取「用户这一轮说的话」────────────────────────────
+// ── 一、取「用户这一步要处理的那条消息」─────────────────────────
 // 官方求值 provider 时会把当前 agent 交给我们（assembleContextFor 里
 // 返回 {agent, scope, signal}），顺着 agent.session 就能读到这次对话。
 // ⚠️ 必须**同步**：官方求值不带 await（`entry.text(context)` 直接调用），
 //   返回 Promise 只会被当成一个奇怪的字符串塞进 prompt。
+//
+// 🔴🔴 为什么要**两条通道**（2026-09-15 主人报「提示讲的是上一条消息」）
+//
+// 官方第 1 步求值上下文的顺序是死的（dsh-agent-loop 的 preStep）：
+//     ① claim()                             把待处理消息从队列里取走
+//     ② systemPrompt.assemble()   ← 我们在这里求值
+//     ③ session.append("user/message", …)   消息**这时**才写进会话界面
+// 所以第 1 步里"会话界面上的最后一条人消息"**就是上一条**，怎么看都晚一拍
+// （一天四次实测都是这个规律，同一回合的第 2 步才追上）。
+//
+// → **不能只看界面。** 还有一条更早的记录：官方**一收到**消息就把它放进
+//   待处理队列（`agent/inbox/spliced` 事件里的 data.inserted），那一步在整轮
+//   开始之前，所以第 1 步也读得到 —— 它才是"这一步正在处理的那条消息"。
+//
+// 两条通道都读，取**新的那条**：
+//   · 队列那条更新 → 界面还没追上，用队列的（第 1 步就靠它）
+//   · 界面那条更新 → 界面已追上，两条内容一样，用界面那条更省事
+// 兜底通道（只能看界面时）再加一道**否决**，见 ccvTurnMsg。
+
+// ── 诊断：服务端这一侧怎么判断的，也落盘 ─────────────────────────
+// 客户端那份日志在 %TEMP%/ccv-selbar.log（09-http.js 落盘）。
+// 这里另写一份 %TEMP%/ccv-selctx.log —— **不抢同一个文件**，复盘时两边对得上。
+// 「为什么没注入」和「注入了什么」都写在这条线上；全部 try/catch，
+// 诊断绝不能影响注入本身。
+var CCV_TRACE_FILE = ''
+try {
+  if (typeof process !== 'undefined' && process && process.env) {
+    CCV_TRACE_FILE = (process.env.TEMP || process.env.TMPDIR || '.') + '/ccv-selctx.log'
+  }
+} catch (e) { CCV_TRACE_FILE = '' }
+var ccvTraceRing = []
+
+function ccvClock(t) {
+  try {
+    var d = new Date(t)
+    function p(n) { return n < 10 ? '0' + n : '' + n }
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
+  } catch (e) { return String(t) }
+}
+
+function ccvTrace(msg) {
+  try {
+    ccvTraceRing.push(ccvClock(Date.now()) + ' ' + String(msg))
+    if (ccvTraceRing.length > 300) ccvTraceRing = ccvTraceRing.slice(ccvTraceRing.length - 300)
+    if (!CCV_TRACE_FILE) return
+    if (typeof nodefs === 'undefined' || !nodefs || !nodefs.writeFileSync) return
+    nodefs.writeFileSync(CCV_TRACE_FILE, ccvTraceRing.join('\n') + '\n', 'utf8')
+  } catch (e) { /* 落盘失败不影响注入 */ }
+}
 
 // 「不是人打的字」的来源。这些一律跳过，继续往前找。
 var CCV_INJECT_KINDS = {
@@ -55,25 +104,93 @@ function ccvMsgText(msg) {
   return out.join('\n')
 }
 
-// 最近一条「人打的」消息，找不到就返回空串。
-// ⚠️ 这里必须**往前找**而不是只看最后一条：我们自己注入的那条也是
-//   user/message，只看最后一条会看到自己，那就永远解析不出引用了。
+// 这条消息算不算"人打的"。是 → 返回正文；不是 → null。
+function ccvHumanTextOf(msg) {
+  if (!msg) return null
+  var kind = msg.source && msg.source.kind
+  if (kind && CCV_INJECT_KINDS[kind]) return null
+  var t = ccvMsgText(msg)
+  return t || null
+}
+
+// ── 通道 A：会话界面（可能晚一拍）────────────────────────────────
+// ⚠️ 必须**往前找**而不是只看最后一条：我们自己注入的那条也是 user/message，
+//   只看最后一条会看到自己，那就永远解析不出引用了。
 // 反过来这也给了我们一个好性质：用户发了新的、不带引用的消息时，
-// 最近这条就变成它 → 解析不出引用 → 返回空 → 官方把注入抹掉。
-function ccvLastHumanText(agent) {
+//   最近这条就变成它 → 解析不出引用 → 返回空 → 官方把注入抹掉。
+function ccvFromSurface(agent) {
   var session = agent && agent.session
-  if (!session) return ''
+  if (!session) return null
   var nodes = session.surface && session.surface.nodes
-  if (!nodes || !nodes.length) return ''
+  if (!nodes || !nodes.length) return null
   for (var i = nodes.length - 1; i >= 0; i--) {
     var ev = session.eventAt(nodes[i])
     if (!ev || ev.type !== 'user/message') continue
-    var msg = ev.data                       // user/message 的 data 就是消息本身
-    var kind = msg && msg.source && msg.source.kind
-    if (kind && CCV_INJECT_KINDS[kind]) continue
-    return ccvMsgText(msg)
+    var t = ccvHumanTextOf(ev.data)
+    if (!t) continue
+    return { text: t, time: typeof ev.time === 'number' ? ev.time : 0, src: '界面' }
   }
-  return ''
+  return null
+}
+
+// ── 通道 B：待处理队列的记录（更早，不晚拍）───────────────────────
+// 事件名与形状照抄官方（dsh-agent-loop 的 ReactLoopInbox.mutate）：
+//   session.append('agent/inbox/spliced', { target, start, inserted, … })
+// 认领/取消只带 removedCount、inserted 为空 → 跳过（那是噪音，不是新消息）。
+//
+// 🔴 这里用**白名单**：只有 source.kind === 'user' 才算人打的。
+//   理由：这条队列里还流着别的东西（工具结果带回来的补充上下文等），
+//   用"排除法"容易漏掉没见过的 kind，那就把机器塞的东西当成用户说的话了。
+//   （界面那条通道仍用排除法 —— 它本来就工作正常，不动它。）
+var CCV_INBOX_EVENT = 'agent/inbox/spliced'
+
+function ccvInboxHumanText(msg) {
+  var kind = msg && msg.source && msg.source.kind
+  if (kind !== 'user') return null
+  var t = ccvMsgText(msg)
+  return t || null
+}
+
+function ccvFromInbox(agent) {
+  var session = agent && agent.session
+  if (!session || typeof session.snapshotEvents !== 'function') return null
+  var events = null
+  try { events = session.snapshotEvents() } catch (e) { return null }
+  if (!events || !events.length) return null
+  for (var i = events.length - 1; i >= 0; i--) {
+    var ev = events[i]
+    if (!ev || ev.type !== CCV_INBOX_EVENT) continue
+    var ins = ev.data && ev.data.inserted
+    if (!ins || !ins.length) continue
+    // 这一批里没有"人打的字"（多半是工具结果带进来的补充上下文）→ 继续往前翻。
+    // 往前翻是安全的：翻出来的**一定不比界面那条更旧**（提交必然早于进界面），
+    // 所以不会退化成"讲上一条消息"。
+    for (var k = ins.length - 1; k >= 0; k--) {
+      var t = ccvInboxHumanText(ins[k])
+      if (t) return { text: t, time: typeof ev.time === 'number' ? ev.time : 0, src: '队列' }
+    }
+  }
+  return null
+}
+
+// 挑出「这一步要处理的那条消息」→ {text, time, src}；拿不到 → null。
+// 🔴 兜底通道（只能看界面）上多一道**否决**：界面这条消息，比我收到的最新一次
+//   选区上报还旧 → 说明用户在这条之后又引用过东西、界面还没追上 → 我看的不是
+//   这一步的消息 → **一个字都不说**。宁可不说，也不说错。
+//   （队列通道不需要这道：队列那条就是提交本身，不可能比上报旧。）
+function ccvTurnMsg(agent) {
+  var byInbox = ccvFromInbox(agent)
+  var bySurface = ccvFromSurface(agent)
+  if (byInbox && bySurface) return byInbox.time >= bySurface.time ? byInbox : bySurface
+  if (byInbox) return byInbox
+  if (!bySurface) return null
+  var newestPinAt = ccvPins.length ? (ccvPins[ccvPins.length - 1].at || 0) : 0
+  if (bySurface.time > 0 && newestPinAt > bySurface.time) {
+    ccvTrace('否决：界面这条消息（' + ccvClock(bySurface.time) + '）比我收到的最新上报（'
+      + ccvClock(newestPinAt) + '）还旧 → 界面没追上，本轮不注入')
+    return null
+  }
+  return bySurface
 }
 
 // ── 一·五、客户端报上来的「你划的是第几处」──────────────────────
@@ -108,7 +225,8 @@ function ccvPinAdd(p) {
       dupCount: typeof p.dupCount === 'number' ? p.dupCount : 0,
       line: typeof p.line === 'number' ? p.line : -1,
       heading: String(p.heading || ''),
-      at: Date.now(),
+      // 时间戳默认取"此刻"；允许上报里自带（诊断与测试要造"更旧/更新"的场景）。
+      at: typeof p.at === 'number' && p.at > 0 ? p.at : Date.now(),
     })
     if (ccvPins.length > CCV_PINS_MAX) ccvPins = ccvPins.slice(ccvPins.length - CCV_PINS_MAX)
     ccvPinSeq++
@@ -122,12 +240,17 @@ function ccvPinAdd(p) {
 // 「先划选、再发送」，所以最新那条就是这次的。
 // ⚠️ 已知边界：同一段原文连着划两次、却只发出第一条引用时，会取到后一条的序数。
 //   罕见，且注入文案里保留了每处的上下文供核对，不会静默改错。
-function ccvPinFind(path, quote) {
+//
+// 🔴 `used` 是**本次拼装里已经用掉的上报**：一条消息里引用了两段不同的原文、
+//   但它们被解析成同一个 `q`（比如原文本身含「」被截短）时，两条会抢同一条上报
+//   → 第二条拿到第一条的序数 → 改错地方。所以用过的不能再给下一条用。
+function ccvPinFind(path, quote, used) {
   var want = ccvNormPathForRef(path)
   var q = String(quote || '')
   if (!q) return null
   for (var i = ccvPins.length - 1; i >= 0; i--) {
     var p = ccvPins[i]
+    if (used && used.length && used.indexOf(p) >= 0) continue
     // 精确相等最好；但解析出来的原文在"原文本身含「」"时会被截短，
     // 所以也接受"它是上报原文的前缀"（截短只会往前截，不会变形）。
     if (p.text !== q && p.text.indexOf(q) !== 0) continue
@@ -304,7 +427,8 @@ function ccvSpotExcerpt(content, idx, quote) {
 }
 
 // 单条引用 → 一段话。返回 '' 表示这条不值得注入（比如找不到文档）。
-function ccvDescribeRef(ref) {
+// `used` 见 ccvPinFind：同一次拼装里上报记录不许被两条引用重复认领。
+function ccvDescribeRef(ref, used) {
   var who = ref.path || ref.title || '（未标注）'
   var c = ccvFindDoc(ref)
   if (!c) {
@@ -348,7 +472,8 @@ function ccvDescribeRef(ref) {
   // 序数从哪来：**客户端刚报上来的**优先（引用正文里已经不写了）；
   // 拿不到才退回看抬头标签（兼容没更新的客户端 / 用户手打的引用）。
   // 两个都没有 → 绝不替模型挑一处，让它把每处摆给用户确认。
-  var pin = ccvPinFind(ref.path, quote)
+  var pin = ccvPinFind(ref.path, quote, used)
+  if (pin && used && used.indexOf(pin) < 0) used.push(pin)
   var ordinal = (pin && pin.ordinal > 0) ? pin.ordinal : ref.ordinal
 
   var head = '· 《' + c.title + '》「' + ccvShortQuote(quote, CCV_SEL_QUOTE_MAX)
@@ -394,15 +519,19 @@ var ccvSelCtxMemo = { key: null, val: '' }
 function ccvBuildSelContext(context) {
   try {
     var agent = context && context.agent
-    var text = ccvLastHumanText(agent)
-    if (!text) { ccvSelCtxMemo = { key: null, val: '' }; return '' }
-    var memoKey = text + '#' + ccvPinSeq + '#' + ccvPins.length
+    var picked = ccvTurnMsg(agent)
+    if (!picked) { ccvSelCtxMemo = { key: null, val: '' }; return '' }
+    var text = picked.text
+    // ⚠️ 键里**必须**带上报计数与记录条数（见下），也带"这是哪条消息"（来源+时间）——
+    // 少一个维度就会把"消息换了、内容恰好一样"的两次当成同一次，拿旧序数去改。
+    var memoKey = picked.src + '#' + picked.time + '#' + text + '#' + ccvPinSeq + '#' + ccvPins.length
     if (ccvSelCtxMemo.key === memoKey) return ccvSelCtxMemo.val
 
     var refs = ccvParseRefs(text)
     var blocks = []
+    var usedPins = []
     for (var i = 0; i < refs.length && i < 3; i++) {
-      var one = ccvDescribeRef(refs[i])
+      var one = ccvDescribeRef(refs[i], usedPins)
       if (one) blocks.push(one)
     }
     var out = ''
@@ -411,6 +540,9 @@ function ccvBuildSelContext(context) {
         + '按下面的位置改就行，不必再问：\n' + blocks.join('\n')
       if (out.length > CCV_SEL_TOTAL_MAX) out = out.slice(0, CCV_SEL_TOTAL_MAX) + '\n（内容过长，已截断）'
     }
+    ccvTrace('这一步的消息来自「' + picked.src + '」（' + ccvClock(picked.time) + '），'
+      + '认出 ' + refs.length + ' 条引用，注入 ' + blocks.length + ' 条；'
+      + '手上上报 ' + ccvPins.length + ' 条')
     ccvSelCtxMemo = { key: memoKey, val: out }
     return out
   } catch (e) {

@@ -104,24 +104,63 @@ if (typeof reg.text !== "function") {
 }
 
 // ─── 造一个假会话 ──────────────────────────────────────────────
-// 按官方 session 的真实形状：surface.nodes 是一串 seq，eventAt(seq) 取事件，
-// user/message 的 data 就是消息本身（不是 {message:…}，那是 assistant 那种）。
-function makeAgent(messages) {
-  const nodes = messages.map((_, i) => i)
+// 按官方 session 的真实形状：
+//   · surface.nodes 是一串 seq，eventAt(seq) 取事件；
+//   · 每个事件都带 time（官方 append 时写的 Date.now()）；
+//   · user/message 的 data 就是消息本身（不是 {message:…}，那是 assistant 那种）；
+//   · **另外还有一条"投递记录"**：官方一收到消息就先记一条
+//     `agent/inbox/spliced`（data.inserted 装着消息），它**早于**消息写进界面。
+//     真机第 1 步求值上下文时，界面上还没有刚发的那条，只有队列里有 →
+//     所以这份假数据必须两样都有，否则测的就不是同一件事。
+const T0 = 1700000000000                 // 固定基准时间：结果不随运行时刻变化
+const STEP = 60000                       // 相邻两条消息隔 1 分钟
+const msgTime = (i) => T0 + i * STEP
+const PIN_BASE = T0 - 600000             // 上报默认发生在"划选那一刻"（必然早于发送）
+
+function makeAgent(messages, opt) {
+  opt = opt || {}
+  const surfaceCount = typeof opt.surfaceCount === "number" ? opt.surfaceCount : messages.length
+  const nodes = []
   const bySeq = new Map()
+  const events = []
+  let seq = 0
   messages.forEach((m, i) => {
-    bySeq.set(i, {
+    const ev = {
       type: "user/message",
-      seq: i,
+      seq: seq++,
+      time: msgTime(i),
       data: { id: "m" + i, role: "user", source: m.source || { kind: "user" }, content: m.content },
-    })
+    }
+    if (i < surfaceCount) { nodes.push(ev.seq); bySeq.set(ev.seq, ev) }
   })
-  return {
-    session: {
-      surface: { nodes },
-      eventAt: (seq) => bySeq.get(seq),
-    },
+  if (!opt.noInboxEvents) {
+    // 投递记录：只记"人发出来的"（我们自己注入的那条不走队列，真机也是这样）
+    messages.forEach((m, i) => {
+      const kind = (m.source && m.source.kind) || "user"
+      if (kind !== "user") return
+      events.push({
+        type: "agent/inbox/spliced",
+        seq: seq++,
+        time: msgTime(i) - 1000,        // 投递早于进界面（真机就是这个顺序）
+        data: { target: "next-turn", start: 0, inserted: [{ id: "m" + i, source: { kind: "user" }, content: m.content }] },
+      })
+    })
+    // 队列里流着的**别的东西**（工具结果带回来的补充上下文等）
+    ;(opt.extraInbox || []).forEach((b) => {
+      events.push({
+        type: "agent/inbox/spliced",
+        seq: seq++,
+        time: typeof b.time === "number" ? b.time : T0 + 900000,
+        data: { target: "next-step", start: 0, inserted: b.messages },
+      })
+    })
   }
+  const session = {
+    surface: { nodes },
+    eventAt: (s) => bySeq.get(s),
+  }
+  if (!opt.noInboxEvents) session.snapshotEvents = () => events
+  return { session }
 }
 function human(text) {
   return { content: [{ type: "text", text: text }], source: { kind: "user" } }
@@ -162,7 +201,9 @@ function refBare(quote, p) {
   return '@"' + (p || DOC.filePath) + '"\n「' + quote + '」'
 }
 function clearPins() { sandbox.ccvPins.length = 0 }
-function pinIt(o) { return sandbox.ccvPinAdd(Object.assign({ path: DOC.filePath, text: "散步" }, o)) }
+// 默认 `at` 用"划选那一刻"的固定值 —— 真机上它必然早于消息，
+// 不这么写会让"兜底通道的否决"（上报比消息新才否决）被假数据误触发。
+function pinIt(o) { return sandbox.ccvPinAdd(Object.assign({ path: DOC.filePath, text: "散步", at: PIN_BASE }, o)) }
 
 // ═══ 一、引用识别：认什么、不认什么 ═══════════════════════════
 console.log("\n[1] 引用识别（认错 = 凭空定位一段没被引用的文字）")
@@ -426,7 +467,9 @@ setDocs([DOC])
     content: "他常说「早睡早起」这句话，后来自己也做到了。\n\n再说一次：他常说「早睡早起」这句话。",
   }
   setDocs([doc2])
-  sandbox.ccvPinAdd({ path: doc2.filePath, text: "他常说「早睡早起」这句话", ordinal: 2, dupCount: 2 })
+  // 上报的时间戳要给准（真机上它必然早于消息）—— 不给就会落成"此刻"，
+  // 被测代码会判成"界面没追上"而否决掉，于是这条用例就变成在测别的事了。
+  sandbox.ccvPinAdd({ path: doc2.filePath, text: "他常说「早睡早起」这句话", ordinal: 2, dupCount: 2, at: PIN_BASE + 1000 })
   const out = run([human('@"D:\\proj\\canvas-docs\\带引号.md"\n「他常说「早睡早起」这句话」')])
   has("[66] 原文被截短时仍能配上报记录", out, "用户要的就是第 2 处")
   setDocs([DOC])
@@ -454,11 +497,121 @@ console.log("\n[8] 长度上限")
     content: chunks.join("\n\n"),
   }
   setDocs([doc3])
+  // 清干净：上面的用例可能留下"时间戳很新"的上报，会把兜底通道的否决误触发
+  clearPins()
   const one = ' @"D:\\proj\\canvas-docs\\大文档.md" > 第 1 行 · 多处（第 3 处）\n「' + quote + "」"
   const out = run([human("看看这三处\n" + one + "\n再确认一下\n" + one + "\n最后一遍\n" + one)])
   has("[51] 被截断时明确说了", out, "已截断")
   eq("[52] 截断后长度收在上限附近", out.length <= 1200 + 20, true)
   ok("[53] 截断标记在末尾（是收口，不是中途丢字）", out.trim().endsWith("已截断）"))
+}
+
+// ═══ 八·五、「提示到底属于哪条消息」—— 对应关系 ═════════════════
+// 2026-09-15 主人报：注入讲的是**上一条**消息里的引用（提示和引用对不上）。
+// 根因：官方第 1 步求值上下文时，用户刚发的那条还没写进会话界面
+//   （preStep: ① claim ② assemble←我们 ③ append user/message）→ 只看界面必然晚一拍。
+// 修法：改读"待处理队列"里那条**更早**的记录（agent/inbox/spliced）。
+// 这组用例把「提示 = 这一步要处理的那条消息的引用」钉死。
+console.log("\n[7c] 提示必须对应「这一步要处理的那条消息」")
+setDocs([DOC])
+{
+  clearPins()
+  // 真机第 1 步：界面上只有上一条（引用「散步」），队列里已经有刚发的（引用「中间一段别的内容」）
+  const m1 = human("帮我改一下\n" + refBare("散步"))
+  const m2 = human("再看这个\n" + refMention("中间一段别的内容", null, null))
+  const out = reg.text({ agent: makeAgent([m1, m2], { surfaceCount: 1 }) })
+  // ⚠️ 断言要**认准"这条引用被当成主角"**，不能只搜原文 ——
+  //   上一条的上下文摘录里本来就可能顺带出现下一段的字（第一版就是这么蒙对的）。
+  has("[73] 界面没追上时，讲的是**刚发的**那条", out, "「中间一段别的内容」在第")
+  hasNot("[74] 不许拿上一条的引用充数", out, "「散步」在第")
+}
+{
+  clearPins()
+  // 第 2 步：界面追上了 → 两条通道读到同一条，结论不能翻回上一条
+  const out = run([
+    human("帮我改一下\n" + refBare("散步")),
+    human("再看这个\n" + refMention("中间一段别的内容", null, null)),
+  ])
+  has("[75] 界面追上之后仍然一致", out, "「中间一段别的内容」在第")
+  hasNot("[76] 也不会退回上一条的引用", out, "「散步」在第")
+}
+{
+  clearPins()
+  // 队列里最新一批是**机器塞的**（工具结果带的补充上下文）→ 必须继续往前翻到人那条
+  const mHuman = human("改一下\n" + refMention("中间一段别的内容", null, null))
+  const agent = makeAgent([mHuman], {
+    surfaceCount: 0,
+    extraInbox: [{
+      time: msgTime(0) + 5000,
+      messages: [{ id: "ctx", source: { kind: "plugin", plugin: "x" }, content: [{ type: "text", text: "工具结果带的补充说明" }] }],
+    }],
+  })
+  const out = reg.text({ agent })
+  has("[77] 队列里最新一批是机器塞的 → 继续往前翻，仍找到人那条", out, "「中间一段别的内容」在第")
+}
+{
+  clearPins()
+  // 队列里最新一批是**助手/工具**来源（不是 plugin 也不是 user）→ 同样不许当成用户说的话
+  const mHuman = human("改一下\n" + refMention("中间一段别的内容", null, null))
+  const agent = makeAgent([mHuman], {
+    surfaceCount: 0,
+    extraInbox: [{
+      time: msgTime(0) + 5000,
+      messages: [{ id: "t1", source: { kind: "tool", callId: "c1" }, content: [{ type: "text", text: "工具修好的内容" }] }],
+    }],
+  })
+  has("[78] kind=tool 同样不当成人说的话", reg.text({ agent }), "「中间一段别的内容」在第")
+}
+{
+  // 队列那条比界面上那条**旧**（界面已追上）→ 用界面的，结论一样
+  clearPins()
+  const mHuman = human("改一下\n" + refMention("中间一段别的内容", null, null))
+  const out = reg.text({ agent: makeAgent([human("先聊点别的"), mHuman]) })
+  has("[79] 界面已追上时用界面的那条（内容一致）", out, "「中间一段别的内容」在第")
+}
+{
+  // 🔴 兜底通道（拿不到队列记录 = 老版本）：界面那条比最新上报还旧
+  //    → 说明界面没追上 → **一个字都不说**。宁可不说，也不说错。
+  clearPins()
+  const agent = makeAgent([human("帮我改\n" + refBare("散步"))], { noInboxEvents: true })
+  sandbox.ccvPinAdd({ path: DOC.filePath, text: "散步", ordinal: 2, dupCount: 2, at: msgTime(0) + 5000 })
+  eq("[80] 兜底通道：界面没追上 → 不注入（不是注错）", reg.text({ agent }), "")
+}
+{
+  // 同一条通道，但上报比消息旧（正常顺序：先划、后发）→ 照常注入
+  clearPins()
+  const agent = makeAgent([human("帮我改\n" + refBare("散步"))], { noInboxEvents: true })
+  sandbox.ccvPinAdd({ path: DOC.filePath, text: "散步", ordinal: 2, dupCount: 2, at: msgTime(0) - 5000 })
+  has("[81] 上报早于消息（正常顺序）→ 照常注入", reg.text({ agent }), "用户要的就是第 2 处")
+}
+{
+  // 用户中途又划了一段新引用（上报更新），界面还没追上 → 立刻改为不注入
+  clearPins()
+  const agent = makeAgent([human("帮我改\n" + refBare("散步"))], { noInboxEvents: true })
+  sandbox.ccvPinAdd({ path: DOC.filePath, text: "散步", ordinal: 1, dupCount: 2, at: msgTime(0) - 5000 })
+  has("[82] 先验一次：正常情况能注入", reg.text({ agent }), "【话布选区】")
+  sandbox.ccvPinAdd({ path: "D:\\proj\\canvas-docs\\别处.md", text: "另一段", ordinal: 1, at: msgTime(0) + 9000 })
+  eq("[83] 之后又上报新引用 → 界面没追上 → 立刻改为不注入", reg.text({ agent }), "")
+}
+{
+  // 一条消息里两次引用同一段原文：两条不许抢同一条上报
+  // （抢了第二条就会顶替第一条的序数 —— 正是"改错地方"那种错）
+  clearPins()
+  pinIt({ code: 9, ordinal: 2, dupCount: 2 })
+  eq("[84a] 只上报了一条", sandbox.ccvPins.length, 1)
+  const out = run([human(refBare("散步") + "\n另外\n" + refBare("散步"))])
+  has("[84] 第一条用掉这条上报", out, "用户要的就是第 2 处")
+  has("[85] 第二条拿不到第二条上报 → 老实说分不出，不许重复认领", out, "分不出用户要哪一处")
+}
+{
+  // 诊断：能从日志里看出"这一步的消息是从哪条通道读到的"
+  clearPins()
+  const m1 = human("帮我改一下\n" + refBare("散步"))
+  const m2 = human("再看这个\n" + refMention("中间一段别的内容", null, null))
+  reg.text({ agent: makeAgent([m1, m2], { surfaceCount: 1 }) })
+  const trace = sandbox.ccvTraceRing.join("\n")
+  has("[86] 日志写明了消息来自哪条通道", trace, "来自「队列」")
+  has("[87] 日志写明了认出/注入了几条", trace, "条引用")
 }
 
 // ═══ 九、与 canvas_locate 说的是同一套位置 ════════════════════
