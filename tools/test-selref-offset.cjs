@@ -142,8 +142,13 @@ const flatOf = sandbox.window.__ccvSelRefFlat
 const findOf = sandbox.window.__ccvSelRefFind
 const squashOf = sandbox.window.__ccvSelRefSquash
 const nodeAtOf = sandbox.window.__ccvSelRefNodeAt
+const detectLen = sandbox.window.__ccvSelRefDetectLen
 if (typeof findOf !== "function" || typeof squashOf !== "function" || typeof nodeAtOf !== "function") {
   console.log("✗ 侧模块没有挂出「AI 改完跳过去」的那几个诊断口（Find / Squash / NodeAt）")
+  process.exit(1)
+}
+if (typeof detectLen !== "function") {
+  console.log("✗ 侧模块没有挂出 __ccvSelRefDetectLen（两套坐标的换算，第二条引用能不能插进去全靠它）")
   process.exit(1)
 }
 if (typeof capture !== "function" || typeof info !== "function" || typeof flatOf !== "function") {
@@ -224,10 +229,16 @@ function makeScope(opts) {
       if (opts.silent) return true           // 说成功但什么事都没发生
       const cur = sandbox.window.__ccvInputState
       if (ev === "slash/input-insert-reference") {
+        // 忠实还原官方 insertReference：把 span 换成一颗胶囊，后面再补一个空格。
+        // ⚠️ 胶囊在 occurrences 里必须带 `length` —— 官方给的是 clipboardLength
+        //   （胶囊在"剪贴板投影"里占几个字）。**少了这个字段就测不出坐标换算的错**，
+        //   这正是 2026-09-15 那个"第二条永远插不进"漏网的原因。
         sandbox.window.__ccvInputState = {
           draft: cur.draft + "@话布优化 > 新一段 ",
           draftRev: (cur.draftRev || 0) + 1,
-          occurrences: (cur.occurrences || []).concat([{ ref: req.reference.ref }])
+          occurrences: (cur.occurrences || []).concat([
+            { ref: req.reference.ref, length: "@话布优化 > 新一段".length }
+          ])
         }
         return true
       }
@@ -731,8 +742,12 @@ async function main() {
     withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
     const r = capture()
     // 现场还原：草稿里已经有一条胶囊了（正是主人点第二条时的状态）
-    const seen = "@话布优化 > 前一段 "
-    sandbox.window.__ccvInputState = { draft: seen, draftRev: 21, occurrences: [{ ref: "1" }] }
+    const seenChip = "@话布优化 > 前一段"
+    const seen = seenChip + " "
+    sandbox.window.__ccvInputState = {
+      draft: seen, draftRev: 21,
+      occurrences: [{ ref: "1", length: seenChip.length }]
+    }
     noSessionScope()                 // 连菜单手柄都不给 → 证明这条新路不需要它
     const scope = makeScope()
     scopeResult.current = scope
@@ -750,7 +765,8 @@ async function main() {
     eq("图标用官方允许的 file", req.reference.appearance, "file")
     eq("退化形态是「@文档 > 原文」", req.reference.clipboardText, "@话布优化 > 写入方基于哪一版")
 
-    eq("span 起点 = 草稿末尾", req.span.start, seen.length)
+    // 🔴 坐标必须是**探测投影**的末尾，不是 draft 长度（draft 里胶囊是展开的）
+    eq("span 起点 = 探测坐标的末尾（不是草稿字符串长度）", req.span.start, 2)
     eq("span 终点 = 起点（零宽）", req.span.end, req.span.start)
     eq("带上**现读**的草稿版本号（官方靠它做比对）", req.span.draftRev, 21)
 
@@ -764,10 +780,11 @@ async function main() {
     withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
     const r = capture()
     const seen = "@话布优化 > 前一段 "
-    const before = { draft: seen, draftRev: 30, occurrences: [{ ref: "1" }] }
+    const seenOcc = [{ ref: "1", length: "@话布优化 > 前一段".length }]
+    const before = { draft: seen, draftRev: 30, occurrences: seenOcc }
 
     // ① 官方拒绝这次改动（版本对不上 / 当前不许改）
-    sandbox.window.__ccvInputState = { draft: seen, draftRev: 30, occurrences: [{ ref: "1" }] }
+    sandbox.window.__ccvInputState = { draft: seen, draftRev: 30, occurrences: seenOcc }
     noSessionScope()
     let scope = makeScope({ refuse: true })
     scopeResult.current = scope
@@ -776,14 +793,14 @@ async function main() {
     eqj("草稿一个字都没被动过", sandbox.window.__ccvInputState, before)
 
     // ② 官方说成功，但胶囊数没变 → 同样不许谎报成功
-    sandbox.window.__ccvInputState = { draft: seen, draftRev: 31, occurrences: [{ ref: "1" }] }
+    sandbox.window.__ccvInputState = { draft: seen, draftRev: 31, occurrences: seenOcc }
     scope = makeScope({ silent: true })
     scopeResult.current = scope
     eq("说了成功但胶囊没多 → false", await auto(r), false)
     eq("草稿仍然没被动过", sandbox.window.__ccvInputState.draft, seen)
 
     // ③ 作用域根本没有 bail（更老的 DSH / 服务没到位）
-    sandbox.window.__ccvInputState = { draft: seen, draftRev: 32, occurrences: [{ ref: "1" }] }
+    sandbox.window.__ccvInputState = { draft: seen, draftRev: 32, occurrences: seenOcc }
     scopeResult.current = { 没有bail: true }
     let threw = false
     let val = null
@@ -800,15 +817,19 @@ async function main() {
 
   console.log("\n【31】最后的兜底：往末尾追加纯文字（同样不碰已有内容）")
   {
-    const seen = "@话布优化 > 前一段 "
-    sandbox.window.__ccvInputState = { draft: seen, draftRev: 40, occurrences: [{ ref: "1" }] }
+    const seenChip = "@话布优化 > 前一段"
+    const seen = seenChip + " "
+    sandbox.window.__ccvInputState = {
+      draft: seen, draftRev: 40,
+      occurrences: [{ ref: "1", length: seenChip.length }]
+    }
     noSessionScope()
     const scope = makeScope()
     scopeResult.current = scope
 
     eq("插进去了", textInsert("> 一段引用\n\n"), true)
     eq("派发的是官方的「插入纯文字」事件", scope.calls[0].ev, "slash/input-insert-text")
-    eq("span 起点 = 草稿末尾", scope.calls[0].req.span.start, seen.length)
+    eq("span 起点 = 探测坐标的末尾（不是草稿字符串长度）", scope.calls[0].req.span.start, 2)
     eq("span 零宽（只追加，不替换）", scope.calls[0].req.span.end, scope.calls[0].req.span.start)
     eq("带上现读的版本号", scope.calls[0].req.span.draftRev, 40)
     eq("原有内容一个字没动", sandbox.window.__ccvInputState.draft.indexOf(seen), 0)
@@ -841,6 +862,68 @@ async function main() {
     ok("整体重写前有「输入框里没有胶囊」的把关", iGuard >= 0)
     ok("顺序必须是：先试事件 → 再过把关 → 最后才整体重写",
       iEvent >= 0 && iGuard > iEvent && iWrite > iGuard)
+  }
+
+  // ═══ 两套坐标的换算 ═══════════════════════════════════════════════
+  // 主人 2026-09-15 的现场线索：「插入第二条失败，但是我手动 @ 可以引用第二条」。
+  // 手动能插 → 编辑器本身没问题；那失败就一定出在"我们给的位置"上。
+  //
+  // 读官方源码找到的两套坐标（dsh-client-ui-conversation）：
+  //   · $composerLayout 里 pushLeaf("chip", kid, "\uFFFC", kid.getTextContent())
+  //     → 同一颗胶囊：探测投影占 **1** 个字，剪贴板投影占 **一整串**字
+  //   · 发布给插件的 InputState.draft 用的是 clipboardText（胶囊**展开**）
+  //   · 而事件里的 span 走 detectText（insertReference 就是拿 detectText 切片的）
+  //
+  // 草稿空着时两套长度相等 → 第一条永远成功；有胶囊就差「串长 − 1」→ 必然失败。
+  // 所以这里要钉住的是一条**公式**，不是某个具体数字。
+  console.log("\n【33】🔴 坐标换算：胶囊在两套投影里长度不同（第二条插不进的真正原因）")
+  {
+    const stOf = (draft, occ) => ({ draft: draft, occurrences: occ })
+    // 一颗胶囊：剪贴板里 11 字，探测里 1 字
+    const chip = "@话布优化 > 前一段"           // 11 字
+    const one = stOf(chip + " ", [{ ref: "1", length: chip.length }])
+    eq("一颗胶囊：剪贴板末尾是 12", one.draft.length, 12)
+    eq("一颗胶囊：探测末尾是 2（胶囊算 1 个字 + 后面那个空格）",
+      detectLen(one.draft, one.occurrences), 2)
+
+    // 两颗胶囊（主人发第二条时就是走到这里）
+    const two = stOf(chip + " " + chip + " ", [
+      { ref: "1", length: chip.length },
+      { ref: "2", length: chip.length }
+    ])
+    eq("两颗胶囊：剪贴板末尾是 24", two.draft.length, 24)
+    eq("两颗胶囊：探测末尾是 4", detectLen(two.draft, two.occurrences), 4)
+
+    // 没有胶囊时**必须与从前的行为一模一样**（否则会把第一条也弄坏）
+    const none = stOf("就是一段普通文字", [])
+    eq("没有胶囊时两套坐标相等", detectLen(none.draft, none.occurrences), none.draft.length)
+    eq("occurrences 整个缺失也不许算错", detectLen(none.draft, undefined), none.draft.length)
+
+    // 只打字不插胶囊：长度守恒
+    const plain = stOf("没有任何胶囊的一串字", [])
+    eq("纯文字：换算前后一致", detectLen(plain.draft, plain.occurrences), plain.draft.length)
+
+    // 🔴 边界：万一 length 比 1 还离谱，也绝不许把位置算成负数
+    const weird = stOf("ab", [{ ref: "1", length: 999 }])
+    eq("length 不合理时夹到 0，不出负数", detectLen(weird.draft, weird.occurrences), 0)
+
+    // 端到端：走一遍真实插入，落在末尾（零宽），且前面一个字没动
+    withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
+    const r2 = capture()
+    // ⚠️ 端到端必须带 draftRev —— 少了它 draftNow() 直接返回 null，
+    //    测出来的是"读不到版本号"，根本走不到坐标那一步（第一版就踩了这个坑）
+    sandbox.window.__ccvInputState = {
+      draft: two.draft, draftRev: 55, occurrences: two.occurrences
+    }
+    noSessionScope()
+    const scope2 = makeScope()
+    scopeResult.current = scope2
+    eq("第二条也插进去了", await auto(r2), true)
+    eq("span 落在探测末尾（4），不是剪贴板末尾（24）",
+      scope2.calls[0].req.span.start, 4)
+    eq("零宽 → 只追加", scope2.calls[0].req.span.end, 4)
+    eq("胶囊从 2 条变成 3 条", sandbox.window.__ccvInputState.occurrences.length, 3)
+    eq("前面两条一个字没动", sandbox.window.__ccvInputState.draft.indexOf(chip + " " + chip + " "), 0)
   }
 
   console.log("\n────────────────────────────────")
