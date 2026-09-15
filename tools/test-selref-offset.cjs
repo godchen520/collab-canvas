@@ -136,6 +136,7 @@ vm.runInContext(src, sandbox, { filename: "lib/selref.js" })
 
 const capture = sandbox.window.__ccvSelRefCapture
 const auto = sandbox.window.__ccvSelRefAuto
+const textInsert = sandbox.window.__ccvSelRefText
 const info = sandbox.window.__ccvSelRefInfo
 const flatOf = sandbox.window.__ccvSelRefFlat
 const findOf = sandbox.window.__ccvSelRefFind
@@ -151,6 +152,10 @@ if (typeof capture !== "function" || typeof info !== "function" || typeof flatOf
 }
 if (typeof auto !== "function") {
   console.log("✗ 侧模块没有挂出 __ccvSelRefAuto")
+  process.exit(1)
+}
+if (typeof textInsert !== "function") {
+  console.log("✗ 侧模块没有挂出 __ccvSelRefText（兜底插纯文字用，主模块靠它避免整体重写）")
   process.exit(1)
 }
 
@@ -202,6 +207,42 @@ function setController(ctl) {
 function noSessionScope() {
   controllerRef.current = null
   scopeResult.current = undefined
+}
+
+// ─── 假会话作用域：记录官方「输入框改动」事件的派发 ───────────────
+// 官方把"插入胶囊 / 插入纯文字"做成会话级事件（带草稿版本校验），
+// 事件处理体就是 shell.insertReference / insertText。
+// 这里把它做出来，好验证"往哪儿插、插什么、失败时有没有乱动草稿"。
+function makeScope(opts) {
+  opts = opts || {}
+  const calls = []
+  const actx = {
+    calls,
+    bail(self, ev, req) {
+      calls.push({ ev, req, self })
+      if (opts.refuse) return false          // 官方拒绝（版本对不上 / 当前不许改）
+      if (opts.silent) return true           // 说成功但什么事都没发生
+      const cur = sandbox.window.__ccvInputState
+      if (ev === "slash/input-insert-reference") {
+        sandbox.window.__ccvInputState = {
+          draft: cur.draft + "@话布优化 > 新一段 ",
+          draftRev: (cur.draftRev || 0) + 1,
+          occurrences: (cur.occurrences || []).concat([{ ref: req.reference.ref }])
+        }
+        return true
+      }
+      if (ev === "slash/input-insert-text") {
+        sandbox.window.__ccvInputState = {
+          draft: cur.draft + req.text,
+          draftRev: (cur.draftRev || 0) + 1,
+          occurrences: cur.occurrences || []
+        }
+        return true
+      }
+      return false
+    }
+  }
+  return actx
 }
 
 // 用主模块的取数桥把假 DOM 喂进去（bridge 的接口是 doc/editor/range）
@@ -674,6 +715,132 @@ async function main() {
     // 正向反向来回一趟必须回到原处（这才是真正要保证的不变量）
     const back = flat.startOf.get(b.node) + b.offset
     eq("换算回下标 = 原下标", back, pOff)
+  }
+
+  // ═══ 第二条引用为什么必须能成功 ═══════════════════════════════════
+  // 主人 2026-09-15 第二次报同一个毛病：「第二条还是会把已经做好的胶囊
+  // 压成一堆普通文字」。上一版给菜单加宽限+重试没打中，因为真正的失败源
+  // 在别处：菜单会被输入状态刷新带关，草稿里已经有东西时尤其容易。
+  // 所以改成**直接派发官方的会话级事件**，不经菜单。
+  //
+  // 这一段要钉住的不是"能不能插进去"，而是**失败时绝不许破坏已有内容** ——
+  // 那才是主人真正的损失（前面的引用全变成普通文字，还没任何提示）。
+
+  console.log("\n【29】🔴 第二条引用：直接派发官方事件，不依赖菜单")
+  {
+    withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
+    const r = capture()
+    // 现场还原：草稿里已经有一条胶囊了（正是主人点第二条时的状态）
+    const seen = "@话布优化 > 前一段 "
+    sandbox.window.__ccvInputState = { draft: seen, draftRev: 21, occurrences: [{ ref: "1" }] }
+    noSessionScope()                 // 连菜单手柄都不给 → 证明这条新路不需要它
+    const scope = makeScope()
+    scopeResult.current = scope
+
+    const okVal = await auto(r)
+    eq("插入成功", okVal, true)
+    eq("只派发了一次事件", scope.calls.length, 1)
+    eq("派发的是官方的「插入胶囊」事件", scope.calls[0].ev, "slash/input-insert-reference")
+    eq("派发主体是会话作用域自己（官方 execute 也是这么传的）", scope.calls[0].self, scope)
+
+    const req = scope.calls[0].req
+    eq("归属本源（发送时靠它找回翻译规则）", req.reference.source, "话布选区")
+    eq("引用值 = 记录编号", req.reference.ref, String(r.code))
+    eq("胶囊文字 = 选中文字前 12 字", req.reference.label, "写入方基于哪一版")
+    eq("图标用官方允许的 file", req.reference.appearance, "file")
+    eq("退化形态是「@文档 > 原文」", req.reference.clipboardText, "@话布优化 > 写入方基于哪一版")
+
+    eq("span 起点 = 草稿末尾", req.span.start, seen.length)
+    eq("span 终点 = 起点（零宽）", req.span.end, req.span.start)
+    eq("带上**现读**的草稿版本号（官方靠它做比对）", req.span.draftRev, 21)
+
+    const after = sandbox.window.__ccvInputState
+    eq("已有胶囊还在（1 → 2）", after.occurrences.length, 2)
+    eq("原来那段草稿一个字没动", after.draft.indexOf(seen), 0)
+  }
+
+  console.log("\n【30】🔴 失败时绝不许破坏已有内容（这才是主人的损失）")
+  {
+    withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
+    const r = capture()
+    const seen = "@话布优化 > 前一段 "
+    const before = { draft: seen, draftRev: 30, occurrences: [{ ref: "1" }] }
+
+    // ① 官方拒绝这次改动（版本对不上 / 当前不许改）
+    sandbox.window.__ccvInputState = { draft: seen, draftRev: 30, occurrences: [{ ref: "1" }] }
+    noSessionScope()
+    let scope = makeScope({ refuse: true })
+    scopeResult.current = scope
+    eq("被拒 → 老老实实返回 false", await auto(r), false)
+    ok("确实尝试过官方事件", scope.calls.length > 0)
+    eqj("草稿一个字都没被动过", sandbox.window.__ccvInputState, before)
+
+    // ② 官方说成功，但胶囊数没变 → 同样不许谎报成功
+    sandbox.window.__ccvInputState = { draft: seen, draftRev: 31, occurrences: [{ ref: "1" }] }
+    scope = makeScope({ silent: true })
+    scopeResult.current = scope
+    eq("说了成功但胶囊没多 → false", await auto(r), false)
+    eq("草稿仍然没被动过", sandbox.window.__ccvInputState.draft, seen)
+
+    // ③ 作用域根本没有 bail（更老的 DSH / 服务没到位）
+    sandbox.window.__ccvInputState = { draft: seen, draftRev: 32, occurrences: [{ ref: "1" }] }
+    scopeResult.current = { 没有bail: true }
+    let threw = false
+    let val = null
+    try { val = await auto(r) } catch (e) { threw = true }
+    eq("作用域没有 bail 时不抛错", threw, false)
+    eq("返回 false", val, false)
+    eq("草稿没被动过", sandbox.window.__ccvInputState.draft, seen)
+
+    // ④ 读不到草稿版本号
+    sandbox.window.__ccvInputState = { draft: seen }
+    scopeResult.current = makeScope()
+    eq("读不到版本号 → false", await auto(r), false)
+  }
+
+  console.log("\n【31】最后的兜底：往末尾追加纯文字（同样不碰已有内容）")
+  {
+    const seen = "@话布优化 > 前一段 "
+    sandbox.window.__ccvInputState = { draft: seen, draftRev: 40, occurrences: [{ ref: "1" }] }
+    noSessionScope()
+    const scope = makeScope()
+    scopeResult.current = scope
+
+    eq("插进去了", textInsert("> 一段引用\n\n"), true)
+    eq("派发的是官方的「插入纯文字」事件", scope.calls[0].ev, "slash/input-insert-text")
+    eq("span 起点 = 草稿末尾", scope.calls[0].req.span.start, seen.length)
+    eq("span 零宽（只追加，不替换）", scope.calls[0].req.span.end, scope.calls[0].req.span.start)
+    eq("带上现读的版本号", scope.calls[0].req.span.draftRev, 40)
+    eq("原有内容一个字没动", sandbox.window.__ccvInputState.draft.indexOf(seen), 0)
+    eq("胶囊还在（没被文字顶掉）", sandbox.window.__ccvInputState.occurrences.length, 1)
+
+    // 拿不到作用域 → 返回 false，交给主模块处置（主模块会拒绝整体重写）
+    noSessionScope()
+    eq("拿不到作用域 → false", textInsert("> 一段引用\n\n"), false)
+    // 读不到草稿 → 同样 false，不许抛错
+    sandbox.window.__ccvInputState = { draft: seen }
+    scopeResult.current = makeScope()
+    eq("读不到草稿 → false", textInsert("> 一段引用\n\n"), false)
+  }
+
+  // 主模块那半没法在这里跑（要 React），但它有一条**结构**规矩必须钉住：
+  // 整体重写草稿 = 把已有胶囊拍平。所以它必须被"没有胶囊"挡住。
+  // 这里读源码做结构守卫 —— 以后谁把顺序改回去，这条会立刻红。
+  console.log("\n【32】🔴 结构守卫：主模块的整体重写必须被「没有胶囊」挡住")
+  {
+    const client = fs.readFileSync(path.join(__dirname, "..", "lib", "client.js"), "utf8")
+    const iFn = client.indexOf("function insertQuoteBlock")
+    ok("找得到 insertQuoteBlock", iFn >= 0)
+    const iNext = client.indexOf("function runCanvasCmd", iFn)
+    const body = (iFn >= 0 && iNext > iFn) ? client.slice(iFn, iNext) : ""
+    ok("取到了它的函数体", body.length > 200)
+    const iEvent = body.indexOf("__ccvSelRefText")
+    const iGuard = body.indexOf("ccvInputChipCount() > 0")
+    const iWrite = body.indexOf("setDraft(newDraft)")
+    ok("兜底先试官方的「追加纯文字」事件", iEvent >= 0)
+    ok("整体重写前有「输入框里没有胶囊」的把关", iGuard >= 0)
+    ok("顺序必须是：先试事件 → 再过把关 → 最后才整体重写",
+      iEvent >= 0 && iGuard > iEvent && iWrite > iGuard)
   }
 
   console.log("\n────────────────────────────────")
