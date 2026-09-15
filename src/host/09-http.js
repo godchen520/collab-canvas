@@ -127,6 +127,21 @@ function initCanvasHttpEndpoints(ctx, webServer) {
     const out = aiChanges.filter((x) => x.seq > since)
     json(res, { ok: true, latest: aiChangeSeq, changes: out })
   }}))
+  // POST /api/canvas/selref/pin —— 客户端报「你刚才划的是第几处」
+  // 为什么需要：引用正文里**已经不写坐标了**（2026-09-15 主人要求对话里那张
+  // 卡片只留文件名），而"第几处"靠的是**划选那一刻的 DOM 位置** —— 只有浏览器
+  // 那边知道，服务端自己无论如何算不出。所以单独送一份过来，
+  // 供 host 侧的「位置主动注入」（13-selref-context.js）使用。
+  // 只存内存、不落盘：它是**当下的**输入，重启后就该丢。
+  // 实现在 13-selref-context.js（那边有 [[CCV-SELCTX]] 标记，测试切得出来）。
+  ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/selref/pin', handler: async (req, res) => {
+    try {
+      if (req.method !== 'POST') { error(res, 405, { ok: false, error: '只收 POST' }); return }
+      const body = await readBody(req)
+      const taken = ccvPinAdd(body)
+      json(res, { ok: taken, n: ccvPins.length })
+    } catch (e) { error(res, 400, { ok: false, error: e.message }) }
+  }}))
   // POST /api/canvas/write
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/write', handler: async (req, res) => {
     try {

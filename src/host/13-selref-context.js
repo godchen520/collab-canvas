@@ -76,13 +76,79 @@ function ccvLastHumanText(agent) {
   return ''
 }
 
+// ── 一·五、客户端报上来的「你划的是第几处」──────────────────────
+// 为什么服务端自己算不出：序数靠的是**划选那一刻的 DOM 位置**，
+// 只有浏览器那边知道 —— 服务端只知道原文长什么样，不知道你指的是哪一处。
+//
+// 🔴 而引用正文里现在**也不写坐标了**（2026-09-15 主人要求卡片只留文件名），
+//   所以这条上报通道成了"第几处"的**唯一来源**。它和 lib/selref.js 里的
+//   pinUp() 是一对，**必须一起改**：只改一边，模型就彻底不知道用户指哪儿了。
+//
+// 上报时机是 capture()（用户点「问AI」/划选那一刻），比发送早得多，
+// 所以这里不会出现"消息先到、记录后到"的竞态。
+var CCV_PINS_MAX = 8      // 只留最近几条，覆盖式；不清理也不会涨
+var ccvPins = []
+// 每收一条上报就 +1。**专供下面那份 memo 失效用**，见 ccvBuildSelContext。
+// 没有它会出一个很难发现又很致命的错：用户前后两次引用同一段原文
+// （这段文字在文档里出现多处），两次的引用正文**一字不差**，
+// memo 会把第二次挡掉、继续用第一次的序数 → 模型改错地方。
+var ccvPinSeq = 0
+
+function ccvPinAdd(p) {
+  try {
+    if (!p || typeof p !== 'object') return false
+    var text = String(p.text || '')
+    if (!text) return false
+    ccvPins.push({
+      code: p.code,
+      path: ccvNormPathForRef(p.path),
+      title: String(p.title || ''),
+      text: text,
+      ordinal: typeof p.ordinal === 'number' ? p.ordinal : 0,
+      dupCount: typeof p.dupCount === 'number' ? p.dupCount : 0,
+      line: typeof p.line === 'number' ? p.line : -1,
+      heading: String(p.heading || ''),
+      at: Date.now(),
+    })
+    if (ccvPins.length > CCV_PINS_MAX) ccvPins = ccvPins.slice(ccvPins.length - CCV_PINS_MAX)
+    ccvPinSeq++
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+// 找出这条引用对应的上报记录。取**最新**的一条 —— 用户的操作顺序天然是
+// 「先划选、再发送」，所以最新那条就是这次的。
+// ⚠️ 已知边界：同一段原文连着划两次、却只发出第一条引用时，会取到后一条的序数。
+//   罕见，且注入文案里保留了每处的上下文供核对，不会静默改错。
+function ccvPinFind(path, quote) {
+  var want = ccvNormPathForRef(path)
+  var q = String(quote || '')
+  if (!q) return null
+  for (var i = ccvPins.length - 1; i >= 0; i--) {
+    var p = ccvPins[i]
+    // 精确相等最好；但解析出来的原文在"原文本身含「」"时会被截短，
+    // 所以也接受"它是上报原文的前缀"（截短只会往前截，不会变形）。
+    if (p.text !== q && p.text.indexOf(q) !== 0) continue
+    if (want && p.path && p.path !== want) continue
+    return p
+  }
+  return null
+}
+
 // ── 二、从消息正文里认出「话布选区引用」──────────────────────────
 // 引用正文的形状由 lib/selref.js 的 codec.serialize 生成，**只有两行**：
-//   @"D:\...\canvas-docs\话布优化.md" > 小标题 · 第 8 行 · 多处（第 2 处）
+//   @"D:\...\canvas-docs\话布优化.md"
 //   「原文」
 // 拿不到真实路径时第 1 行退化成：
-//   【话布选区】文档名 · 小标题 · 第 8 行
+//   【话布选区】文档名
 //   「原文」
+//
+// 🔴 2026-09-15 起标签**整串没有了**（主人要求对话里那张卡片只留文件名）。
+//   于是"第几处"改从上报记录拿（ccvPinFind）。但抬头仍然要认、也仍然要
+//   **兼容带标签的老形态** —— 浏览器缓存里的旧客户端、以及用户手打的引用，
+//   都可能还带着「> 小标题 · 第 21 行 · 多处（第 2 处）」。
 //
 // 只有上面这两种抬头才认。**用户自己在正文里写**
 //   他说：
@@ -278,18 +344,24 @@ function ccvDescribeRef(ref) {
   }
 
   // 多处：把目标那一处标出来，其余只报行号（够模型核对，又不啰嗦）
+  //
+  // 序数从哪来：**客户端刚报上来的**优先（引用正文里已经不写了）；
+  // 拿不到才退回看抬头标签（兼容没更新的客户端 / 用户手打的引用）。
+  // 两个都没有 → 绝不替模型挑一处，让它把每处摆给用户确认。
+  var pin = ccvPinFind(ref.path, quote)
+  var ordinal = (pin && pin.ordinal > 0) ? pin.ordinal : ref.ordinal
+
   var head = '· 《' + c.title + '》「' + ccvShortQuote(quote, CCV_SEL_QUOTE_MAX)
     + '」全文共 ' + idxs.length + ' 处'
-  if (ref.ordinal > 0 && ref.ordinal <= idxs.length) {
-    head += '，**用户要的是第 ' + ref.ordinal + ' 处**（引用标签里写的就是「第 '
-      + ref.ordinal + ' 处」）'
+  if (ordinal > 0 && ordinal <= idxs.length) {
+    head += '，**用户要的就是第 ' + ordinal + ' 处**（他划中的是这一处）'
   } else {
     head += '，仅凭行号分不出来'
   }
   head += '：'
 
   var lines = [head]
-  var target = ref.ordinal > 0 && ref.ordinal <= idxs.length ? ref.ordinal - 1 : -1
+  var target = ordinal > 0 && ordinal <= idxs.length ? ordinal - 1 : -1
   for (var k = 0; k < shown.length; k++) {
     var lc = lineColOf(content, shown[k])
     var isTarget = k === target
@@ -314,6 +386,9 @@ function ccvDescribeRef(ref) {
 //   · 全程 try/catch，任何异常都退化成一件事：不注入。
 //     （provider 抛错会毁掉整个 prompt 组装 —— 那比不注入严重得多。）
 //   · 结果按正文做一次 memo：同一轮里正文没变就直接复用。
+//     ⚠️ 键里**必须**带上上报计数和记录条数（见下），不能只看正文 ——
+//     同一段原文出现多处时，用户前后两次引用拼出来的正文可以一字不差，
+//     只按正文做键就会把第二次挡掉，让模型拿着第一次的序数去改。
 var ccvSelCtxMemo = { key: null, val: '' }
 
 function ccvBuildSelContext(context) {
@@ -321,7 +396,8 @@ function ccvBuildSelContext(context) {
     var agent = context && context.agent
     var text = ccvLastHumanText(agent)
     if (!text) { ccvSelCtxMemo = { key: null, val: '' }; return '' }
-    if (ccvSelCtxMemo.key === text) return ccvSelCtxMemo.val
+    var memoKey = text + '#' + ccvPinSeq + '#' + ccvPins.length
+    if (ccvSelCtxMemo.key === memoKey) return ccvSelCtxMemo.val
 
     var refs = ccvParseRefs(text)
     var blocks = []
@@ -335,7 +411,7 @@ function ccvBuildSelContext(context) {
         + '按下面的位置改就行，不必再问：\n' + blocks.join('\n')
       if (out.length > CCV_SEL_TOTAL_MAX) out = out.slice(0, CCV_SEL_TOTAL_MAX) + '\n（内容过长，已截断）'
     }
-    ccvSelCtxMemo = { key: text, val: out }
+    ccvSelCtxMemo = { key: memoKey, val: out }
     return out
   } catch (e) {
     try { console.error('[collab-canvas] sel-context failed:', e && e.message) } catch (_) {}

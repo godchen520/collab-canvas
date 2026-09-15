@@ -27,6 +27,8 @@ function eq(name, got, want) {
   console.log("  ✗ " + name + "\n      期望: " + JSON.stringify(want) + "\n      实得: " + JSON.stringify(got))
 }
 function ok(name, cond) { eq(name, !!cond, true) }
+// eq 是严格 === 比较，数组永远不相等 —— 要比较一串值时用这个
+function eqj(name, got, want) { eq(name, JSON.stringify(got), JSON.stringify(want)) }
 
 // ─── 极简假 DOM ───────────────────────────────────────────────
 // 只实现 selref 真正用到的那几样：nodeType / data / tagName /
@@ -119,7 +121,16 @@ sandbox.window.__ccvCtx = {
     sessionOf: function () { return controllerRef.current }
   }
 }
-sandbox.window.fetch = () => Promise.resolve({ ok: true })
+// 网络层：selref.js 里用的是**裸 fetch**（浏览器里它是全局的）。沙箱里必须显式给一个，
+// 否则 log 与「序数上报」都会抛 —— 而它们各自带 try/catch 把异常吞掉，
+// 表现成"什么都没发生"。这类静默失效正是测试最容易漏掉的。
+sandbox.__net = []
+function fakeFetch(url, opt) {
+  sandbox.__net.push({ url: String(url), opt: opt || null })
+  return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true }) })
+}
+sandbox.fetch = fakeFetch
+sandbox.window.fetch = fakeFetch
 vm.createContext(sandbox)
 vm.runInContext(src, sandbox, { filename: "lib/selref.js" })
 
@@ -274,32 +285,38 @@ async function main() {
   eq("排序在官方之后", captured.order, 50)
   eq("显示分组标题", captured.showGroupTitle, true)
 
-  console.log("\n【8】翻译规则 · 正常路径（要求短、且 @ 打头）")
+  console.log("\n【8】翻译规则 · 正常路径（只有两行：@路径 + 原文）")
   withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
   rec = capture()
   const text = await captured.codec.serialize(String(rec.code))
   const textLines = text.split("\n")
   // @ 必须打头 —— 官方要靠它把这一行折成一张文件卡片（主人实测的线索）
-  eq("首行 = @路径 +「> 小标题 · 行号」", textLines[0], '@"/x/话布优化.md" > 第一节 总览 · 第 2 行')
+  eq("首行 = @路径（不带标签）", textLines[0], '@"/x/话布优化.md"')
   eq("第二行 = 原文", textLines[1], "「写入方基于哪一版」")
   eq("总共只有 2 行", textLines.length, 2)
   ok("首字符就是 @", text.charAt(0) === "@")
   ok("不塞前后文指纹（实测它会把表格摊成一串噪音）", text.indexOf("上下文核对") < 0)
   ok("不塞字符偏移 / 字数这类对模型没用的东西", text.indexOf("字起") < 0 && text.indexOf("文中第") < 0)
 
-  console.log("\n【8b】小标题与文档名同名时，只写一次")
-  // 实测出现过「话布优化 · 话布优化」—— 文档的 h1 就叫这个名字。
-  withBridge({ title: "第一节 总览" }, root, fakeRange(tP1, 0, "写入方基于哪一版"))
-  const recSame = capture()
-  const textSame = await captured.codec.serialize(String(recSame.code))
-  eq("同名不重复", textSame.split("\n")[0], '@"/x/话布优化.md" > 第 2 行')
+  console.log("\n【8b】🔴 主人要求：卡片上那一串坐标一个都不许有（2026-09-15）")
+  // 原话：「这还是有很长一段话啊，可以不可以【二、到底发生了什么 · 第 21 行 ·
+  //        多处（第 2 处）】这些都不要，都不显示」
+  // 所以这四样必须彻底消失：小标题、行号、「多处」、「第 N 处」。
+  ok("首行没有「> 说明」那一段", textLines[0].indexOf(">") < 0)
+  ok("没有小标题", text.indexOf("第一节 总览") < 0)
+  ok("没有行号", text.indexOf("行") < 0)
+  ok("没有「多处」", text.indexOf("多处") < 0)
+  ok("没有「第 N 处」", !/第\s*\d+\s*处/.test(text))
+  ok("整条引用很短（只剩路径 + 原文）", text.length < 60)
 
-  console.log("\n【8c】拿不到真实路径时，退回纯文字标签（不丢信息）")
+  console.log("\n【8c】拿不到真实路径时，退回纯文字抬头（同样不带标签）")
   withBridge({ mention: "" }, root, fakeRange(tP1, 0, "写入方基于哪一版"))
   const recNoPath = capture()
   const textNoPath = await captured.codec.serialize(String(recNoPath.code))
-  eq("没有路径 → 退回「【话布选区】文档名 · 小标题 · 行号」",
-    textNoPath.split("\n")[0], "【话布选区】话布优化 · 第一节 总览 · 第 2 行")
+  eq("没有路径 → 退回「【话布选区】文档名」",
+    textNoPath.split("\n")[0], "【话布选区】话布优化")
+  ok("同样不塞小标题 / 行号",
+    textNoPath.indexOf("第一节 总览") < 0 && textNoPath.indexOf("第 2 行") < 0)
 
   console.log("\n【9】翻译规则 · 兜底路径（不许抛错）")
   const orphan = await captured.codec.serialize("99999")
@@ -440,32 +457,38 @@ async function main() {
 
   const dTextA = await captured.codec.serialize(String(rec.code))
   const dLinesA = dTextA.split("\n")
-  eq("第一行 = 路径 + 标签（歧义与序数都在标签里）",
-    dLinesA[0], '@"/x/话布优化.md" > 第 1 行 · 多处（第 1 处）')
+  eq("第一行 = @路径（坐标一个都不写）", dLinesA[0], '@"/x/话布优化.md"')
   eq("第二行 = 原文", dLinesA[1], "「" + DUP + "」")
-  eq("**永远只有两行** —— 定位不再塞进正文", dLinesA.length, 2)
+  eq("**永远只有两行** —— 定位完全不进正文", dLinesA.length, 2)
   ok("正文里不再出现定位坐标", dTextA.indexOf("定位：") < 0)
   ok("正文里也不再出现方括号", dTextA.indexOf("【") < 0)
+  ok("更没有「多处」（主人明确不要这串字）", dTextA.indexOf("多处") < 0)
+  ok("也没有行号", dTextA.indexOf("行") < 0)
+  const ordA = rec.ordinal    // 【17】要拿它跟第二处对比
 
-  console.log("\n【17】选第二处 → 序数跟着变（这才是「分得开」的关键）")
+  console.log("\n【17】选第二处 → 序数跟着变（正文不体现，改走上报通道）")
   withBridge(null, dupEditor, fakeRange(d2, 2, DUP))
   rec = capture()
   eq("同一段原文的第二次出现", rec.ordinal, 2)
   eq("行号变成第 2 行", rec.line, 2)
   eq("总次数不变", rec.dupCount, 2)
   const dTextB = await captured.codec.serialize(String(rec.code))
-  ok("两次引用**必须不一样**（否则 AI 无从分辨是哪一处）", dTextB !== dTextA)
-  eq("第二处的标签", dTextB.split("\n")[0], '@"/x/话布优化.md" > 第 2 行 · 多处（第 2 处）')
+  // 🔴 2026-09-15 起，两次引用的**正文完全一样** —— 坐标不再写进正文了。
+  //    区分"是哪一处"的责任转交给 capture 时上报的那份记录。
+  //    所以这里要断言的是**记录里的序数不同**，而不是正文不同。
+  eq("两次正文本来就一样了（坐标不进正文）", dTextB, dTextA)
+  eqj("区别落在上报的序数上", [ordA, rec.ordinal], [1, 2])
+  eq("第二处也是干净的文件引用", dTextB.split("\n")[0], '@"/x/话布优化.md"')
 
-  console.log("\n【18】原文唯一 → 连「多处」都不标（日常情况一个字都不多）")
+  console.log("\n【18】原文唯一 → 正文里同样一个坐标都不带")
   withBridge(null, dupEditor, fakeRange(d1, 0, "甲乙"))
   rec = capture()
   eq("原文唯一", rec.dupCount, 1)
   eq("唯一时不算序数（没有意义）", rec.ordinal, 0)
   const uText = await captured.codec.serialize(String(rec.code))
   eq("仍是两行", uText.split("\n").length, 2)
-  ok("不标「多处」", uText.indexOf("多处") < 0)
-  eq("第一行就是干净的标签", uText.split("\n")[0], '@"/x/话布优化.md" > 第 1 行')
+  ok("正文里没有「多处」", uText.indexOf("多处") < 0)
+  eq("第一行就是干净的文件引用", uText.split("\n")[0], '@"/x/话布优化.md"')
 
   console.log("\n【19】重复次数与序数都要数得准（允许重叠）")
   // 独立实现算一遍做交叉验证 —— 这两个数决定引用标签怎么写
@@ -491,16 +514,16 @@ async function main() {
   console.log("\n【21】主人举的反例：一句话里同一个名字出现两次")
   // 主人 09-14 追问：「我觉得你这个方法不行，如果一句话是【小明在笑，小明在闹】
   // 我选第一个小明，又要怎么办呢」
-  // 客户端的责任是**如实把歧义和序数写进引用**；
-  // 「每一处长什么样」由 host 侧的 canvas_locate 回答（见 tools/test-host-locate.cjs）。
-  // 两个数合起来就把位置说清了，而且引用保持两行。
+  // 客户端的责任是**如实记下歧义和序数，并把它报给服务端**；
+  // 「每一处长什么样」由 host 侧回答（见 tools/test-host-locate.cjs 与 test-host-selctx.cjs）。
+  // 两个数合起来就把位置说清了，而引用正文保持干净。
   const SENT = "小明在笑，小明在闹"
   const sNode = new T(SENT)
   const sentEditor = new E("DIV", [new E("DIV", [sNode])])
 
   withBridge(null, sentEditor, fakeRange(sNode, 0, "小明"))
   rec = capture()
-  eq("两个小明 → 必须标出来", rec.dupCount, 2)
+  eq("两个小明 → 记下来了", rec.dupCount, 2)
   eq("选第一个 → 第 1 处", rec.ordinal, 1)
   const t1 = await captured.codec.serialize(String(rec.code))
 
@@ -509,12 +532,40 @@ async function main() {
   eq("选第二个 → 第 2 处", rec2.ordinal, 2)
   const t2 = await captured.codec.serialize(String(rec2.code))
 
-  ok("两次都标了「多处」", t1.indexOf("多处") >= 0 && t2.indexOf("多处") >= 0)
-  ok("而且两次**不一样**（AI 据此就能分辨，不必再猜）", t1 !== t2)
-  eq("第一个小明的引用", t1.split("\n")[0], '@"/x/话布优化.md" > 第 1 行 · 多处（第 1 处）')
-  eq("第二个小明的引用", t2.split("\n")[0], '@"/x/话布优化.md" > 第 1 行 · 多处（第 2 处）')
-  ok("两次的行号相同（所以只靠行号分不开，靠的是序数）",
-    t1.split(" · 多处")[0] === t2.split(" · 多处")[0])
+  ok("正文里两个都不带坐标（主人不要那些字）", t1.indexOf("多处") < 0 && t2.indexOf("多处") < 0)
+  eq("两次正文一样 —— 分辨靠的是上报的序数", t1, t2)
+  eq("第一个小明的引用", t1.split("\n")[0], '@"/x/话布优化.md"')
+  ok("而两次上报的序数确实不同（服务端据此就能分辨）", rec.ordinal !== rec2.ordinal)
+
+  console.log("\n【21b】🔴 序数上报：正文里不写坐标之后，「第几处」只能靠它")
+  // 这条通道是 2026-09-15 加的：主人要求对话卡片只留文件名 → 标签整串去掉
+  // → 服务端再也读不到坐标。而"第几处"只有划选那一刻在浏览器里才算得出，
+  // 所以必须单独报一份。**它和 host 侧的注入是一对，只改一边这功能就是死的。**
+  {
+    sandbox.__net.length = 0
+    withBridge(null, sentEditor, fakeRange(sNode, 5, "小明"))
+    const r3 = capture()
+    const hit = sandbox.__net.filter((x) => x.url === "/api/canvas/selref/pin")
+    eq("capture 时确实发出了上报", hit.length, 1)
+    const body = hit.length ? JSON.parse(hit[0].opt.body) : {}
+    eq("用 POST", hit.length ? hit[0].opt.method : null, "POST")
+    eq("报的是原文", body.text, "小明")
+    eq("报上了序数（选的是第二个 → 2）", body.ordinal, 2)
+    eq("也报了总次数（服务端据此判断是否有多处）", body.dupCount, 2)
+    eq("报的是裸路径（不带 @ 和引号）", body.path, "/x/话布优化.md")
+    eq("行号也一并带上", body.line, 1)
+    ok("上报失败也不影响 capture（它只是补充通道）", !!r3)
+  }
+  {
+    // 原文唯一时也要报 —— 服务端靠"没有序数"来区分"只有一处"
+    sandbox.__net.length = 0
+    withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
+    capture()
+    const hit = sandbox.__net.filter((x) => x.url === "/api/canvas/selref/pin")
+    const body = hit.length ? JSON.parse(hit[0].opt.body) : {}
+    eq("唯一一处 → 序数报 0（不编数字）", body.ordinal, 0)
+    eq("总次数报 1", body.dupCount, 1)
+  }
 
   console.log("\n【22】归一化：两边（源码 vs 渲染后）靠它才能对上")
   // 服务端给的是 **Markdown 源码**里的文字，客户端手里是**渲染之后**的文字。

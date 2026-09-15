@@ -157,6 +157,12 @@ function refMention(quote, label, p) {
 function refPlain(quote, label, title) {
   return "【话布选区】" + (title || DOC.title) + (label ? " · " + label : "") + "\n「" + quote + "」"
 }
+// 2026-09-15 起正文里**没有标签**了（对话卡片只留文件名）—— 这是新的常态
+function refBare(quote, p) {
+  return '@"' + (p || DOC.filePath) + '"\n「' + quote + '」'
+}
+function clearPins() { sandbox.ccvPins.length = 0 }
+function pinIt(o) { return sandbox.ccvPinAdd(Object.assign({ path: DOC.filePath, text: "散步" }, o)) }
 
 // ═══ 一、引用识别：认什么、不认什么 ═══════════════════════════
 console.log("\n[1] 引用识别（认错 = 凭空定位一段没被引用的文字）")
@@ -227,7 +233,7 @@ setDocs([DOC])
 {
   const out = run([human(refMention("散步", "第 9 行 · 多处（第 2 处）", null))])
   has("[21] 多处 → 标出用户要的那一处", out, "★")
-  has("[22] 说清是第几处", out, "用户要的是第 2 处")
+  has("[22] 说清是第几处", out, "用户要的就是第 2 处")
   has("[23] 结论指向 ★ 那一处", out, "照上面标 ★ 的那一处改")
   has("[24] 提醒别碰其他处", out, "不要碰")
 }
@@ -352,6 +358,86 @@ ok("[47] order 是有限数（官方要求）", Number.isFinite(reg.order))
   try { out = reg.text({ agent: boom }) } catch (e) { threw = true }
   eq("[49] 内部抛错时不往外抛", threw, false)
   eq("[50] 内部抛错时返回空（= 不注入）", out, "")
+}
+
+// ═══ 七·五、序数：正文里不写坐标之后，靠什么知道是哪一处 ═════════
+// 2026-09-15 主人要求对话里那张卡片只留文件名 → 标签整串去掉了。
+// 而"第几处"是服务端**自己算不出**的（要划选那一刻的 DOM 位置），
+// 所以改由客户端单独上报。这组用例就是钉住这条通道。
+console.log("\n[7b] 序数改走上报通道")
+setDocs([DOC])
+{
+  clearPins()
+  // 没上报 → 只能说"分不出"。**绝不替模型挑一处** —— 挑错就是改错地方。
+  const out = run([human(refBare("散步"))])
+  has("[57] 正文没标签 + 没上报 → 不替模型挑", out, "分不出用户要哪一处")
+  hasNot("[58] 更不能瞎标一个 ★", out, "★")
+}
+{
+  clearPins()
+  pinIt({ code: 1, ordinal: 2, dupCount: 2 })
+  const out = run([human("把这个改一下\n" + refBare("散步"))])
+  has("[59] 有上报 → 注入仍能说出「第 2 处」", out, "用户要的就是第 2 处")
+  has("[60] 并标出 ★", out, "★")
+  has("[61] 结论仍指向 ★ 那一处", out, "照上面标 ★ 的那一处改")
+}
+{
+  clearPins()
+  pinIt({ code: 2, ordinal: 0, dupCount: 2 })   // 客户端没算出序数（选在匹配中间）
+  const out = run([human(refBare("散步"))])
+  has("[62] 上报里序数为 0 → 退回「分不出」", out, "分不出用户要哪一处")
+}
+{
+  clearPins()
+  pinIt({ code: 3, ordinal: 2, path: "D:\\proj\\canvas-docs\\别的.md" })
+  const out = run([human(refBare("散步"))])
+  has("[63] 上报记的是别的文档 → 不误用", out, "分不出用户要哪一处")
+}
+{
+  clearPins()
+  pinIt({ code: 4, ordinal: 1 })
+  pinIt({ code: 5, ordinal: 2 })
+  eq("[64a] 两条都存进去了", sandbox.ccvPins.length, 2)
+  eq("[64b] 存进去的序数分别是 1 和 2", [sandbox.ccvPins[0].ordinal, sandbox.ccvPins[1].ordinal], [1, 2])
+  const out = run([human(refBare("散步"))])
+  has("[64] 两条都在时取最新那条（用户是「先划、后发」）", out, "用户要的就是第 2 处")
+  // 🔴 [71]/[72] 钉的是 [64] 暴露出来的**真缺陷**，不是测试写法问题：
+  //    同一段原文出现多处时，用户前后两次引用拼出来的正文可以**一字不差**，
+  //    memo 只按正文做键就会把第二次挡掉 → 模型拿第一次的序数去改，改错地方。
+  //    这两条故意用和 [57] 完全相同的正文，只换上报。
+  clearPins()
+  pinIt({ code: 6, ordinal: 1 })
+  has("[71] 正文一字不差、只换了上报 → 结果必须跟着变（memo 不能挡住）", run([human(refBare("散步"))]), "用户要的就是第 1 处")
+  clearPins()
+  pinIt({ code: 7, ordinal: 2 })
+  has("[72] 再报一次第 2 处 → 又跟着变", run([human(refBare("散步"))]), "用户要的就是第 2 处")
+}
+{
+  clearPins()
+  // 兼容路径：老客户端（浏览器缓存）／用户手打的引用，标签还在，照样认
+  const out = run([human(refMention("散步", "第 9 行 · 多处（第 2 处）", null))])
+  has("[65] 没有上报时，退回认标签里的序数", out, "用户要的就是第 2 处")
+}
+{
+  clearPins()
+  // 原文本身含「」→ 解析出来会被截短，但它是上报原文的前缀，仍要配得上
+  const doc2 = {
+    id: "c5", title: "带引号", filePath: "D:\\proj\\canvas-docs\\带引号.md", version: 1,
+    content: "他常说「早睡早起」这句话，后来自己也做到了。\n\n再说一次：他常说「早睡早起」这句话。",
+  }
+  setDocs([doc2])
+  sandbox.ccvPinAdd({ path: doc2.filePath, text: "他常说「早睡早起」这句话", ordinal: 2, dupCount: 2 })
+  const out = run([human('@"D:\\proj\\canvas-docs\\带引号.md"\n「他常说「早睡早起」这句话」')])
+  has("[66] 原文被截短时仍能配上报记录", out, "用户要的就是第 2 处")
+  setDocs([DOC])
+}
+{
+  // 通道两端都必须在，缺一边这功能就是死的
+  has("[67] host 注册了接收端点", hostSrc, "/api/canvas/selref/pin")
+  has("[68] 端点把数据交给 pin 存储", hostSrc, "ccvPinAdd(body)")
+  const clientSrc = fs.readFileSync(path.join(__dirname, "..", "lib", "selref.js"), "utf8")
+  has("[69] 客户端会往这个端点上报", clientSrc, '"/api/canvas/selref/pin"')
+  has("[70] 上报在 capture 时（不是发送时，避开竞态）", clientSrc, "pinUp(rec)")
 }
 
 // ═══ 八、长度上限 ═════════════════════════════════════════════
