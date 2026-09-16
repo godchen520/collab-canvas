@@ -29,7 +29,7 @@
 - **Host 半边**：`dist/host.js`（由 `tools/build.cjs` 从 `src/host/*.js` 按文件名拼出）
 - **Client 半边**：`lib/client.js` —— 独立的 `__ModuleLoader__.load` 模块，
   源文件是 `src/client/editor-panel.js`；由 package.json 的 `dsh.client` 声明加载
-  ⚠️ **它不走 build.cjs，必须手工同步**（见下一节）
+  ⚠️ **它不走 build.cjs**（该脚本只构建 host），由 `tools/deploy.cjs` 自动同步（见下一节）
 - 另有 `lib/selref.js`、`lib/docdrop.js`、`lib/doclink.js`：host **按请求实时读盘**供出去的
   独立客户端模块 —— 改完**刷新页面即生效**，不用重启
 - 已注册 **9 个** AI 工具（经 `ctx.tools.register`，全在 `src/host/07-tools.js`）：
@@ -44,36 +44,56 @@
 
 ---
 
-## 零点五、日常三条命令（先看这个）
+## 零点五、日常四条命令（先看这个）
 
 ```bash
 node tools/test-all.cjs     # 跑全部回归测试（自动收 tools/test-*.cjs，勿手打多条）
 node tools/build.cjs        # 重新构建 dist/host.js（只构建 host！）
+node tools/deploy.cjs       # 一键搬运到部署副本（含同步客户端 + 构建过期检查）
 node tools/verify-all.cjs   # 上线前总检：真跑测试 + 工作区↔部署一致性 + 历史守卫
 ```
 
-有 npm 的正常终端里也可以：`npm test` / `npm run build` / `npm run verify`。
-（`npm` 在某些受限 shell 里起不来，所以**以直接跑 node 的那三条命令为准**。）
+只改了客户端或侧模块时，中间那条 `build.cjs` 可以跳过（客户端不走构建）；
+**改了 `src/host/*.js` 就必须先 `build.cjs` 再 `deploy.cjs`**，顺序别倒。
+
+有 npm 的正常终端里也可以：`npm test` / `npm run build` / `npm run deploy` / `npm run verify`。
+（`npm` 在某些受限 shell 里起不来，所以**以直接跑 node 的那四条命令为准**。）
 
 ### 🔴 改动生效方式（分三种，别混）
 
 | 改了什么 | 怎么才能生效 |
 | --- | --- |
-| `src/host/*.js` → `dist/host.js` | 重新构建 + 拷部署副本 + **完全重启 dsh web** |
-| `src/client/editor-panel.js` → `lib/client.js` | 拷到 `lib/client.js` + 拷部署副本 + **刷新页面** |
-| `lib/selref.js` 等侧模块 | 拷部署副本 + **刷新页面**（host 按请求读盘） |
+| `src/host/*.js` → `dist/host.js` | `build.cjs` + `deploy.cjs` + **完全重启 dsh web** |
+| `src/client/editor-panel.js` → `lib/client.js` | `deploy.cjs`（会自动同步这步）+ **刷新页面** |
+| `lib/selref.js` 等侧模块 | `deploy.cjs` + **刷新页面**（host 按请求读盘） |
 
-### 🔴 手工同步清单（build.cjs 不覆盖客户端）
+### 🔴 同步清单（已由 deploy.cjs 代劳）
 
-改完源码后要保证这 6 份在**工作区与部署副本**两边一致：
+改完源码后要保证这 **7 份**在**工作区与部署副本**两边一致：
 
 ```
 dist/host.js   lib/client.js   lib/selref.js
 lib/doclink.js lib/docdrop.js  package.json  cordis.patch.yml
 ```
 
-`node tools/verify-all.cjs` 的第 3 节会把它们逐个比一遍并指出哪份不一致。
-> 待办：目前还没有"一键搬运"脚本，这一节靠手工 + 总检兜底。
+`node tools/verify-all.cjs` 的第 3 节会把它们逐个比一遍并指出哪份不一致；
+要动手搬运则用下面这条（不用再挨个拷）。
+
+~~~bash
+node tools/deploy.cjs           # 一键搬运：本仓库 → 部署副本（npm run deploy）
+node tools/deploy.cjs --check   # 只看差哪几份，一个字节都不动
+~~~
+
+它顺带把两件最容易做错的事一起做了：
+
+1. **先同步客户端** —— `src/client/editor-panel.js` → `lib/client.js`
+   （这两份确认过是纯拷贝、内容完全相同，所以脚本可以代劳；
+   以前那步"必须手工"是因为 `build.cjs` 不管客户端这一半）。
+2. **先查构建是否过期** —— `dist/host.js` 比 `src/host/*.js` 旧就直接拒绝搬运
+   并提示先跑 `build.cjs`，防止把旧的服务端推上去。
+
+搬完还会把 7 份**读回来再逐个校验**，不给"搬了但没生效"留缝。
+搬运是纯拷贝、可反复跑，两边已一致时会全部跳过。
 
 ---
 

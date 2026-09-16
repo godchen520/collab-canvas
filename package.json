@@ -7,6 +7,8 @@
     "test": "node tools/test-all.cjs",
     "test:verbose": "node tools/test-all.cjs --verbose",
     "build": "node tools/build.cjs",
+    "deploy": "node tools/deploy.cjs",
+    "deploy:check": "node tools/deploy.cjs --check",
     "verify": "node tools/verify-all.cjs"
   },
   "main": "dist/host.js",
