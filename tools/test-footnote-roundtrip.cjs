@@ -90,9 +90,14 @@ function el(tag, attrs, children) {
 function text(s) { return { nodeType: 3, nodeValue: s, childNodes: [] } }
 
 let pass = true
+// 同时数条数：总入口（tools/test-all.cjs）靠这个汇总。
+// 只报 ALL PASS 不报条数，会让"断言合计"静默少算这一份 —— 少报比不报更误导。
+let cntOk = 0
+let cntBad = 0
 function check(name, cond) {
   console.log((cond ? 'PASS' : 'FAIL') + ' — ' + name)
-  if (!cond) pass = false
+  if (cond) cntOk++
+  else { cntBad++; pass = false }
 }
 
 // ─── 1. 脚注 round-trip ──────────────────────────────
@@ -302,5 +307,5 @@ check('md→html：斜体与粗体同在一行，两边都对',
     return one.indexOf('<em>写入方基于哪一版</em>') >= 0 && one.indexOf('<strong>显式化</strong>') >= 0
   })())
 
-console.log(pass ? '\nALL PASS' : '\nHAS FAILURES')
+console.log('\n' + (pass ? 'ALL PASS' : 'HAS FAILURES') + '：' + cntOk + ' 通过 / ' + cntBad + ' 失败')
 process.exit(pass ? 0 : 1)

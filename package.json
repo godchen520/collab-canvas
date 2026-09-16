@@ -3,6 +3,12 @@
   "version": "0.3.0",
   "description": "DSH 协作画布插件：Markdown 渲染/编辑/序列化 + 状态管理 + 工具注册",
   "type": "module",
+  "scripts": {
+    "test": "node tools/test-all.cjs",
+    "test:verbose": "node tools/test-all.cjs --verbose",
+    "build": "node tools/build.cjs",
+    "verify": "node tools/verify-all.cjs"
+  },
   "main": "dist/host.js",
   "exports": {
     ".": "./dist/host.js",

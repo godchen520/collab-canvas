@@ -1,24 +1,39 @@
-# DSH Collab-Canvas · 开发要点速查（v2 — production composition 方案）
+# DSH Collab-Canvas · 开发要点速查（v3 — 2026-09-16 校正）
 
 > 本文档从 30+ 轮迭代中总结，供任何模型/会话正确维护此插件。
 > **已从 cordis_define 动态方案迁移到 DSH composition 插件（生产部署）**。
-> 源码：`src/host/*.js` + `src/client/*.js` → 构建：`node tools/build.js` → 产物：`dist/*.js`
+> 源码：`src/host/*.js` + `src/client/editor-panel.js`
+> → 构建：`node tools/build.cjs`（npm run build）→ 产物：`dist/host.js`
+>
+> ⚠️ **2026-09-16 校正过一批错话**。旧版本有三类错误，凡是别处（含历史会话记录）
+> 还写着的，以下面为准：
+> 1. 到处都是 `node tools/build.js` —— **这个文件从来不存在**，真名是 `tools/build.cjs`。
+> 2. 说"已注册 8 个 AI 工具" —— 实际是 **9 个**（后来加了 `canvas_locate`）。
+> 3. 第三、四节描述的是**已废弃的旧部署方式**（两个包 + 拷成 `index.mjs`），
+>    与第零节的现状自相矛盾。旧内容已改写为"历史沿革"。
+>
+> 📌 **维护约定**：本文件里的命令与数字，**改流程时必须同步改这里**。
+> 判断它有没有过期的最快办法：跑一遍 `node tools/verify-all.cjs`，
+> 再看本文件里出现的每个 `tools/xxx` 命令**是否真的存在**。
 
 ---
 
-## 零、当前部署状态（2026-09 最新）
+## 零、当前部署状态（2026-09-16 最新）
 
 **生产部署：单包 `collab-canvas`**（host + client 同包，`dsh.bundle.patch` 自动注册）：
 
 - 物理位置：`E:\DeepSeek Harness\.dsh\profiles\web\node_modules\collab-canvas\`
-- composition 条目：web profile 的 `cordis.patch.yml` 里 `insert` → `id: collab-canvas`
-- **Host 半边**：`dist/host.js`（由 `tools/build.cjs` 从 `src/host/*.js` 拼出）
+- 启用方式：`profiles/web/package.json` 的 **`dsh.profile.bundles`** 数组里有 `collab-canvas`，
+  包自身的 `package.json` 再通过 `dsh.bundle.patch` 指向本包的 `cordis.patch.yml`
+  （该文件内容就是 `insert: - id: collab-canvas`）
+- **Host 半边**：`dist/host.js`（由 `tools/build.cjs` 从 `src/host/*.js` 按文件名拼出）
 - **Client 半边**：`lib/client.js` —— 独立的 `__ModuleLoader__.load` 模块，
   源文件是 `src/client/editor-panel.js`；由 package.json 的 `dsh.client` 声明加载
-- 另有 `lib/docdrop.js`、`lib/doclink.js`：host 按请求实时供源码的独立客户端模块
-  （改完**刷新页面**即生效，不用重启）
-- 已注册 8 个 AI 工具（经 `ctx.tools.register`）：
-  `canvas_list` / `create` / `read` / `write` / `save` / `load` / `configure` / `delete`
+  ⚠️ **它不走 build.cjs，必须手工同步**（见下一节）
+- 另有 `lib/selref.js`、`lib/docdrop.js`、`lib/doclink.js`：host **按请求实时读盘**供出去的
+  独立客户端模块 —— 改完**刷新页面即生效**，不用重启
+- 已注册 **9 个** AI 工具（经 `ctx.tools.register`，全在 `src/host/07-tools.js`）：
+  `canvas_list` / `create` / `read` / `write` / `save` / `load` / `configure` / `delete` / `locate`
 - 数据持久化到：`canvas-docs/`，会话清单在 `canvas-docs/.sessions/<sid>.json`
 
 > 历史遗留（2026-09-12 清理）：早期曾有 `collab-canvas-host` + `collab-canvas-client`
@@ -26,6 +41,39 @@
 > `lib/client.js`，`src/client/00-*.js ~ 99-*.js` 与 `dist/client.js` 均已删除。
 
 **验证方式**：AI 直接调 `canvas_list` 返回画布列表；`canvas_write` 协作写画布。✅ 已验证工作。
+
+---
+
+## 零点五、日常三条命令（先看这个）
+
+```bash
+node tools/test-all.cjs     # 跑全部回归测试（自动收 tools/test-*.cjs，勿手打多条）
+node tools/build.cjs        # 重新构建 dist/host.js（只构建 host！）
+node tools/verify-all.cjs   # 上线前总检：真跑测试 + 工作区↔部署一致性 + 历史守卫
+```
+
+有 npm 的正常终端里也可以：`npm test` / `npm run build` / `npm run verify`。
+（`npm` 在某些受限 shell 里起不来，所以**以直接跑 node 的那三条命令为准**。）
+
+### 🔴 改动生效方式（分三种，别混）
+
+| 改了什么 | 怎么才能生效 |
+| --- | --- |
+| `src/host/*.js` → `dist/host.js` | 重新构建 + 拷部署副本 + **完全重启 dsh web** |
+| `src/client/editor-panel.js` → `lib/client.js` | 拷到 `lib/client.js` + 拷部署副本 + **刷新页面** |
+| `lib/selref.js` 等侧模块 | 拷部署副本 + **刷新页面**（host 按请求读盘） |
+
+### 🔴 手工同步清单（build.cjs 不覆盖客户端）
+
+改完源码后要保证这 6 份在**工作区与部署副本**两边一致：
+
+```
+dist/host.js   lib/client.js   lib/selref.js
+lib/doclink.js lib/docdrop.js  package.json  cordis.patch.yml
+```
+
+`node tools/verify-all.cjs` 的第 3 节会把它们逐个比一遍并指出哪份不一致。
+> 待办：目前还没有"一键搬运"脚本，这一节靠手工 + 总检兜底。
 
 ---
 
@@ -48,7 +96,7 @@
 
 ```js
 const name = 'collab-canvas-host'
-const inject = ['timer', 'tools', 'fs', 'systemPrompt']
+const inject = ['timer', 'tools', 'fs', 'webServer', 'systemPrompt']
 function apply(ctx, config) {
   // 注册工具：ctx.tools.register(defineTool({...}))
   ctx.tools.register(defineTool({ name: 'canvas_list', ... }))
@@ -57,13 +105,13 @@ function apply(ctx, config) {
 export { apply, inject, name }
 ```
 
-### 2.2 build.js 已改为 composition 输出
+### 2.2 build.cjs 输出 composition 格式
 
-`node tools/build.js` 现在输出：
+`node tools/build.cjs` 输出：
 ```
 import { defineTool } from "@deepseek-ai/dsh-tools"
 export const name = 'collab-canvas-host'
-export const inject = ["timer","tools","fs","systemPrompt"]
+export const inject = ["timer","tools","fs","webServer","systemPrompt"]
 export function apply(ctx, config) { ... }
 ```
 
@@ -79,23 +127,25 @@ export function apply(ctx, config) { ... }
 
 ---
 
-## 三、已部署的 Phase 1（Host AI 工具）
+## 三、Phase 1 已落地（Host AI 工具）
 
-### 改造点
+> ⚠️ **本节的历史沿革**：下面"构建/部署步骤"里的 `collab-canvas-host/index.mjs` 是
+> **早期双包方案**，**已废弃**。当前正确流程见**第零节与零点五节** ——
+> 单包 `collab-canvas`，改完跑 `verify-all.cjs`、按"改动生效方式"那张表操作。
+> 保留这段是为了解释为什么代码里还留着 `typeof harness` 之类的守卫。
+
+### 改造点（当时的记录，仍有效）
 - `00-ctx.js`：`ctx.fs`（injected）+ `ctx.get('sandboxPolicy')`（可选）
 - `07-tools.js`：`harness.registerTool` → `ctx.tools.register(defineTool(...))`
 - `06-rpc.js`：整段用 `if (typeof harness !== 'undefined')` 守卫（composition 下不执行）
 - `08-prompt.js`：`sp.section()` 必须带 `order`（缺了报 "order must be a finite number"）
-- `build.js`：输出 composition ESM，inject 含 `tools`/`fs`/`systemPrompt`
+- `build.cjs`：输出 composition ESM，inject 含 `tools`/`fs`/`webServer`/`systemPrompt`
 
-### 构建/部署步骤
+### 构建/部署步骤（❌ 已废弃，仅存档）
 ```
-1. node tools/build.js                    # 生成 composition ESM dist
-2. Copy dist/host.js → node_modules/collab-canvas-host/index.mjs
-3. web profile cordis.patch.yml insert:
-     - id: collab-canvas-host
-       name: collab-canvas-host
-       config: {}
+1. node tools/build.cjs                   # 生成 composition ESM dist（当时文档里错写成 build.js）
+2. Copy dist/host.js → node_modules/collab-canvas-host/index.mjs   ← 双包方案，已不适用
+3. web profile cordis.patch.yml insert: - id: collab-canvas-host   ← 现走 dsh.bundle.patch
 4. 重启 DSH
 ```
 
@@ -105,7 +155,11 @@ export function apply(ctx, config) { ... }
 
 ---
 
-## 四、Phase 2 方案（WYSIWYG 编辑器「话布」Tab，待做）
+## 四、Phase 2 架构（WYSIWYG 编辑器「话布」Tab —— ✅ 已完成）
+
+> 本节保留的是**当时的设计依据**（为什么客户端必须走 HTTP 而不是 `host.call`）。
+> 「话布」Tab 本身已上线：注册在官方右侧栏，入口是门厅页那张「话布」卡片。
+> 后续演进（选区引用、位置注入等）见 `canvas-docs/` 下的设计文档。
 
 ### 架构（composition 兼容，不需 cordis）
 参考 `dsh-web-remote`：
@@ -140,7 +194,7 @@ export function apply(ctx, config) { ... }
 | 症状 | 根因 | 修复 |
 |------|------|------|
 | prompt section "undefined" order 报错 | `sp.section()` 缺 `order` | 加 `order: 200` |
-| host half ready 但工具没注册 | `ctx.tools.register` 的 defineTool 未 import | build.js 加 `import { defineTool }` |
+| host half ready 但工具没注册 | `ctx.tools.register` 的 defineTool 未 import | build.cjs 加 `import { defineTool }` |
 | harness is not defined | 用了动态 API 但打了 composition | 06-rpc.js 用 `if (typeof harness)` 守卫 |
 | styles/React 未定义（client） | composition 不注入动态全局 | 改用 webServer HTTP + tapIndex |
 | DSH 启动崩溃 loader fibers failed | composition 插件 `apply` 抛错 | 查具体原因；一般是不该访问的全局 |
