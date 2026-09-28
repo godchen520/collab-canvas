@@ -4,6 +4,23 @@ var activeId = null
 var idSeq = 0
 var rootOverride = null   // 用户显式固定的存储根（持久化于 meta）
 
+// 插件自己的用户级目录。**关键性质：与 DSH 无关。**
+// 为什么必须有它：DSH 升级可能把 sessions / workspaceRegistry / policy.workspaceRoot
+// **全部**改指向新的默认工作区 —— 2026-09-28 实测升级后三个源都变成
+// ~/.zcode/workspace/default，于是 meta 的两个候选位置里都不再包含真正的存储根，
+// restore 读不到 rootOverride，插件当成"首次运行"在错误目录里新建了一份空的。
+// 只有这里不受影响，所以它同时是①存储根彻底探测不到时的兜底、
+// ②meta 的第三个落点（见 04-persistence 的 metaTargets）。
+function userHome() {
+  return (typeof process !== 'undefined' && process.env
+    && (process.env.USERPROFILE || process.env.HOME)) || ''
+}
+function fallbackBase() {
+  const home = userHome()
+  return home ? joinPath(home, '.dsh-collab-canvas') : '.'
+}
+function fallbackDocsDir() { return joinPath(fallbackBase(), 'canvas-docs') }
+
 function docsDirBase() {
   // 多级探测：显式覆盖 > 活跃会话 cwd > workspace 注册表 > 部署根兜底
   if (rootOverride) return rootOverride
@@ -26,9 +43,7 @@ function docsDirBase() {
   // 实测 2026-09-12 20:28 落到 node_modules/@deepseek-ai/dsh/lib —— 插件把
   // file-registry.json 和 canvas-docs/.canvases.json 写进了 DSH 的包目录。
   // 改用一个稳定的、与 DSH 无关的用户级目录。
-  const home = (typeof process !== 'undefined' && process.env
-    && (process.env.USERPROFILE || process.env.HOME)) || ''
-  const fallback = home ? joinPath(home, '.dsh-collab-canvas') : '.'
+  const fallback = fallbackBase()
   console.error('[collab-canvas] 存储根探测全部失败（sessions / workspaceRegistry / policy 都不可用），'
     + '退到兜底目录:', fallback, '——请检查会话工作区是否正常')
   return fallback

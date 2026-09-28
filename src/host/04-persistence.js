@@ -36,6 +36,26 @@ function sanctionedDocsDir() {
   return joinPath((policy !== undefined && policy.workspaceRoot) ? policy.workspaceRoot : '.', 'canvas-docs')
 }
 
+// meta 的落点清单。**persistMeta 与 restore 必须用同一份** ——
+// 两边各写一份清单，一旦漂移就会出现「写进去了，但冷启动读不到」这种最难查的故障。
+//
+// 第三个落点（用户级、与 DSH 无关）是 2026-09-28 补的：
+// DSH 升级后 sessions / workspaceRegistry / policy.workspaceRoot **全部**改指向
+// ~/.zcode/workspace/default，前两个落点里都不再包含真正的存储根，
+// 于是 rootOverride 读不回来、插件在错误目录里当成首次运行。
+// 加了它之后，DSH 再怎么换默认工作区，rootOverride 都还在。
+function metaTargets() {
+  const list = [metaPath(), joinPath(sanctionedDocsDir(), '.canvases.json')]
+  try {
+    const f = fallbackDocsDir()
+    if (f && f !== '.') {
+      const p = joinPath(f, '.canvases.json')
+      if (list.indexOf(p) < 0) list.push(p)
+    }
+  } catch (_) { /* 拿不到 home 就只用前两个 */ }
+  return list
+}
+
 async function saveCanvas(c, filePath) {
   const primary = filePath || c.filePath || joinPath(docsDir(), slugify(c.title) + '.md')
   try {
@@ -59,7 +79,7 @@ async function persistMeta() {
     return { id: c.id, title: c.title, type: c.type, filePath: c.filePath }
   }) }, null, 2)
   // 同步写所有候选位置：冷启动时无论读到哪一份都带 rootOverride
-  const targets = [metaPath(), joinPath(sanctionedDocsDir(), '.canvases.json')]
+  const targets = metaTargets()
   let okCount = 0
   for (const mp of targets) {
     try { await writeFile(mp, payload); okCount++ } catch (e) { console.error('[collab-canvas] meta persist miss:', mp, e && e.message) }
@@ -94,7 +114,7 @@ ctx.effect(function () { return function () { flushDirty() } }, 'final-flush')
 
 async function restore() {
   if (!fs) { console.error('[collab-canvas]', 'fs service unavailable — persistence disabled'); return }
-  const metaCandidates = [metaPath(), joinPath(sanctionedDocsDir(), '.canvases.json')]
+  const metaCandidates = metaTargets()
   const metas = []
   for (const mp of metaCandidates) {
     try {
@@ -138,6 +158,12 @@ async function restore() {
     if (skippedDup) console.error('[collab-canvas] restore: 共跳过', skippedDup, '条重复记录')
     activeId = meta.activeId && canvases.has(meta.activeId) ? meta.activeId : (meta.canvases && meta.canvases[0] && meta.canvases[0].id) || null
     console.log('[collab-canvas]', 'restored', canvases.size, 'canvas(es), root =', docsDirBase())
+    // 自愈：本次若是从别的落点读到 rootOverride，立刻把 meta 写回**全部**落点。
+    // 否则那几份仍停在旧根上，下次探测顺序一变又会被带偏。
+    // 失败不致命（本次内存里的根已经是对的），所以只记日志。
+    if (typeof meta.rootOverride === 'string' && meta.rootOverride.length > 2) {
+      try { await persistMeta() } catch (e) { console.error('[collab-canvas] restore 后回写 meta 失败:', e && e.message) }
+    }
   } catch (e) {
     console.log('[collab-canvas]', 'restore failed:', e.message)
   }
