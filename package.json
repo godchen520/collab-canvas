@@ -1,6 +1,6 @@
 {
   "name": "collab-canvas",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DSH 协作画布插件（话布）：人和 AI 共写的 Markdown 文档面。AI 通过 canvas_* 工具读写，带版本冲突检测、可撤销历史与文件持久化。",
   "type": "module",
   "license": "MIT",

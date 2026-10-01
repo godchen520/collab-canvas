@@ -1,5 +1,6 @@
 # collab-canvas（话布）
 
+[![npm version](https://img.shields.io/npm/v/collab-canvas)](https://www.npmjs.com/package/collab-canvas)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![DSH Compatible](https://img.shields.io/badge/DSH-0.2.x-brightgreen)](https://github.com/deepseek-ai/deepseek-harness)
 
@@ -47,8 +48,9 @@
 ## 安装
 
 ```bash
-# 1. 装进 profile
-dsh plugin --profile web add github:godchen520/collab-canvas
+# 1. 装进 profile（下面两种来源任选其一）
+dsh plugin --profile web add collab-canvas                      # 从 npm 装（推荐）
+dsh plugin --profile web add github:godchen520/collab-canvas     # 从 GitHub 装（跟随最新提交）
 
 # 2. 把 "collab-canvas" 加进 profile package.json 的 dsh.profile.bundles 数组
 #    （只加 dependencies 不加 bundles 的话，cordis.patch.yml 不会生效 —— 插件"装了但没启用"）
@@ -59,6 +61,8 @@ dsh web
 
 > **两处都要加**：`dependencies` 负责把包装上，`dsh.profile.bundles` 负责让它的
 > `cordis.patch.yml` 进入组合。缺任何一边都会出现"装上了但功能不在"。
+
+> **npm 安装的好处**：不受 npm 对 git 依赖触发的 `allowBuilds` 构建授权步骤影响，且市场能显示下载量。
 
 ## 数据存放
 
