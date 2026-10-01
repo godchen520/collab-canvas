@@ -18,7 +18,7 @@
 //   node tools/deploy.cjs           # 搬运 + 逐个校验（npm run deploy）
 //   node tools/deploy.cjs --check   # 只看差哪几份，一个字节都不动
 //
-// 部署目录默认 E:/DeepSeek Harness/.dsh/profiles/web/node_modules/collab-canvas，
+// 部署目录默认由 DSH_HOME 推导：$DSH_HOME/profiles/web/node_modules/collab-canvas，
 // 可用环境变量 CCV_DEPLOY_DIR 覆盖（换机器 / 换 profile 时用）。
 //
 // 生效方式（脚本会再提醒一次，因为这两种别混）：
@@ -30,10 +30,14 @@
 
 const fs = require('fs')
 const path = require('path')
+const os = require('os')
 
 const ROOT = path.join(__dirname, '..')
+// 部署目录：默认从 DSH_HOME 推导（$DSH_HOME/profiles/web/node_modules/collab-canvas），
+// 可用环境变量 CCV_DEPLOY_DIR 显式覆盖。
+const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const DP = process.env.CCV_DEPLOY_DIR ||
-  'E:/DeepSeek Harness/.dsh/profiles/web/node_modules/collab-canvas'
+  path.join(DSH_HOME, 'profiles', 'web', 'node_modules', 'collab-canvas')
 
 const CHECK_ONLY = process.argv.includes('--check')
 

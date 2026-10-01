@@ -1,5 +1,7 @@
 const { execSync } = require('child_process')
-const ROOT = 'H:/WPSCloud/OneDrive - 星河游/文档/DSH project/DSH Collab Doc'
+const path = require('path')
+// 仓库根 = 本脚本的上一级目录（可移植，不写死本机路径）
+const ROOT = path.join(__dirname, '..')
 const F = 'canvas-docs/话布优化.md'
 
 const raw = execSync('git log --format=' + '"%h %cI %s"' + ' -- ' + F, { cwd: ROOT, encoding: 'utf8' }).trim()

@@ -1,7 +1,11 @@
 const fs = require('fs')
 const path = require('path')
+const os = require('os')
 
-const ROOT = 'E:/DeepSeek Harness'
+// DSH 部署根：由 DSH_HOME 的父目录推导（DSH_HOME 通常就是 <部署根>/.dsh），
+// 可用环境变量 DSH_ROOT 显式覆盖。
+const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+const ROOT = process.env.DSH_ROOT || path.dirname(DSH_HOME)
 // 我预期会写的地方（插件部署目录）
 const PLUGIN = path.join(ROOT, '.dsh/profiles/web/node_modules/collab-canvas').replace(/\\/g, '/')
 

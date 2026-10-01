@@ -20,7 +20,10 @@ const { execSync, spawnSync } = require('child_process')
 
 const ROOT = path.join(__dirname, '..')
 const WS = ROOT
-const DP = 'E:/DeepSeek Harness/.dsh/profiles/web/node_modules/collab-canvas'
+// 部署目录与 deploy.cjs 保持同一推导规则：DSH_HOME 优先，CCV_DEPLOY_DIR 可覆盖。
+const DSH_HOME = process.env.DSH_HOME || path.join(require('os').homedir(), '.dsh')
+const DP = process.env.CCV_DEPLOY_DIR ||
+  path.join(DSH_HOME, 'profiles', 'web', 'node_modules', 'collab-canvas')
 
 let problems = []
 

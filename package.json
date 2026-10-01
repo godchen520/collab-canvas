@@ -1,8 +1,27 @@
 {
   "name": "collab-canvas",
   "version": "0.3.0",
-  "description": "DSH 协作画布插件：Markdown 渲染/编辑/序列化 + 状态管理 + 工具注册",
+  "description": "DSH 协作画布插件（话布）：人和 AI 共写的 Markdown 文档面。AI 通过 canvas_* 工具读写，带版本冲突检测、可撤销历史与文件持久化。",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/godchen520/collab-canvas.git"
+  },
+  "homepage": "https://github.com/godchen520/collab-canvas#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "plugin",
+    "canvas",
+    "collab",
+    "markdown",
+    "collaboration"
+  ],
   "scripts": {
     "test": "node tools/test-all.cjs",
     "test:verbose": "node tools/test-all.cjs --verbose",
@@ -22,7 +41,6 @@
     "lib",
     "cordis.patch.yml"
   ],
-  "license": "MIT",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -35,5 +53,8 @@
       ],
       "platform": "web"
     }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2"
   }
 }
