@@ -1,0 +1,40 @@
+name: Publish to npm
+
+# 通过 GitHub OIDC 的 Trusted Publishing 发布，不使用任何 npm 令牌。
+# 触发方式：在 GitHub 上发布一个 Release（打标签后点 Publish release）。
+#
+# 前置（一次性）：在 npm 上为本包配置 Trusted Publisher，指向
+#   仓库 godchen520/collab-canvas + 工作流文件 publish.yml
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Trusted Publishing 必需：允许工作流向 npm 换取 OIDC 身份令牌
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # 先跑测试，绿了才发布
+      - name: Run tests
+        run: npm test
+
+      # Trusted Publishing 需要 npm >= 11.5.1；Node 22 自带的是 10.x
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      # 不传 NODE_AUTH_TOKEN —— npm 在 id-token: write 下自动使用 OIDC。
+      # --provenance 生成来源证明（仓库公开时可用）。
+      - name: Publish
+        run: npm publish --provenance --access public
