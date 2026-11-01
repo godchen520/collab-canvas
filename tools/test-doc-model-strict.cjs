@@ -52,7 +52,15 @@ function diffSets(a, b) {
 
 let bad = 0
 const dir = path.join(__dirname, '..', 'canvas-docs')
-const files = fs.readdirSync(dir).filter(function (f) { return f.endsWith('.md') })
+// canvas-docs/ 在 .gitignore 里（用户的真实文档，不进仓库）。
+// 所以「本机有就跑、CI 上没有就跳过」—— 否则干净检出上会直接 ENOENT，
+// 让整条 CI（进而 npm 发布）永远红着。
+let files = []
+if (fs.existsSync(dir)) {
+  files = fs.readdirSync(dir).filter(function (f) { return f.endsWith('.md') })
+} else {
+  console.log('  （跳过：canvas-docs 是本地真实文档，不在仓库里 —— 本机有就会自动跑这一段）')
+}
 console.log('=== 语义比较：内容行是否一一对应（顺序无关 ✓ 空格/对齐冒号无关 ✓）===')
 files.forEach(function (f) {
   const md = fs.readFileSync(path.join(dir, f), 'utf8')
