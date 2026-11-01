@@ -1,10 +1,74 @@
 // 共享变更逻辑（RPC 与模型工具共用同一套历史栈）
+// [[CCV-UNDO-BEGIN]] —— 到 END 之间是「历史栈 + 撤销/重做」的全部代码，
+// tools/test-host-undo.cjs 会把这一段切出来跑（标记没了它立刻报错，不会悄悄测过期副本）。
 var HISTORY_MAX = 50
+// 连续编辑合并的时间窗（见 pushHistory 里的说明）
+var HISTORY_MERGE_MS = 60 * 1000
 function pushHistory(c, before, after, source, version) {
+  // ★ 合并连续编辑（2026-10-11 加）—— **自动保存的前提** ✓
+  //   为什么要它：接了自动保存之后，停手 1.5 秒就可能写一次 ✓ 若每次都落一条历史 ✗
+  //   撤销栈会被冲爆（按一次撤销只退一小步 ✗ 主人会以为"撤不动"✗）。
+  //   成熟文档软件都做这件事（Google Docs 把短时间内的连续编辑合成一个版本 ✓）。
+  //
+  //   判据三条，缺一不可：
+  //     ① 来源相同 —— AI 改的与人改的不该合成一步 ✗（撤销时想分清是谁改的 ✓）
+  //     ② 时间相近 —— 隔太久的两段编辑该分开，否则撤销粒度太粗 ✗
+  //     ③ **首尾相接**：新一次的 before === 上一条的 after ✓✓ —— 这条最硬，
+  //        它证明中间**没有任何别的改动**（撤销 / 重做 / 别处的写入都会破坏它 ✓）
+  var last = c.history.length ? c.history[c.history.length - 1] : null
+  if (last && last.source === source
+    && (Date.now() - (last.at || 0)) < HISTORY_MERGE_MS
+    && last.after === before) {
+    last.after = after            // 终点往后延 ✓ 起点不动 ✓
+    last.at = Date.now()
+    last.version = version
+    c.redoStack.length = 0
+    return
+  }
   c.history.push({ opId: 'op-' + Date.now().toString(36) + '-' + (++idSeq), source: source, before: before, after: after, at: Date.now(), version: version })
   if (c.history.length > HISTORY_MAX) c.history.shift()
   c.redoStack.length = 0
 }
+
+// ═══ 撤销 / 重做 ══════════════════════════════════════════════════
+// 为什么抽成函数：包级 RPC（06-rpc）和 HTTP 端点（09-http）都要用它。
+// 两处各写一套的话，日后改一处漏一处 —— meta 落点那次故障就是这么来的
+// （persistMeta 与 restore 各持一份候选清单，DSH 升级后两者都没包含真正的存储根）。
+//
+// ⚠️ 只回退 content，**不往 history 里塞新条目**：否则「撤销」本身变成一步可撤销的操作，
+//    按一次栈也跟着长，用户会觉得撤不回去（撤了 A，栈顶又变成刚才那次撤销）。
+// ⚠️ version 必须 +1：客户端靠 knownVer 做并发保护，版本不动的话它下一次写入
+//    还是拿着旧版本号 → 被自己挡下或误判成冲突。返回新版本号，客户端据此同步。
+// ⚠️ dirty + debouncedFlush：撤销的结果要落盘，否则刷新后撤销白做。
+function undoCanvas(c) {
+  if (!c) return { ok: false, error: '画布不存在' }
+  if (!c.history.length) return { ok: true, noop: true, content: c.content, version: c.version }
+  const rec = c.history.pop()
+  c.redoStack.push(rec)
+  c.content = rec.before
+  c.version += 1
+  c.dirty = true
+  c.updatedAt = Date.now()
+  debouncedFlush()
+  return { ok: true, content: c.content, version: c.version, source: rec.source || null, at: rec.at || null }
+}
+function redoCanvas(c) {
+  if (!c) return { ok: false, error: '画布不存在' }
+  if (!c.redoStack.length) return { ok: true, noop: true, content: c.content, version: c.version }
+  const rec = c.redoStack.pop()
+  c.history.push(rec)
+  c.content = rec.after
+  c.version += 1
+  c.dirty = true
+  c.updatedAt = Date.now()
+  debouncedFlush()
+  return { ok: true, content: c.content, version: c.version, source: rec.source || null, at: rec.at || null }
+}
+// 给界面用：按钮该不该灰掉。调用方在 read/write/undo/redo 的响应里带上它。
+function canUndo(c) { return !!(c && c.history && c.history.length) }
+function canRedo(c) { return !!(c && c.redoStack && c.redoStack.length) }
+// [[CCV-UNDO-END]]
+
 
 function createCanvasDoc(title) {
   // 标题净化：AI/导入可能把 "xxx.md" 当标题传入，canvas_save 落盘时会变成
@@ -17,6 +81,64 @@ function createCanvasDoc(title) {
   persistMeta()
   debouncedFlush()
   return c
+}
+
+// ─── 选区编辑区（scratch 画布）─────────────────────────────────────
+// 规格：canvas-docs/话布选区编辑区方案.md（第三、四节）
+//
+// 形态：一个**临时画布**，type='scratch'。借画布的壳只为两件事 ——
+//   ① 给 AI 一条**现成的写入通道**（canvas_write，不用给它造新工具）
+//   ② 白得一套版本号与历史栈（撤销直接可用）
+// 三条约束（第九节「明确不做」）：
+//   · 不进任何清单（list 端点过滤 type==='scratch'）
+//   · 不写进 meta（persistMeta 过滤）—— 一次性对象，重启即消失
+//   · 不给人看、不给人改（没有界面）
+//
+// ⚠️ 刻意**不调用** persistMeta / debouncedFlush —— 它是内存对象，
+//    一旦落盘就不再"一次性"了（步骤 6 专门验这条）。
+let scratchSeq = 0
+function createScratchCanvas(b) {
+  b = b || {}
+  const id = 'scratch-' + Date.now().toString(36) + '-' + (++scratchSeq)
+  const quote = String(b.quote || '')
+  const c = {
+    id: id, title: '选区片段', type: 'scratch',
+    content: quote, version: 1, filePath: null,
+    history: [], redoStack: [], dirty: false, updatedAt: Date.now(),
+    // 绑定：主文档 + 位置 + 指纹。位置由 host 侧按**引文与序数**解析
+    //（与「位置主动注入」用同一套算法 —— 渲染前后出现顺序不变，口径一致）。
+    scratch: {
+      docId: b.docId || null,
+      docPath: b.docPath || null,
+      offset: (typeof b.offset === 'number') ? b.offset : -1,
+      length: (typeof b.length === 'number' && b.length >= 0) ? b.length : quote.length,
+      docVersion: (typeof b.docVersion === 'number') ? b.docVersion : 0,
+      ordinal: (typeof b.ordinal === 'number') ? b.ordinal : 0,
+      dupCount: (typeof b.dupCount === 'number') ? b.dupCount : 0,
+      // 哪一笔上报建的这个区 —— 注入时靠它把「这一轮引用到的」认出来
+      pinCode: (typeof b.pinCode === 'number') ? b.pinCode : 0,
+      // ⚠️ **建区时的原始引文**（2026-10-11 加，拼接要用）。
+      //   为什么必须单独留一份：编辑区的内容会被 AI 改掉 ✗，而拼接前要校验
+      //   "主文档 [偏移, 偏移+长度) 那一段还是不是原来那段" —— 拿被改过的内容去比
+      //   必然比不过 ✗。
+      origQuote: quote,
+      spliced: false,
+      at: Date.now(),
+    },
+  }
+  canvases.set(id, c)
+  return c
+}
+
+// 找某个 pin 建出来的编辑区（没有就返回 null）
+function scratchForPin(pinCode) {
+  if (!pinCode) return null
+  let hit = null
+  canvases.forEach(function (c) {
+    if (hit) return
+    if (c && c.type === 'scratch' && c.scratch && c.scratch.pinCode === pinCode) hit = c
+  })
+  return hit
 }
 
 // ═══ AI 改动记录（喂给画布端的「跳过去给我看」）══════════════════════

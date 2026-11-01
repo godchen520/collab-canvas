@@ -75,8 +75,22 @@ async function saveCanvas(c, filePath) {
 }
 
 async function persistMeta() {
-  const payload = JSON.stringify({ activeId: activeId, rootOverride: rootOverride, canvases: Array.from(canvases.values()).map(function (c) {
-    return { id: c.id, title: c.title, type: c.type, filePath: c.filePath }
+  const payload = JSON.stringify({ activeId: activeId, rootOverride: rootOverride, canvases: Array.from(canvases.values()).filter(function (c) {
+    // ⚠️ 选区编辑区（type='scratch'）**不落盘**（2026-10-11 加）。
+    //   它是一次性对象：拼接成功后立刻销毁；重启即消失。
+    //   规格见 canvas-docs/话布选区编辑区方案.md 第四、九节。
+    //   一旦写进 meta 就不再"一次性"了 —— 实施步骤 6 专门验这条。
+    return c && c.type !== 'scratch'
+  }).map(function (c) {
+    // ⚠️ version 必须存 —— 2026-10-04 补。
+    //   它原本不存，于是 restore 时一律 `version: 1`，后果有两个：
+    //     ① **所有靠版本号的保护在重启后失效**：草稿基准校验（草稿记的 base=1、
+    //        服务端重启后也是 1 → 误判成"基准相符" → 把过期草稿写回去覆盖新内容）、
+    //        并发冲突校验（knownVer 走的是同一套版本号）都形同虚设；
+    //     ② **事后无法追溯**：撤销每次都会把版本 +1，本来能数出"被撤了几次"，
+    //        重启一重置就再也看不出来（2026-10-04 那次误判就是这么丢的线索 ——
+    //        把"主人点了 3 次撤销"误判成了"面板覆盖"）。
+    return { id: c.id, title: c.title, type: c.type, filePath: c.filePath, version: c.version }
   }) }, null, 2)
   // 同步写所有候选位置：冷启动时无论读到哪一份都带 rootOverride
   const targets = metaTargets()
@@ -112,8 +126,49 @@ async function flushDirty() {
 const debouncedFlush = ctx.debounce(function () { flushDirty() }, 1500)
 ctx.effect(function () { return function () { flushDirty() } }, 'final-flush')
 
+// ── 每轮结束落一次盘（2026-10-14 加）─────────────────────────────
+// 为什么：AI 用 canvas_write 写画布走的是 applyWrite → debouncedFlush（**1.5 秒** ✗），
+//   进程/会话在那一秒半里重启就丢 ✗。而"一轮结束"是很自然的检查点 ✓
+//   —— 把暴露窗口从"几轮"缩到"一轮之内" ✓
+// 主人 2026-10-14 的现场：AI 追加的附录因会话重启全丢 ✗（根因是 restore 覆盖，
+//   但"更早落盘"能把这个坑填得更死 ✓ 两道一起上 ✓）
+//
+// ⚠️ 挂 **ctx.root**，不是插件自己的 ctx —— 作用域树上插件 ctx 是 agent 作用域的
+//    **兄弟分支** ✗ 事件只往上冒到祖先 ✓（2026-10-11 在拼接那边踩过这个坑 ✓）
+try {
+  var flushEvCtx = (ctx && ctx.root) ? ctx.root : ctx
+  if (flushEvCtx && typeof flushEvCtx.on === 'function') {
+    flushEvCtx.on('agent/turn-stopping', function () { try { flushDirty() } catch (_) {} })
+    flushEvCtx.on('session/event', function (session, event) {
+      try { if (event && event.type === 'turn/end') flushDirty() } catch (_) {}
+    })
+    console.log('[collab-canvas]', 'turn-end flush registered')
+  }
+} catch (e) { console.error('[collab-canvas] turn-end flush 注册失败:', e && e.message) }
+
+// [[CCV-RESTORE-BEGIN]] —— 到 END 之间是「启动/重载时恢复画布」的全部代码。
+// tools/test-host-restore.cjs 会把这一段切出来跑（标记没了它立刻报错，不会悄悄测过期副本）。
 async function restore() {
   if (!fs) { console.error('[collab-canvas]', 'fs service unavailable — persistence disabled'); return }
+
+  // 🔴🔴 **先把内存里没落盘的改动写下去，再读文件**（2026-10-14 加，修数据丢失）
+  //
+  // 为什么必须放在最前面：restore() 会在**同一个进程里被重跑** ——
+  //   会话重启 / 插件重载都会让它再跑一次 ✓ 而那时 canvases 里**还留着**上一轮的
+  //   内容（可能比文件新 ✓ 因为落盘是 1.5 秒防抖的 ✗）。
+  //   它下面无条件 `content = 读文件` + `canvases.set(...)` ——
+  //   等于**拿旧文件覆盖新内存** ✗✗
+  //
+  // 主人 2026-10-14 的现场（别的项目里）：
+  //   AI 用 canvas_write 追加了附录 A/B/C，几轮之后会话重启 →
+  //   插件重新初始化 → restore 从文件读回 9752 字节的**原始版** →
+  //   覆盖掉内存里的新版 → **附录全丢** ✗ 而且 dirty 被设成 false，
+  //   连"还没存"这件事都看不出来了 ✗
+  //   同一个根因还造成了"话布登记被重置"（meta 也没落盘 ✓）
+  //
+  // 冷启动时内存是空的 → 这一步是空操作 ✓ 不会有副作用 ✓
+  try { await flushDirty() } catch (e) { console.error('[collab-canvas] restore 前落盘失败:', e && e.message) }
+
   const metaCandidates = metaTargets()
   const metas = []
   for (const mp of metaCandidates) {
@@ -149,9 +204,23 @@ async function restore() {
         try { content = await fs.readText(await fs.resolve(m.filePath)) }
         catch (e) { console.error('[collab-canvas] restore miss:', m.filePath, e.message); continue }
       }
+      // 🔴 **绝不拿文件覆盖"内存里有未保存改动"的那一份**（2026-10-14 加）
+      //   上面已经 flushDirty 过一次 ✓ 正常情况这里不会命中；
+      //   但落盘可能失败（OneDrive 占用、磁盘满、权限 ✗）—— 那时 dirty 还是 true ✓
+      //   这份内存内容比文件新 ✓ 用文件覆盖它就是**丢数据** ✗✗
+      //   所以：保留内存那份（内容/历史/脏标记都不动），只把 meta 里能补的补上 ✓
+      const live = canvases.get(m.id)
+      if (live && live.dirty) {
+        if (m.filePath && !live.filePath) live.filePath = m.filePath
+        if (typeof m.version === 'number' && m.version > live.version) live.version = m.version
+        console.error('[collab-canvas] restore: 保留内存里未落盘的改动（不覆盖）', m.id, m.title)
+        continue
+      }
       canvases.set(m.id, {
         id: m.id, title: m.title, type: m.type || 'document', content: content,
-        version: 1, filePath: m.filePath || null, history: [], redoStack: [],
+        // 版本号跟着 meta 一起存（见 persistMeta 的注释）：拿不到才退回 1
+        version: (typeof m.version === 'number' && m.version > 0) ? m.version : 1,
+        filePath: m.filePath || null, history: [], redoStack: [],
         dirty: false, updatedAt: Date.now(),
       })
     }
@@ -168,3 +237,4 @@ async function restore() {
     console.log('[collab-canvas]', 'restore failed:', e.message)
   }
 }
+// [[CCV-RESTORE-END]]

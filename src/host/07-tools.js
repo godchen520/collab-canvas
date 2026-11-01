@@ -29,7 +29,7 @@ ctx.tools.register(defineTool({
     if (!title) return toolOutput(err('E_BAD_ARGS', 'title 必须为非空字符串'))
     const c = createCanvasDoc(title)
     // 会话清单登记：AI 建的画布归入浏览器最近在看的会话清单（面板轮询可见）
-    try { sessAdd(lastBrowserSid, c.id) } catch (_) {}
+    try { sessAddExclusive(lastBrowserSid, c.id) } catch (_) {}
     return toolOutput({ ok: true, canvasId: c.id, title: title, hint: '已创建并设为活跃画布，接着可用 canvas_write 写入内容。本轮结束前记得调用 present 声明 "canvas-docs/' + slugify(c.title) + '.md"——它会在回复末尾生成一张可点卡片，点开就是话布面板。' })
   },
 }))
@@ -110,7 +110,7 @@ ctx.tools.register(defineTool({
     try {
       const c = await loadFileDoc(p, args && args.title)
       // 会话清单登记：AI 加载的文档归入浏览器最近在看的会话清单（面板轮询可见）
-      try { sessAdd(lastBrowserSid, c.id) } catch (_) {}
+      try { sessAddExclusive(lastBrowserSid, c.id) } catch (_) {}
       return toolOutput({ ok: true, canvasId: c.id, title: c.title, chars: c.content.length, hint: '已加载为画布并设为活跃。' })
     } catch (e) {
       return toolOutput(err(e.message.indexOf('ENOENT') >= 0 ? 'E_NOT_FOUND' : 'E_IO', '读取失败：' + e.message))

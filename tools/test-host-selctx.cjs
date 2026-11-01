@@ -83,6 +83,17 @@ sandbox.defineTool = function (def) { return def }
 sandbox.canvases = new Map()
 sandbox.activeId = null
 
+// 选区编辑区（scratch）的桩。
+// 真实现（createScratchCanvas / scratchForPin）在 05-mutations.js —— 不在本测试切的两块里，
+// 所以这里给一个**可切换的桩**：本测试只验「注入」这一段逻辑（编辑区的内容有没有摆出来、
+// 硬要求有没有立），建区与生命周期由实施步骤 6 单独验。
+sandbox.__scratch = null
+sandbox.scratchForPin = function (code) {
+  var s = sandbox.__scratch
+  if (!s || !s.scratch) return null
+  return (s.scratch.pinCode === code) ? s : null
+}
+
 const prelude = [
   "function toolOutput(v) { return JSON.stringify(v) }",
   "function err(code, message) { return { ok: false, error: { code: code, message: message } } }",
@@ -436,12 +447,61 @@ setDocs([DOC])
 }
 {
   clearPins()
+  // 🔴 [73] 一条消息里两条**文字完全相同**的引用（同一篇里同一个词选了两处）——
+  //    主人 2026-10-04 实测报「改反了」就是这个现场。
+  //    旧实现"无脑取最新"会让两条引用抢同一条上报、**正好互换**：
+  //      第 1 条引用拿到序数 2、第 2 条拿到序数 1 → 模型把两处改反，界面上看不出来。
+  //    正确做法：按时间顺序配对 —— 第 N 条引用配倒数第 (剩余条数) 条上报。
+  pinIt({ code: 8, ordinal: 1 })      // 先划的那一处
+  pinIt({ code: 9, ordinal: 2 })      // 后划的那一处
+  const two = run([human(refBare("散步") + "\n" + refBare("散步"))])
+  const at1 = two.indexOf("用户要的就是第 1 处")
+  const at2 = two.indexOf("用户要的就是第 2 处")
+  ok("[73a] 第 1 条引用配到【先划】的那一处（序数 1）", at1 >= 0)
+  ok("[73b] 第 2 条引用配到【后划】的那一处（序数 2）", at2 >= 0)
+  ok("[73c] ★ 两条不许颠倒（序数 1 必须出现在序数 2 之前）", at1 >= 0 && at2 >= 0 && at1 < at2)
+}
+{
+  clearPins()
+  // 🔴 [90] 选区编辑区的注入（实施步骤 1：建区 + 绑定 + 注入，先不拼接）
+  //    规格：canvas-docs/话布选区编辑区方案.md 第七节
+  //    这一条钉的是：**AI 拿到的是那一小段 + 它原来的语境 + 一条硬要求**。
+  //    缺语境 → 它改出不搭的东西（"改成和上面一致"没有"上面"）；
+  //    缺硬要求 → 它会写"以下是修改后的版本"，将来拼回原文就是往文档里塞说明文字 ✗
+  pinIt({ code: 21, ordinal: 2 })
+  sandbox.__scratch = {
+    id: 'scratch-test-1', title: '选区片段', type: 'scratch', version: 3,
+    content: '散步（改短版）',
+    scratch: { pinCode: 21, offset: -1, length: 2, ordinal: 2, docVersion: 1 },
+  }
+  const out = run([human(refBare('散步'))])
+  has('[90a] 说明了这是选区编辑区（AI 的工作台）', out, '选区编辑区')
+  has('[90b] 给出了编辑区的 id（让它用 canvas_write 改它）', out, 'scratch-test-1')
+  has('[90c] 摆出了编辑区现在的内容', out, '散步（改短版）')
+  has('[90d] 明确「不要去改主文档」', out, '不要去改主文档')
+  has('[90e] 立了硬要求：只写替换后的内容本身', out, '只写替换后的内容本身')
+  // 位置**能**解析（序数 2 落在 2 处之内）→ 必须补上文/下文
+  //（否则"改成和上面一致"这种要求，它没有"上面"）
+  has('[90f] 位置能解析 → 补上文', out, '上文：')
+  has('[90h] 位置能解析 → 补下文', out, '下文：')
+
+  // 位置**解析不出来**（序数 0 且原文多处）→ 必须明说"别猜"
+  clearPins()
+  pinIt({ code: 22, ordinal: 0 })
+  sandbox.__scratch.scratch.pinCode = 22
+  const out2 = run([human(refBare('散步'))])
+  has('[90g] 解析不出位置 → 明说别自己猜', out2, '别自己猜')
+  // 收尾：桩清掉，别影响后面的用例
+  sandbox.__scratch = null
+}
+{
+  clearPins()
   pinIt({ code: 4, ordinal: 1 })
   pinIt({ code: 5, ordinal: 2 })
   eq("[64a] 两条都存进去了", sandbox.ccvPins.length, 2)
   eq("[64b] 存进去的序数分别是 1 和 2", [sandbox.ccvPins[0].ordinal, sandbox.ccvPins[1].ordinal], [1, 2])
   const out = run([human(refBare("散步"))])
-  has("[64] 两条都在时取最新那条（用户是「先划、后发」）", out, "用户要的就是第 2 处")
+  has("[64] 只有一条引用时取最新那条（用户是「先划、后发」）", out, "用户要的就是第 2 处")
   // 🔴 [71]/[72] 钉的是 [64] 暴露出来的**真缺陷**，不是测试写法问题：
   //    同一段原文出现多处时，用户前后两次引用拼出来的正文可以**一字不差**，
   //    memo 只按正文做键就会把第二次挡掉 → 模型拿第一次的序数去改，改错地方。

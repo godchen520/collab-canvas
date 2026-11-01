@@ -4,7 +4,10 @@ if (typeof harness !== 'undefined') {
 harness.handle('canvas.list', async function () {
   const arr = []
   canvases.forEach(function (c) {
-    arr.push({ id: c.id, title: c.title, type: c.type, updatedAt: c.updatedAt, hasFile: !!c.filePath })
+    // ★ 2026-10-22：补上 filePath ✓（主人要在右侧栏「话布」清单里【点一下跳到文档】✓）
+    //   原来只回 hasFile ✗ → 前端拿不到路径 → 那个清单只能是死文字 ✓
+    //   ⚠️ 没必要藏它：它本来就是本机路径 ✓ 而这个接口只有本机 UI 在用 ✓
+    arr.push({ id: c.id, title: c.title, type: c.type, updatedAt: c.updatedAt, hasFile: !!c.filePath, filePath: c.filePath || null })
   })
   return { ok: true, canvases: arr, activeId: activeId, docsDir: docsDir() }
 })
@@ -41,29 +44,14 @@ harness.handle('canvas.edit', async function (args) {
 harness.handle('canvas.undo', async function (args) {
   const c = canvases.get(args && args.canvasId)
   if (!c) return err('E_NOT_FOUND', '画布不存在')
-  if (!c.history.length) return { ok: true, noop: true }
-  const rec = c.history.pop()
-  c.redoStack.push(rec)
-  c.content = rec.before
-  c.version += 1
-  c.dirty = true
-  c.updatedAt = Date.now()
-  debouncedFlush()
-  return { ok: true, content: c.content, version: c.version }
+  // 逻辑在 05-mutations 的 undoCanvas —— 与 HTTP 端点共用同一份（别在这儿另写一套）
+  return undoCanvas(c)
 })
 
 harness.handle('canvas.redo', async function (args) {
   const c = canvases.get(args && args.canvasId)
   if (!c) return err('E_NOT_FOUND', '画布不存在')
-  if (!c.redoStack.length) return { ok: true, noop: true }
-  const rec = c.redoStack.pop()
-  c.history.push(rec)
-  c.content = rec.after
-  c.version += 1
-  c.dirty = true
-  c.updatedAt = Date.now()
-  debouncedFlush()
-  return { ok: true, content: c.content, version: c.version }
+  return redoCanvas(c)
 })
 
 harness.handle('canvas.save', async function (args) {

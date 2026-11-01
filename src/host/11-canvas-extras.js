@@ -2,28 +2,6 @@
 // 依赖同作用域：docsDirBase, docsDir, canvases, createCanvasDoc, applyWrite,
 //               saveCanvas, persistMeta, nodefs, path（均由其他模块提供）
 function initCanvasExtraEndpoints(ctx, webServer) {
-  // JSON 响应辅助（与 09-http 同款，本文件自包含）
-  function json(res, data) {
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(data))
-  }
-  function error(res, status, data) {
-    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(data))
-  }
-  function readBody(req, limit) {
-    return new Promise((resolve, reject) => {
-      const chunks = []
-      let size = 0
-      req.on('data', (c) => {
-        size += c.length
-        if (limit && size > limit) { reject(new Error('文件超过大小上限')); try { req.destroy() } catch (_) {} ; return }
-        chunks.push(c)
-      })
-      req.on('end', () => resolve(Buffer.concat(chunks)))
-      req.on('error', reject)
-    })
-  }
 
   // 会话工作区目录（@ 文件选择器索引的目录）
   function sessionWorkspaceDir() {
@@ -35,7 +13,7 @@ function initCanvasExtraEndpoints(ctx, webServer) {
         const cwd = holder && holder.cwd
         if (typeof cwd === 'string' && cwd.length > 2) return cwd
       }
-    } catch (e) { console.error('[collab-canvas] session-cwd probe failed:', e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] session-cwd probe failed:', e && e.message) }
     return docsDirBase()
   }
 
@@ -55,13 +33,13 @@ function initCanvasExtraEndpoints(ctx, webServer) {
         const j = JSON.parse(nodefs.readFileSync(f, 'utf8'))
         if (Array.isArray(j.folders)) return j.folders.filter(p => typeof p === 'string' && path.isAbsolute(p))
       }
-    } catch (e) { console.error('[collab-canvas] registry config read failed:', e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] registry config read failed:', e && e.message) }
     return []
   }
   function regSaveConfig(folders) {
     try {
       nodefs.writeFileSync(REG_CONFIG_FILE(), JSON.stringify({ folders: folders }, null, 2))
-    } catch (e) { console.error('[collab-canvas] registry config write failed:', e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] registry config write failed:', e && e.message) }
   }
   function regScanFolder(folder) {
     const map = new Map()
@@ -105,7 +83,7 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       regTotal = 0
       regIndex.forEach(m => { m.forEach(arr => { regTotal += arr.length }) })
       if (changed) console.log('[collab-canvas] registry scanned', folder, '->', n, 'files')
-    } catch (e) { console.error('[collab-canvas] registry scan failed:', folder, e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] registry scan failed:', folder, e && e.message) }
   }
   const regLastSig = new Map()   // folder -> 上次索引签名（文件数+路径集），无变化的重扫静默处理
   const regRescanTimers = new Map()
@@ -120,7 +98,7 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       const w = nodefs.watch(folder, { recursive: true }, function () { regScheduleRescan(folder) })
       w.on('error', function () {})
       regWatchers.set(folder, w)
-    } catch (e) { console.error('[collab-canvas] registry watch failed:', folder, e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] registry watch failed:', folder, e && e.message) }
   }
   function regUnwatch(folder) {
     const w = regWatchers.get(folder)
@@ -147,10 +125,10 @@ function initCanvasExtraEndpoints(ctx, webServer) {
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/registry', handler: async (req, res) => {
     try {
       if (req.method === 'POST') {
-        const body = await readBody(req)
+        const body = await httpReadBody(req)
         const folders = Array.isArray(body.folders) ? body.folders.map(s => String(s).trim()).filter(Boolean) : []
         const invalid = folders.filter(f => !path.isAbsolute(f) || !nodefs.existsSync(f) || !nodefs.statSync(f).isDirectory())
-        if (invalid.length) { error(res, 400, { ok: false, error: '以下路径无效或不是文件夹: ' + invalid.join(', ') }); return }
+        if (invalid.length) { httpError(res, 400, { ok: false, error: '以下路径无效或不是文件夹: ' + invalid.join(', ') }); return }
         const uniq = Array.from(new Set(folders))
         regFolders.length = 0
         regFolders.push(...uniq)
@@ -161,11 +139,11 @@ function initCanvasExtraEndpoints(ctx, webServer) {
           regWatch(f)
           setTimeout(function () { regRescanFolder(f) }, 0)
         })
-        json(res, { ok: true, folders: regFolders.slice(), files: regTotal, note: '索引构建中' })
+        httpJson(res, { ok: true, folders: regFolders.slice(), files: regTotal, note: '索引构建中' })
         return
       }
-      json(res, { ok: true, folders: regFolders.slice(), files: regTotal })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, folders: regFolders.slice(), files: regTotal })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // GET /api/canvas/locate?name=xxx —— 按文件名查登记索引，返回真实路径
   //（rel = 会话工作区相对路径；docsRel = 画布文档目录相对路径，形如 canvas-docs/xxx.md）
@@ -189,8 +167,8 @@ function initCanvasExtraEndpoints(ctx, webServer) {
           matches.push({ path: norm, rel: rel, docsRel: docsRel })
         })
       })
-      json(res, { ok: true, name: name, matches: matches, folders: regFolders.length })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, name: name, matches: matches, folders: regFolders.length })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // GET /api/canvas/load-doc?rel=canvas-docs/xxx.md —— 把 canvas-docs 里的 md
   // 注册为话布（按标题找已有，找不到新建）并返回画布 id——即 canvas_load 的最小实现
@@ -198,9 +176,9 @@ function initCanvasExtraEndpoints(ctx, webServer) {
     try {
       const url = new URL(req.url, 'http://x')
       const rel = String(url.searchParams.get('rel') || '')
-      if (!/^canvas-docs\/[^\\/]+\.md$/i.test(rel)) { error(res, 400, { ok: false, error: '仅支持 canvas-docs/ 下的 .md 文件' }); return }
+      if (!/^canvas-docs\/[^\\/]+\.md$/i.test(rel)) { httpError(res, 400, { ok: false, error: '仅支持 canvas-docs/ 下的 .md 文件' }); return }
       const full = path.join(docsDir(), rel.slice('canvas-docs/'.length))
-      if (!nodefs.existsSync(full)) { error(res, 404, { ok: false, error: '文件不存在' }); return }
+      if (!nodefs.existsSync(full)) { httpError(res, 404, { ok: false, error: '文件不存在' }); return }
       const content = nodefs.readFileSync(full, 'utf8')
       const title = rel.split('/').pop().replace(/\.(md|markdown)$/i, '')
       let c = null
@@ -220,12 +198,12 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       if (!c) {
         c = createCanvasDoc(title)
         applyWrite(c, content, 'replace', undefined, 'human')
-        try { await saveCanvas(c) } catch (e) { console.error('[collab-canvas] load-doc save failed:', e && e.message) }
+        try { await saveCanvas(c) } catch (e) { console.httpError('[collab-canvas] load-doc save failed:', e && e.message) }
         created = true
       }
-      sessAdd(url.searchParams.get('sid'), c.id)   // 登记即记入当前会话清单
-      json(res, { ok: true, id: c.id, title: c.title, created: created })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      sessAddExclusive(url.searchParams.get('sid'), c.id)   // 登记即记入当前会话清单
+      httpJson(res, { ok: true, id: c.id, title: c.title, created: created })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // ─── 白名单：本地文档「就地」登记为话布 ───────────────────────────
   // 允许范围 = 会话工作区 ∪ 画布目录 ∪ 文件登记表里登记的文件夹。
@@ -251,23 +229,23 @@ function initCanvasExtraEndpoints(ctx, webServer) {
     try {
       const url = new URL(req.url, 'http://x')
       const raw = String(url.searchParams.get('path') || '').trim()
-      if (!raw) { error(res, 400, { ok: false, error: '缺少 path 参数' }); return }
-      if (!/\.(md|markdown|txt|text)$/i.test(raw)) { error(res, 400, { ok: false, error: '仅支持 .md/.markdown/.txt' }); return }
+      if (!raw) { httpError(res, 400, { ok: false, error: '缺少 path 参数' }); return }
+      if (!/\.(md|markdown|txt|text)$/i.test(raw)) { httpError(res, 400, { ok: false, error: '仅支持 .md/.markdown/.txt' }); return }
       const abs = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(sessionWorkspaceDir(), raw)
       if (!pathAllowedInTarget(abs)) {
-        error(res, 403, { ok: false, error: '路径不在允许范围内（会话工作区 / 画布目录 / 已登记文件夹）' })
+        httpError(res, 403, { ok: false, error: '路径不在允许范围内（会话工作区 / 画布目录 / 已登记文件夹）' })
         return
       }
-      if (!nodefs.existsSync(abs)) { error(res, 404, { ok: false, error: '文件不存在' }); return }
+      if (!nodefs.existsSync(abs)) { httpError(res, 404, { ok: false, error: '文件不存在' }); return }
       let c = null
       canvases.forEach(function (x) {
         if (!c && x.filePath) { try { if (path.resolve(x.filePath) === abs) c = x } catch (_) {} }
       })
       let created = false
       if (!c) { c = await loadFileDoc(abs); created = true }
-      sessAdd(url.searchParams.get('sid'), c.id)
-      json(res, { ok: true, id: c.id, title: c.title, filePath: c.filePath, created: created })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      sessAddExclusive(url.searchParams.get('sid'), c.id)
+      httpJson(res, { ok: true, id: c.id, title: c.title, filePath: c.filePath, created: created })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // GET /api/canvas/delete?id=xxx&sid=xxx —— 从当前会话清单移除画布；
   // 若其他会话清单仍引用该画布则只摘引用保留文件，无人引用才连 md 一起删
@@ -277,7 +255,7 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       const id = url.searchParams.get('id')
       const sid = sessSafe(url.searchParams.get('sid'))
       const c = id ? canvases.get(id) : null
-      if (!c) { error(res, 404, { ok: false, error: '画布不存在' }); return }
+      if (!c) { httpError(res, 404, { ok: false, error: '画布不存在' }); return }
       sessRemove(sid, id)
       let referenced = false
       try {
@@ -295,29 +273,29 @@ function initCanvasExtraEndpoints(ctx, webServer) {
         if (activeId === id) activeId = null
         try {
           if (c.filePath && nodefs.existsSync(c.filePath)) nodefs.unlinkSync(c.filePath)
-        } catch (e) { console.error('[collab-canvas] delete file failed:', e && e.message) }
+        } catch (e) { console.httpError('[collab-canvas] delete file failed:', e && e.message) }
         persistMeta()
       }
-      json(res, { ok: true, id: id, title: c.title, fileDeleted: !referenced })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, id: id, title: c.title, fileDeleted: !referenced })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // POST /api/canvas/import-doc?name=xxx —— 外部文档拖入/上传：复制到会话工作区
   // 的 uploads/ 文件夹（@ 文件选择器可索引到），返回相对路径供 @ 引用
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/import-doc', handler: async (req, res) => {
     try {
-      if (req.method !== 'POST') { error(res, 405, { ok: false, error: 'POST only' }); return }
+      if (req.method !== 'POST') { httpError(res, 405, { ok: false, error: 'POST only' }); return }
       const url = new URL(req.url, 'http://x')
       let name = url.searchParams.get('name') || 'doc.md'
       name = String(name).replace(/[\\/:*?"<>|\r\n]/g, '_').trim() || 'doc.md'
-      const body = await readBody(req, UPLOAD_LIMIT)
-      if (!body || !body.length) { error(res, 400, { ok: false, error: '空文件' }); return }
+      const body = await httpReadBody(req, UPLOAD_LIMIT)
+      if (!body || !body.length) { httpError(res, 400, { ok: false, error: '空文件' }); return }
       const dir = path.join(sessionWorkspaceDir(), 'uploads')
       try { nodefs.mkdirSync(dir, { recursive: true }) } catch (e) {}
       const fname = Date.now() + '-' + Math.random().toString(36).slice(2, 6) + '-' + name
       nodefs.writeFileSync(path.join(dir, fname), body)
       console.log('[collab-canvas] import-doc:', fname, body.length + 'B')
-      json(res, { ok: true, path: 'uploads/' + fname, name: name, size: body.length })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, path: 'uploads/' + fname, name: name, size: body.length })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // GET /api/canvas/open-upload?name=xxx —— 把拖入上传的文档变成/打开话布：
   // 已有同名（去掉时间戳前缀后的标题，含/不含 .md 扩展名）话布 → 直接返回其 id；
@@ -326,11 +304,11 @@ function initCanvasExtraEndpoints(ctx, webServer) {
     try {
       const url = new URL(req.url, 'http://x')
       const fname = String(url.searchParams.get('name') || '')
-      if (!/^\d{13}-[a-z0-9]{2,8}-[^\r\n\\/:"*?<>|]{1,120}$/i.test(fname)) { error(res, 400, { ok: false, error: '非法文件名' }); return }
+      if (!/^\d{13}-[a-z0-9]{2,8}-[^\r\n\\/:"*?<>|]{1,120}$/i.test(fname)) { httpError(res, 400, { ok: false, error: '非法文件名' }); return }
       const upDir = path.join(sessionWorkspaceDir(), 'uploads')
       const full = path.join(upDir, fname)
-      if (path.resolve(full).indexOf(path.resolve(upDir) + path.sep) !== 0) { error(res, 403, { ok: false, error: '非法路径' }); return }
-      if (!nodefs.existsSync(full)) { error(res, 404, { ok: false, error: '文件不存在' }); return }
+      if (path.resolve(full).indexOf(path.resolve(upDir) + path.sep) !== 0) { httpError(res, 403, { ok: false, error: '非法路径' }); return }
+      if (!nodefs.existsSync(full)) { httpError(res, 404, { ok: false, error: '文件不存在' }); return }
       const content = nodefs.readFileSync(full, 'utf8')
       const title = fname.replace(/^\d{13}-[a-z0-9]{2,8}-/i, '')
       const baseTitle = title.replace(/\.(md|markdown)$/i, '')
@@ -345,12 +323,12 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       if (!c) {
         c = createCanvasDoc(title)
         applyWrite(c, content, 'replace', undefined, 'human')
-        try { await saveCanvas(c) } catch (e) { console.error('[collab-canvas] open-upload save failed:', e && e.message) }
+        try { await saveCanvas(c) } catch (e) { console.httpError('[collab-canvas] open-upload save failed:', e && e.message) }
         created = true
       }
-      sessAdd(url.searchParams.get('sid'), c.id)   // 导入即记入当前会话清单
-      json(res, { ok: true, id: c.id, title: c.title, created: created, matched: matched })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      sessAddExclusive(url.searchParams.get('sid'), c.id)   // 导入即记入当前会话清单
+      httpJson(res, { ok: true, id: c.id, title: c.title, created: created, matched: matched })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // 画布附件与独立模块源码服务（file / docdrop.js / doclink.js）
   function canvasDocDir() {
@@ -377,10 +355,10 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       const full = path.resolve(base, rel)
       const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p)
       if (norm(full) !== norm(base) && norm(full).indexOf(norm(base) + path.sep) !== 0) {
-        error(res, 403, { ok: false, error: '非法路径' }); return
+        httpError(res, 403, { ok: false, error: '非法路径' }); return
       }
       if (!nodefs.existsSync(full) || !nodefs.statSync(full).isFile()) {
-        error(res, 404, { ok: false, error: '文件不存在' }); return
+        httpError(res, 404, { ok: false, error: '文件不存在' }); return
       }
       const ext = (full.split('.').pop() || '').toLowerCase()
       const mime = MIME_MAP[ext] || 'application/octet-stream'
@@ -394,24 +372,24 @@ function initCanvasExtraEndpoints(ctx, webServer) {
         'Cache-Control': 'no-cache',
       })
       res.end(buf)
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // POST /api/canvas/upload?name=xxx —— 画布附件上传（图片粘贴等），存 canvas-docs/attachments/
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/upload', handler: async (req, res) => {
     try {
-      if (req.method !== 'POST') { error(res, 405, { ok: false, error: 'POST only' }); return }
+      if (req.method !== 'POST') { httpError(res, 405, { ok: false, error: 'POST only' }); return }
       const url = new URL(req.url, 'http://x')
       let name = url.searchParams.get('name') || 'file.bin'
       name = String(name).replace(/[\\/:*?"<>|\r\n]/g, '_').trim() || 'file.bin'
       const body = await readRawBody(req, UPLOAD_LIMIT)
-      if (!body || !body.length) { error(res, 400, { ok: false, error: '空文件' }); return }
+      if (!body || !body.length) { httpError(res, 400, { ok: false, error: '空文件' }); return }
       const dir = path.join(canvasDocDir(), 'attachments')
       try { nodefs.mkdirSync(dir, { recursive: true }) } catch (e) {}
       const fname = Date.now() + '-' + name
       nodefs.writeFileSync(path.join(dir, fname), body)
       console.log('[collab-canvas] upload:', fname, body.length + 'B')
-      json(res, { ok: true, path: 'attachments/' + fname, name: name, size: body.length })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, path: 'attachments/' + fname, name: name, size: body.length })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   function readRawBody(req, limit) {
     return new Promise((resolve, reject) => {
@@ -426,18 +404,20 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       req.on('error', reject)
     })
   }
-  // GET /api/canvas/docdrop.js、doclink.js、selref.js —— 提供独立客户端模块源码
+  // GET /api/canvas/selref.js、viewer-md.js、doc-model.js —— 提供独立客户端模块源码
   //（client 入口动态挂载；每次读盘，改完刷新页面即生效，无需重启）。
   // 注意：运行时路径相对于部署目录的 dist/host.js 解析（../lib/…）
   // ⚠️ 这个名单是服务端常量，新增一项需要重启 dsh web 才认得出该端点。
-  ;['docdrop.js', 'doclink.js', 'selref.js'].forEach(function (modFile) {
+  // ⚠️ docdrop.js / doclink.js 于 2026-10-11 随画布面板一起删除（面板专属 ✗）。
+  // ⚠️ doc-model.js 于 2026-10-15 加入（A4：按块转换要用它 ✓ 必须排在 viewer-md 之前 ✓）
+  ;['ccv-logic.js', 'doc-model.js', 'selref.js', 'viewer-md.js'].forEach(function (modFile) {
     ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/' + modFile, handler: async (req, res) => {
       try {
         const srcPath = new URL('../lib/' + modFile, import.meta.url)
         const src = nodefs.readFileSync(srcPath, 'utf8')
         res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' })
         res.end(src)
-      } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
     }}))
   })
 
@@ -450,6 +430,6 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       }
       regSeedIfEmpty()
       console.log('[collab-canvas] file registry:', regFolders.length ? regFolders.join(' | ') : '(未登记文件夹)', '索引', regTotal, '文件')
-    } catch (e) { console.error('[collab-canvas] registry init failed:', e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] registry init failed:', e && e.message) }
   }, 0)
 }

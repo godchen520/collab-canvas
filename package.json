@@ -1,6 +1,6 @@
 {
   "name": "collab-canvas",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "DSH 协作画布插件（话布）：人和 AI 共写的 Markdown 文档面。AI 通过 canvas_* 工具读写，带版本冲突检测、可撤销历史与文件持久化。",
   "type": "module",
   "license": "MIT",
@@ -26,8 +26,9 @@
     "test": "node tools/test-all.cjs",
     "test:verbose": "node tools/test-all.cjs --verbose",
     "build": "node tools/build.cjs",
-    "deploy": "node tools/deploy.cjs",
-    "deploy:check": "node tools/deploy.cjs --check",
+    "deploy": "node tools/deploy-all.cjs",
+    "deploy:one": "node tools/deploy.cjs",
+    "deploy:check": "node tools/deploy-all.cjs --check",
     "verify": "node tools/verify-all.cjs"
   },
   "main": "dist/host.js",

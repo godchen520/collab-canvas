@@ -29,6 +29,36 @@ function slugify(title) {
 }
 function err(code, message) { return { ok: false, error: { code: code, message: message } } }
 
+// ── HTTP 响应辅助（2026-10-26 重构 P2：从 09-http / 11-extras 各一份合并到这里）──
+//   原来的问题是两个文件各写一份同名函数 ✗ 改一处忘一处就行为不一致 ✓
+//   注意两者的**语义差异**（合并时必须保留 ✓）：
+//     · httpReadBody(req)      → 返回 **Buffer**（上传要用原始字节 ✓ 支持大小上限）
+//     · httpReadJson(req)      → 返回**解析后的对象**（普通 RPC 用 ✓ 解析失败抛错）
+function httpJson(res, data) {
+  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(data))
+}
+function httpError(res, status, data) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(data))
+}
+function httpReadBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (c) => {
+      size += c.length
+      if (limit && size > limit) { reject(new Error('文件超过大小上限')); try { req.destroy() } catch (_) {} ; return }
+      chunks.push(c)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', reject)
+  })
+}
+function httpReadJson(req) {
+  return httpReadBody(req).then((buf) => JSON.parse(buf.toString('utf8')))
+}
+
     // ==================== 03-state.js ====================
 // 画布注册表状态 + 存储根多级探测
 var canvases = new Map()   // id -> {id,title,type,content,version,filePath,history[],redoStack[],dirty,updatedAt}
@@ -175,8 +205,22 @@ async function saveCanvas(c, filePath) {
 }
 
 async function persistMeta() {
-  const payload = JSON.stringify({ activeId: activeId, rootOverride: rootOverride, canvases: Array.from(canvases.values()).map(function (c) {
-    return { id: c.id, title: c.title, type: c.type, filePath: c.filePath }
+  const payload = JSON.stringify({ activeId: activeId, rootOverride: rootOverride, canvases: Array.from(canvases.values()).filter(function (c) {
+    // ⚠️ 选区编辑区（type='scratch'）**不落盘**（2026-10-11 加）。
+    //   它是一次性对象：拼接成功后立刻销毁；重启即消失。
+    //   规格见 canvas-docs/话布选区编辑区方案.md 第四、九节。
+    //   一旦写进 meta 就不再"一次性"了 —— 实施步骤 6 专门验这条。
+    return c && c.type !== 'scratch'
+  }).map(function (c) {
+    // ⚠️ version 必须存 —— 2026-10-04 补。
+    //   它原本不存，于是 restore 时一律 `version: 1`，后果有两个：
+    //     ① **所有靠版本号的保护在重启后失效**：草稿基准校验（草稿记的 base=1、
+    //        服务端重启后也是 1 → 误判成"基准相符" → 把过期草稿写回去覆盖新内容）、
+    //        并发冲突校验（knownVer 走的是同一套版本号）都形同虚设；
+    //     ② **事后无法追溯**：撤销每次都会把版本 +1，本来能数出"被撤了几次"，
+    //        重启一重置就再也看不出来（2026-10-04 那次误判就是这么丢的线索 ——
+    //        把"主人点了 3 次撤销"误判成了"面板覆盖"）。
+    return { id: c.id, title: c.title, type: c.type, filePath: c.filePath, version: c.version }
   }) }, null, 2)
   // 同步写所有候选位置：冷启动时无论读到哪一份都带 rootOverride
   const targets = metaTargets()
@@ -212,8 +256,49 @@ async function flushDirty() {
 const debouncedFlush = ctx.debounce(function () { flushDirty() }, 1500)
 ctx.effect(function () { return function () { flushDirty() } }, 'final-flush')
 
+// ── 每轮结束落一次盘（2026-10-14 加）─────────────────────────────
+// 为什么：AI 用 canvas_write 写画布走的是 applyWrite → debouncedFlush（**1.5 秒** ✗），
+//   进程/会话在那一秒半里重启就丢 ✗。而"一轮结束"是很自然的检查点 ✓
+//   —— 把暴露窗口从"几轮"缩到"一轮之内" ✓
+// 主人 2026-10-14 的现场：AI 追加的附录因会话重启全丢 ✗（根因是 restore 覆盖，
+//   但"更早落盘"能把这个坑填得更死 ✓ 两道一起上 ✓）
+//
+// ⚠️ 挂 **ctx.root**，不是插件自己的 ctx —— 作用域树上插件 ctx 是 agent 作用域的
+//    **兄弟分支** ✗ 事件只往上冒到祖先 ✓（2026-10-11 在拼接那边踩过这个坑 ✓）
+try {
+  var flushEvCtx = (ctx && ctx.root) ? ctx.root : ctx
+  if (flushEvCtx && typeof flushEvCtx.on === 'function') {
+    flushEvCtx.on('agent/turn-stopping', function () { try { flushDirty() } catch (_) {} })
+    flushEvCtx.on('session/event', function (session, event) {
+      try { if (event && event.type === 'turn/end') flushDirty() } catch (_) {}
+    })
+    console.log('[collab-canvas]', 'turn-end flush registered')
+  }
+} catch (e) { console.error('[collab-canvas] turn-end flush 注册失败:', e && e.message) }
+
+// [[CCV-RESTORE-BEGIN]] —— 到 END 之间是「启动/重载时恢复画布」的全部代码。
+// tools/test-host-restore.cjs 会把这一段切出来跑（标记没了它立刻报错，不会悄悄测过期副本）。
 async function restore() {
   if (!fs) { console.error('[collab-canvas]', 'fs service unavailable — persistence disabled'); return }
+
+  // 🔴🔴 **先把内存里没落盘的改动写下去，再读文件**（2026-10-14 加，修数据丢失）
+  //
+  // 为什么必须放在最前面：restore() 会在**同一个进程里被重跑** ——
+  //   会话重启 / 插件重载都会让它再跑一次 ✓ 而那时 canvases 里**还留着**上一轮的
+  //   内容（可能比文件新 ✓ 因为落盘是 1.5 秒防抖的 ✗）。
+  //   它下面无条件 `content = 读文件` + `canvases.set(...)` ——
+  //   等于**拿旧文件覆盖新内存** ✗✗
+  //
+  // 主人 2026-10-14 的现场（别的项目里）：
+  //   AI 用 canvas_write 追加了附录 A/B/C，几轮之后会话重启 →
+  //   插件重新初始化 → restore 从文件读回 9752 字节的**原始版** →
+  //   覆盖掉内存里的新版 → **附录全丢** ✗ 而且 dirty 被设成 false，
+  //   连"还没存"这件事都看不出来了 ✗
+  //   同一个根因还造成了"话布登记被重置"（meta 也没落盘 ✓）
+  //
+  // 冷启动时内存是空的 → 这一步是空操作 ✓ 不会有副作用 ✓
+  try { await flushDirty() } catch (e) { console.error('[collab-canvas] restore 前落盘失败:', e && e.message) }
+
   const metaCandidates = metaTargets()
   const metas = []
   for (const mp of metaCandidates) {
@@ -249,9 +334,23 @@ async function restore() {
         try { content = await fs.readText(await fs.resolve(m.filePath)) }
         catch (e) { console.error('[collab-canvas] restore miss:', m.filePath, e.message); continue }
       }
+      // 🔴 **绝不拿文件覆盖"内存里有未保存改动"的那一份**（2026-10-14 加）
+      //   上面已经 flushDirty 过一次 ✓ 正常情况这里不会命中；
+      //   但落盘可能失败（OneDrive 占用、磁盘满、权限 ✗）—— 那时 dirty 还是 true ✓
+      //   这份内存内容比文件新 ✓ 用文件覆盖它就是**丢数据** ✗✗
+      //   所以：保留内存那份（内容/历史/脏标记都不动），只把 meta 里能补的补上 ✓
+      const live = canvases.get(m.id)
+      if (live && live.dirty) {
+        if (m.filePath && !live.filePath) live.filePath = m.filePath
+        if (typeof m.version === 'number' && m.version > live.version) live.version = m.version
+        console.error('[collab-canvas] restore: 保留内存里未落盘的改动（不覆盖）', m.id, m.title)
+        continue
+      }
       canvases.set(m.id, {
         id: m.id, title: m.title, type: m.type || 'document', content: content,
-        version: 1, filePath: m.filePath || null, history: [], redoStack: [],
+        // 版本号跟着 meta 一起存（见 persistMeta 的注释）：拿不到才退回 1
+        version: (typeof m.version === 'number' && m.version > 0) ? m.version : 1,
+        filePath: m.filePath || null, history: [], redoStack: [],
         dirty: false, updatedAt: Date.now(),
       })
     }
@@ -268,15 +367,80 @@ async function restore() {
     console.log('[collab-canvas]', 'restore failed:', e.message)
   }
 }
+// [[CCV-RESTORE-END]]
 
     // ==================== 05-mutations.js ====================
 // 共享变更逻辑（RPC 与模型工具共用同一套历史栈）
+// [[CCV-UNDO-BEGIN]] —— 到 END 之间是「历史栈 + 撤销/重做」的全部代码，
+// tools/test-host-undo.cjs 会把这一段切出来跑（标记没了它立刻报错，不会悄悄测过期副本）。
 var HISTORY_MAX = 50
+// 连续编辑合并的时间窗（见 pushHistory 里的说明）
+var HISTORY_MERGE_MS = 60 * 1000
 function pushHistory(c, before, after, source, version) {
+  // ★ 合并连续编辑（2026-10-11 加）—— **自动保存的前提** ✓
+  //   为什么要它：接了自动保存之后，停手 1.5 秒就可能写一次 ✓ 若每次都落一条历史 ✗
+  //   撤销栈会被冲爆（按一次撤销只退一小步 ✗ 主人会以为"撤不动"✗）。
+  //   成熟文档软件都做这件事（Google Docs 把短时间内的连续编辑合成一个版本 ✓）。
+  //
+  //   判据三条，缺一不可：
+  //     ① 来源相同 —— AI 改的与人改的不该合成一步 ✗（撤销时想分清是谁改的 ✓）
+  //     ② 时间相近 —— 隔太久的两段编辑该分开，否则撤销粒度太粗 ✗
+  //     ③ **首尾相接**：新一次的 before === 上一条的 after ✓✓ —— 这条最硬，
+  //        它证明中间**没有任何别的改动**（撤销 / 重做 / 别处的写入都会破坏它 ✓）
+  var last = c.history.length ? c.history[c.history.length - 1] : null
+  if (last && last.source === source
+    && (Date.now() - (last.at || 0)) < HISTORY_MERGE_MS
+    && last.after === before) {
+    last.after = after            // 终点往后延 ✓ 起点不动 ✓
+    last.at = Date.now()
+    last.version = version
+    c.redoStack.length = 0
+    return
+  }
   c.history.push({ opId: 'op-' + Date.now().toString(36) + '-' + (++idSeq), source: source, before: before, after: after, at: Date.now(), version: version })
   if (c.history.length > HISTORY_MAX) c.history.shift()
   c.redoStack.length = 0
 }
+
+// ═══ 撤销 / 重做 ══════════════════════════════════════════════════
+// 为什么抽成函数：包级 RPC（06-rpc）和 HTTP 端点（09-http）都要用它。
+// 两处各写一套的话，日后改一处漏一处 —— meta 落点那次故障就是这么来的
+// （persistMeta 与 restore 各持一份候选清单，DSH 升级后两者都没包含真正的存储根）。
+//
+// ⚠️ 只回退 content，**不往 history 里塞新条目**：否则「撤销」本身变成一步可撤销的操作，
+//    按一次栈也跟着长，用户会觉得撤不回去（撤了 A，栈顶又变成刚才那次撤销）。
+// ⚠️ version 必须 +1：客户端靠 knownVer 做并发保护，版本不动的话它下一次写入
+//    还是拿着旧版本号 → 被自己挡下或误判成冲突。返回新版本号，客户端据此同步。
+// ⚠️ dirty + debouncedFlush：撤销的结果要落盘，否则刷新后撤销白做。
+function undoCanvas(c) {
+  if (!c) return { ok: false, error: '画布不存在' }
+  if (!c.history.length) return { ok: true, noop: true, content: c.content, version: c.version }
+  const rec = c.history.pop()
+  c.redoStack.push(rec)
+  c.content = rec.before
+  c.version += 1
+  c.dirty = true
+  c.updatedAt = Date.now()
+  debouncedFlush()
+  return { ok: true, content: c.content, version: c.version, source: rec.source || null, at: rec.at || null }
+}
+function redoCanvas(c) {
+  if (!c) return { ok: false, error: '画布不存在' }
+  if (!c.redoStack.length) return { ok: true, noop: true, content: c.content, version: c.version }
+  const rec = c.redoStack.pop()
+  c.history.push(rec)
+  c.content = rec.after
+  c.version += 1
+  c.dirty = true
+  c.updatedAt = Date.now()
+  debouncedFlush()
+  return { ok: true, content: c.content, version: c.version, source: rec.source || null, at: rec.at || null }
+}
+// 给界面用：按钮该不该灰掉。调用方在 read/write/undo/redo 的响应里带上它。
+function canUndo(c) { return !!(c && c.history && c.history.length) }
+function canRedo(c) { return !!(c && c.redoStack && c.redoStack.length) }
+// [[CCV-UNDO-END]]
+
 
 function createCanvasDoc(title) {
   // 标题净化：AI/导入可能把 "xxx.md" 当标题传入，canvas_save 落盘时会变成
@@ -289,6 +453,64 @@ function createCanvasDoc(title) {
   persistMeta()
   debouncedFlush()
   return c
+}
+
+// ─── 选区编辑区（scratch 画布）─────────────────────────────────────
+// 规格：canvas-docs/话布选区编辑区方案.md（第三、四节）
+//
+// 形态：一个**临时画布**，type='scratch'。借画布的壳只为两件事 ——
+//   ① 给 AI 一条**现成的写入通道**（canvas_write，不用给它造新工具）
+//   ② 白得一套版本号与历史栈（撤销直接可用）
+// 三条约束（第九节「明确不做」）：
+//   · 不进任何清单（list 端点过滤 type==='scratch'）
+//   · 不写进 meta（persistMeta 过滤）—— 一次性对象，重启即消失
+//   · 不给人看、不给人改（没有界面）
+//
+// ⚠️ 刻意**不调用** persistMeta / debouncedFlush —— 它是内存对象，
+//    一旦落盘就不再"一次性"了（步骤 6 专门验这条）。
+let scratchSeq = 0
+function createScratchCanvas(b) {
+  b = b || {}
+  const id = 'scratch-' + Date.now().toString(36) + '-' + (++scratchSeq)
+  const quote = String(b.quote || '')
+  const c = {
+    id: id, title: '选区片段', type: 'scratch',
+    content: quote, version: 1, filePath: null,
+    history: [], redoStack: [], dirty: false, updatedAt: Date.now(),
+    // 绑定：主文档 + 位置 + 指纹。位置由 host 侧按**引文与序数**解析
+    //（与「位置主动注入」用同一套算法 —— 渲染前后出现顺序不变，口径一致）。
+    scratch: {
+      docId: b.docId || null,
+      docPath: b.docPath || null,
+      offset: (typeof b.offset === 'number') ? b.offset : -1,
+      length: (typeof b.length === 'number' && b.length >= 0) ? b.length : quote.length,
+      docVersion: (typeof b.docVersion === 'number') ? b.docVersion : 0,
+      ordinal: (typeof b.ordinal === 'number') ? b.ordinal : 0,
+      dupCount: (typeof b.dupCount === 'number') ? b.dupCount : 0,
+      // 哪一笔上报建的这个区 —— 注入时靠它把「这一轮引用到的」认出来
+      pinCode: (typeof b.pinCode === 'number') ? b.pinCode : 0,
+      // ⚠️ **建区时的原始引文**（2026-10-11 加，拼接要用）。
+      //   为什么必须单独留一份：编辑区的内容会被 AI 改掉 ✗，而拼接前要校验
+      //   "主文档 [偏移, 偏移+长度) 那一段还是不是原来那段" —— 拿被改过的内容去比
+      //   必然比不过 ✗。
+      origQuote: quote,
+      spliced: false,
+      at: Date.now(),
+    },
+  }
+  canvases.set(id, c)
+  return c
+}
+
+// 找某个 pin 建出来的编辑区（没有就返回 null）
+function scratchForPin(pinCode) {
+  if (!pinCode) return null
+  let hit = null
+  canvases.forEach(function (c) {
+    if (hit) return
+    if (c && c.type === 'scratch' && c.scratch && c.scratch.pinCode === pinCode) hit = c
+  })
+  return hit
 }
 
 // ═══ AI 改动记录（喂给画布端的「跳过去给我看」）══════════════════════
@@ -467,7 +689,10 @@ if (typeof harness !== 'undefined') {
 harness.handle('canvas.list', async function () {
   const arr = []
   canvases.forEach(function (c) {
-    arr.push({ id: c.id, title: c.title, type: c.type, updatedAt: c.updatedAt, hasFile: !!c.filePath })
+    // ★ 2026-10-22：补上 filePath ✓（主人要在右侧栏「话布」清单里【点一下跳到文档】✓）
+    //   原来只回 hasFile ✗ → 前端拿不到路径 → 那个清单只能是死文字 ✓
+    //   ⚠️ 没必要藏它：它本来就是本机路径 ✓ 而这个接口只有本机 UI 在用 ✓
+    arr.push({ id: c.id, title: c.title, type: c.type, updatedAt: c.updatedAt, hasFile: !!c.filePath, filePath: c.filePath || null })
   })
   return { ok: true, canvases: arr, activeId: activeId, docsDir: docsDir() }
 })
@@ -504,29 +729,14 @@ harness.handle('canvas.edit', async function (args) {
 harness.handle('canvas.undo', async function (args) {
   const c = canvases.get(args && args.canvasId)
   if (!c) return err('E_NOT_FOUND', '画布不存在')
-  if (!c.history.length) return { ok: true, noop: true }
-  const rec = c.history.pop()
-  c.redoStack.push(rec)
-  c.content = rec.before
-  c.version += 1
-  c.dirty = true
-  c.updatedAt = Date.now()
-  debouncedFlush()
-  return { ok: true, content: c.content, version: c.version }
+  // 逻辑在 05-mutations 的 undoCanvas —— 与 HTTP 端点共用同一份（别在这儿另写一套）
+  return undoCanvas(c)
 })
 
 harness.handle('canvas.redo', async function (args) {
   const c = canvases.get(args && args.canvasId)
   if (!c) return err('E_NOT_FOUND', '画布不存在')
-  if (!c.redoStack.length) return { ok: true, noop: true }
-  const rec = c.redoStack.pop()
-  c.history.push(rec)
-  c.content = rec.after
-  c.version += 1
-  c.dirty = true
-  c.updatedAt = Date.now()
-  debouncedFlush()
-  return { ok: true, content: c.content, version: c.version }
+  return redoCanvas(c)
 })
 
 harness.handle('canvas.save', async function (args) {
@@ -614,7 +824,7 @@ ctx.tools.register(defineTool({
     if (!title) return toolOutput(err('E_BAD_ARGS', 'title 必须为非空字符串'))
     const c = createCanvasDoc(title)
     // 会话清单登记：AI 建的画布归入浏览器最近在看的会话清单（面板轮询可见）
-    try { sessAdd(lastBrowserSid, c.id) } catch (_) {}
+    try { sessAddExclusive(lastBrowserSid, c.id) } catch (_) {}
     return toolOutput({ ok: true, canvasId: c.id, title: title, hint: '已创建并设为活跃画布，接着可用 canvas_write 写入内容。本轮结束前记得调用 present 声明 "canvas-docs/' + slugify(c.title) + '.md"——它会在回复末尾生成一张可点卡片，点开就是话布面板。' })
   },
 }))
@@ -695,7 +905,7 @@ ctx.tools.register(defineTool({
     try {
       const c = await loadFileDoc(p, args && args.title)
       // 会话清单登记：AI 加载的文档归入浏览器最近在看的会话清单（面板轮询可见）
-      try { sessAdd(lastBrowserSid, c.id) } catch (_) {}
+      try { sessAddExclusive(lastBrowserSid, c.id) } catch (_) {}
       return toolOutput({ ok: true, canvasId: c.id, title: c.title, chars: c.content.length, hint: '已加载为画布并设为活跃。' })
     } catch (e) {
       return toolOutput(err(e.message.indexOf('ENOENT') >= 0 ? 'E_NOT_FOUND' : 'E_IO', '读取失败：' + e.message))
@@ -961,6 +1171,36 @@ function sessState(sid) {
   }
   return sessStore.get(sid)
 }
+// ★ 2026-10-24：分组改成【唯一归属】（一篇文档只属于一个会话）★
+//   事故（主人现场）：「我拖动换组怎么成这样了」
+//   根因：sessAdd 只往新组**追加**，从不把文档从旧组摘掉 ✗
+//     → 同一篇文档同时挂在好几个 .json 里 ✓
+//     → 界面按"先遇到的组"显示它 ✗ → 它跑到没预期的组里 / 拖走以后旧组那份还在 ✓
+//   现在：登记到某组时，顺手把它从**其它所有组**里摘掉 ✓
+//   代价：要读一遍 .json（21 个，实测 11~16ms ✓）—— 只在打开/新建文档时发生 ✓
+function sessAddExclusive(sid, id) {
+  // ⚠️ 没有会话键、或键就是历史兜底桶 'default' → **不登记** ✓
+  //   别再把文档塞进那个假会话里 ✗（2026-10-24 那批就是这么进去的 ✓）
+  if (!sid || String(sid) === 'default') return
+  const target = sessSafe(sid)
+  // ① 先从其它组里摘掉 ✓（不碰目标组 ✓）
+  let files = []
+  try { files = nodefs.readdirSync(sessDirPath()).filter(f => /\.json$/i.test(f)) } catch (_) {}
+  for (const f of files) {
+    const key = String(f).replace(/\.json$/i, '')
+    if (key === target) continue                    // 目标组不动 ✓
+    const fp = joinPath(sessDirPath(), f)
+    let j = null
+    try { j = JSON.parse(nodefs.readFileSync(fp, 'utf8')) } catch (_) { continue }
+    if (!j || !Array.isArray(j.ids) || j.ids.indexOf(id) < 0) continue
+    j.ids = j.ids.filter(x => x !== id)
+    const nextActive = (j.activeId === id) ? (j.ids[0] || null) : (j.activeId || null)
+    try { nodefs.writeFileSync(fp, JSON.stringify({ activeId: nextActive, ids: j.ids }, null, 2)) } catch (_) {}
+    sessStore.delete(key)
+  }
+  // ② 再登记到目标组 ✓
+  sessAdd(sid, id)
+}
 function sessAdd(sid, id) {
   const st = sessState(sid)
   if (st.ids.indexOf(id) < 0) { st.ids.push(id); sessPersist(sid, st) }
@@ -974,27 +1214,9 @@ function sessRemove(sid, id) {
 }
 
 function initCanvasHttpEndpoints(ctx, webServer) {
-  // JSON 响应辅助
-  function json(res, data) {
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(data))
-  }
-  function error(res, status, data) {
-    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(data))
-  }
-  // 解析 POST body 为 JSON
-  function readBody(req) {
-    return new Promise((resolve, reject) => {
-      const chunks = []
-      req.on('data', (c) => chunks.push(c))
-      req.on('end', () => {
-        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))) }
-        catch (e) { reject(new Error('Invalid JSON')) }
-      })
-      req.on('error', reject)
-    })
-  }
+  // HTTP 响应辅助：2026-10-26 重构 P2 起统一由 01-utils.js 提供
+  //   httpJson / httpError / httpReadBody(Buffer) / httpReadJson(解析对象)
+  //   原来是本文件与 11-canvas-extras 各写一份 ✗ 语义还不完全一致（Buffer vs JSON）
   // GET /api/canvas/list?sid=xxx —— 只返回该会话清单里的画布
   //                      ?scope=all —— 返回全部画布（跨会话）。客户端做「标题 → 可点链接」
   //                                    匹配时用：会话清单只含「本会话开过/建过的」，
@@ -1006,26 +1228,128 @@ function initCanvasHttpEndpoints(ctx, webServer) {
     const url = new URL(req.url, 'http://x')
     if (url.searchParams.get('scope') === 'all') {
       const all = []
-      canvases.forEach((c) => all.push({ id: c.id, title: c.title, version: c.version, path: canvasMdPath(c) }))
-      json(res, { ok: true, canvases: all, activeId: activeId, scope: 'all' })
+      // ⚠️ 选区编辑区（type='scratch'）**不进任何清单**（2026-10-11 加）。
+      //   它不是给人看的，是 AI 的工作台（规格第九节「明确不做」：不加分组、不加行）。
+      canvases.forEach((c) => { if (c && c.type !== 'scratch') all.push({ id: c.id, title: c.title, version: c.version, path: canvasMdPath(c) }) })
+      httpJson(res, { ok: true, canvases: all, activeId: activeId, scope: 'all' })
+      return
+    }
+    // ★ ?scope=groups —— 按【会话】分组（2026-10-24 主人要求）★
+    //   为什么新增一个 scope 而不是改老的两个：
+    //     老的 scope=all / scope=sid 都有人在用（客户端做标题链接、会话清单）✗
+    //     改它们的返回形状 = 静默弄坏别处 ✓ 所以只**新增**一个分支 ✓
+    //   数据来源：canvas-docs/.sessions/<sid>.json 里的 { activeId, ids } ✓
+    //     —— 这份归属关系早就有（09-http.js 顶部那套 sessState），
+    //        只是一直没有"把全部会话一起返回"的接口 ✓
+    //   返回：
+    //     groups   [{ sid, activeId, ids: [...] }]   按 .json 的修改时间**倒序**（最近用过的在前）
+    //     canvases 全量元数据（id/title/path/updatedAt），客户端按 id 拼装
+    //   规则：
+    //     · 跳过 type='scratch' ✓（AI 工作台，不进任何清单 ✓）
+    //     · 跳过 ids 全都不存在的空组 ✓（不显示空会话 ✓）
+    if (url.searchParams.get('scope') === 'groups') {
+      const dir = sessDirPath()
+      let files = []
+      try { files = nodefs.readdirSync(dir).filter((f) => /\.json$/i.test(f)) } catch (_) {}
+      // ① 先全部读出来 ✓
+      const entries = []
+      for (const f of files) {
+        let mt = 0
+        let j = null
+        try {
+          mt = nodefs.statSync(joinPath(dir, f)).mtimeMs || 0
+          j = JSON.parse(nodefs.readFileSync(joinPath(dir, f), 'utf8'))
+        } catch (_) { continue }
+        if (!j || !Array.isArray(j.ids)) continue
+        entries.push({ f, key: String(f).replace(/\.json$/i, ''), mt, j, fp: joinPath(dir, f) })
+      }
+      // ② ★ 归一：每篇文档只留【一个】归属，并写回磁盘（2026-10-24）★
+      //   主人症状：「我移动文档改分组，怎么乱变分组」
+      //   根因（实测）：25 篇里 10 篇同时挂在多个组 ✗（有一篇挂了 5 个组 ✓）
+      //     而我上一版是**按文件修改时间去决定归属** ✗
+      //     → 每拖动一次，目标文件的时间戳变新 ✓
+      //     → 下一次读，其它重复文档的归属也跟着变 ✓ → 界面"乱变"✓✓
+      //   修法：在**服务端**把重复彻底收敛掉 ✓ 规则稳定、与时间无关：
+      //     真会话键优先（session-…）→ 其次键名升序（确定性 ✓ 不随写入漂移 ✓）
+      //     归谁就写回磁盘：从其它组的 ids 里摘掉 ✓ 以后再也不重复 ✓
+      const ranked = entries.slice().sort((a, b) => {
+        const ar = /^session-/.test(a.key) ? 1 : 0
+        const br = /^session-/.test(b.key) ? 1 : 0
+        if (ar !== br) return br - ar                 // 真会话优先 ✓
+        return a.key < b.key ? -1 : (a.key > b.key ? 1 : 0)   // 其余按键名 ✓ 稳定 ✓
+      })
+      const ownerOf = {}
+      for (const e of ranked) {
+        for (const id of e.j.ids) { if (!ownerOf[id]) ownerOf[id] = e.key }
+      }
+      let normalized = 0
+      for (const e of entries) {
+        const keep = e.j.ids.filter((id) => ownerOf[id] === e.key)
+        if (keep.length === e.j.ids.length) continue
+        const nextActive = (e.j.activeId && keep.indexOf(e.j.activeId) >= 0) ? e.j.activeId : (keep[0] || null)
+        try { nodefs.writeFileSync(e.fp, JSON.stringify({ activeId: nextActive, ids: keep }, null, 2)) } catch (_) {}
+        sessStore.delete(e.key)
+        e.j = { activeId: nextActive, ids: keep }
+        normalized++
+      }
+      if (normalized) {
+        console.log('[collab-canvas] 分组归一：' + normalized + ' 个组的重复归属已收敛（每篇文档只留一个归属）')
+      }
+      // ③ 组装分组（顺序只影响客户端默认排序 ✓ 客户端会自己按更新时间和当前会话重排 ✓）
+      const withTime = []
+      for (const e of entries) {
+        const ids = e.j.ids.filter((id) => {
+          const c = id ? canvases.get(id) : null
+          return !!(c && c.type !== 'scratch')
+        })
+        if (!ids.length) continue          // 空组不返回 ✓
+        withTime.push({ mtime: e.mt, g: { sid: e.key, activeId: e.j.activeId || null, ids } })
+      }
+      withTime.sort((a, b) => b.mtime - a.mtime)
+      const groupsOut = withTime.map((x) => x.g)
+      const all = []
+      canvases.forEach((c) => {
+        if (!c || c.type === 'scratch') return
+        all.push({ id: c.id, title: c.title, version: c.version, path: canvasMdPath(c), updatedAt: c.updatedAt || 0 })
+      })
+      httpJson(res, {
+        ok: true,
+        scope: 'groups',
+        // real: 这个键是不是【真会话 id】（session-… 形式）。
+        //   2026-10-24 之前客户端用的是 hash(会话名) 当键 ✗ → 那些组查不到会话名 ✓
+        //   客户端会拿 hash(会话名) 反着撞一遍，能撞上的就当那个会话 ✓（见客户端注释）
+        groups: groupsOut.map((g) => Object.assign({ real: /^session-/.test(g.sid) }, g)),
+        canvases: all,
+        activeId: activeId,
+      })
       return
     }
     const sid = sessSafe(url.searchParams.get('sid'))
     lastBrowserSid = sid
     const st = sessState(sid)
     const arr = []
-    st.ids.forEach((id) => { const c = canvases.get(id); if (c) arr.push({ id: c.id, title: c.title, version: c.version, path: canvasMdPath(c) }) })
-    json(res, { ok: true, canvases: arr, activeId: st.activeId })
+    st.ids.forEach((id) => { const c = canvases.get(id); if (c && c.type !== 'scratch') arr.push({ id: c.id, title: c.title, version: c.version, path: canvasMdPath(c) }) })
+    httpJson(res, { ok: true, canvases: arr, activeId: st.activeId })
   }}))
   // GET /api/canvas/read?id=xxx —— 打开过就记入该会话清单
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/read', handler: async (req, res) => {
     const url = new URL(req.url, 'http://x')
     const id = url.searchParams.get('id')
     const c = id ? canvases.get(id) : (activeId ? canvases.get(activeId) : null)
-    if (!c) { error(res, 404, { ok: false, error: '画布不存在' }); return }
-    sessAdd(url.searchParams.get('sid'), c.id)
-    lastBrowserSid = sessSafe(url.searchParams.get('sid'))
-    json(res, { ok: true, id: c.id, title: c.title, content: c.content, version: c.version, path: canvasMdPath(c) })
+    if (!c) { httpError(res, 404, { ok: false, error: '画布不存在' }); return }
+    // ★ 2026-10-24 事故防线 ★
+    //   「打开的文档都跑到旧记录.default 里去了，打开一个进去一个」
+    //   根因：查看器那两处请求**没带 sid** ✗ → sessSafe(null) 退成 'default' ✗
+    //     → 每打开一篇就默默堆进 default ✓（和 12 篇老文档混在一起 ✓）
+    //   客户端已修（补 sid）✓ 这里再加一道：
+    //     **sid 没带就别登记** ✓ —— 宁可让它落在「未归属」（看得见 ✓）
+    //     也不要静默塞进一个假会话 ✓
+    const sidRaw = url.searchParams.get('sid')
+    if (sidRaw) {
+      sessAddExclusive(sidRaw, c.id)
+      lastBrowserSid = sessSafe(sidRaw)
+    }
+    httpJson(res, { ok: true, id: c.id, title: c.title, content: c.content, version: c.version, path: canvasMdPath(c), canUndo: canUndo(c), canRedo: canRedo(c) })
   }}))
   // GET /api/canvas/changes?since=N —— 画布端轮询「AI 刚改了哪儿」
   // 为什么用轮询而不是推送：客户端已经有现成的取数习惯（读文档、报日志都是普通请求），
@@ -1036,9 +1360,9 @@ function initCanvasHttpEndpoints(ctx, webServer) {
     const url = new URL(req.url, 'http://x')
     const raw = url.searchParams.get('since')
     const since = (raw === null || raw === '') ? 0 : parseInt(raw, 10)
-    if (isNaN(since)) { error(res, 400, { ok: false, error: 'since 必须是数字' }); return }
+    if (isNaN(since)) { httpError(res, 400, { ok: false, error: 'since 必须是数字' }); return }
     const out = aiChanges.filter((x) => x.seq > since)
-    json(res, { ok: true, latest: aiChangeSeq, changes: out })
+    httpJson(res, { ok: true, latest: aiChangeSeq, changes: out })
   }}))
   // POST /api/canvas/selref/pin —— 客户端报「你刚才划的是第几处」
   // 为什么需要：引用正文里**已经不写坐标了**（2026-09-15 主人要求对话里那张
@@ -1049,41 +1373,128 @@ function initCanvasHttpEndpoints(ctx, webServer) {
   // 实现在 13-selref-context.js（那边有 [[CCV-SELCTX]] 标记，测试切得出来）。
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/selref/pin', handler: async (req, res) => {
     try {
-      if (req.method !== 'POST') { error(res, 405, { ok: false, error: '只收 POST' }); return }
-      const body = await readBody(req)
+      if (req.method !== 'POST') { httpError(res, 405, { ok: false, error: '只收 POST' }); return }
+      const body = await httpReadJson(req)
       const taken = ccvPinAdd(body)
-      json(res, { ok: taken, n: ccvPins.length })
-    } catch (e) { error(res, 400, { ok: false, error: e.message }) }
+      httpJson(res, { ok: taken, n: ccvPins.length })
+    } catch (e) { httpError(res, 400, { ok: false, error: e.message }) }
+  }}))
+  // POST /api/canvas/scratch —— 开一个「选区编辑区」
+  // 规格：canvas-docs/话布选区编辑区方案.md（第二、三、七节）
+  // 客户端点「问 AI」时调它。body: { pinCode, docId, docPath, quote, ordinal, dupCount }
+  //
+  // 🔴 偏移由 **host 侧**按「引文 + 序数」解析，客户端不必把 DOM 偏移硬换算成
+  //    markdown 偏移 —— 那一步最容易错（渲染会吃掉 `**`、拆并段落）。
+  //    口径与「位置主动注入」完全一致：**渲染前后文字的出现顺序不变**，
+  //    所以两边数出来的"第几处"是同一个数（见 13-selref-context.js 的注释）。
+  // 解析不出来（序数越界 / 引文找不到）→ offset 记 -1，**不猜**；
+  //    实施步骤 3（拼接）遇到 -1 会报给主人，而不是硬拼。
+  ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/scratch', handler: async (req, res) => {
+    try {
+      if (req.method !== 'POST') { httpError(res, 405, { ok: false, error: '只收 POST' }); return }
+      const body = await httpReadJson(req)
+      const quote = String(body.quote || '')
+      if (!quote.trim()) { httpError(res, 400, { ok: false, error: '没有引文' }); return }
+
+      // 找主文档：优先 id，其次按真实路径（正斜杠、忽略大小写）
+      let doc = body.docId ? canvases.get(body.docId) : null
+      if (!doc && body.docPath) {
+        const want = String(body.docPath).replace(/\\/g, '/').toLowerCase()
+        canvases.forEach(function (c) {
+          if (doc || !c || c.type === 'scratch') return
+          const p = String(c.filePath || '').replace(/\\/g, '/').toLowerCase()
+          if (p && p === want) doc = c
+        })
+      }
+
+      let offset = -1
+      let dup = 0
+      if (doc) {
+        const hits = occIndexes(String(doc.content || ''), quote)
+        dup = hits.length
+        const ord = (typeof body.ordinal === 'number' && body.ordinal > 0) ? body.ordinal : 0
+        if (ord > 0 && ord <= hits.length) offset = hits[ord - 1]
+        else if (hits.length === 1) offset = hits[0]
+      }
+
+      const c = createScratchCanvas({
+        docId: doc ? doc.id : null,
+        docPath: doc ? canvasMdPath(doc) : (body.docPath || null),
+        offset: offset,
+        length: quote.length,
+        docVersion: doc ? doc.version : 0,
+        ordinal: body.ordinal,
+        dupCount: dup || body.dupCount,
+        pinCode: body.pinCode,
+        quote: quote,
+      })
+      ccvTrace('开了选区编辑区 ' + c.id + '（主文档=' + (doc ? doc.title : '没找到')
+        + '，偏移=' + offset + '，全文 ' + dup + ' 处，序数=' + (body.ordinal || 0) + '）')
+      httpJson(res, { ok: true, areaId: c.id, offset: offset, dupCount: dup })
+    } catch (e) { httpError(res, 400, { ok: false, error: e.message }) }
   }}))
   // POST /api/canvas/write
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/write', handler: async (req, res) => {
     try {
-      const body = await readBody(req)
+      const body = await httpReadJson(req)
       const id = body.id || activeId
       const c = id ? canvases.get(id) : null
-      if (!c) { error(res, 404, { ok: false, error: '画布不存在' }); return }
+      if (!c) { httpError(res, 404, { ok: false, error: '画布不存在' }); return }
       const result = applyWrite(c, body.content, 'replace', body.knownVer, 'human')
       // ⚠️ 冲突必须显式回传。applyWrite 检出并发冲突时返回
       //    { conflict, currentVersion, currentContent }，此时 result.version 是 undefined；
-      //    若照原样 json({ ok: true, version: result.version })，
+      //    若照原样 httpJson({ ok: true, version: result.version })，
       //    undefined 会被 JSON.stringify 丢掉 → 响应变成 {"ok":true} ——
       //    冲突被伪装成成功，浏览器编辑器无从察觉，只能继续用旧内容写。
       if (result && result.conflict) {
-        json(res, { ok: false, conflict: true, currentVersion: result.currentVersion, currentContent: result.currentContent })
+        httpJson(res, { ok: false, conflict: true, currentVersion: result.currentVersion, currentContent: result.currentContent })
         return
       }
-      json(res, { ok: true, version: result.version })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, version: result.version, canUndo: canUndo(c), canRedo: canRedo(c) })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
+  // POST /api/canvas/undo | /api/canvas/redo
+  //
+  // 为什么必须加 HTTP 这一层：撤销栈（history/redoStack）和 canvas.undo RPC
+  // **早就在了**，但那是走 harness.handle 的包级 RPC，而画布面板只走 HTTP
+  // （/api/canvas/*）—— 两边根本不连通，于是"有撤销"这件事在界面上等于不存在
+  // （2026-09-28 核对：lib/client.js 里 undo|redo 零命中，09-http.js 也一个端点都没有）。
+  //
+  // 语义：把 content 换成快照里的 before/after，version+1（客户端靠它同步 knownVer），
+  // 结果落盘。栈空时回 { ok:true, noop:true } 而不是报错 —— 界面据此提示"没有可撤销的了"。
+  function undoRedoEndpoint(path, fn) {
+    ctx.effect(() => webServer.register({ kind: 'exact', path: path, handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') { httpError(res, 405, { ok: false, error: '只收 POST' }); return }
+        const body = await httpReadJson(req)
+        const id = body.id || activeId
+        const c = id ? canvases.get(id) : null
+        if (!c) { httpError(res, 404, { ok: false, error: '画布不存在' }); return }
+        const r = fn(c)
+        if (!r.ok) { httpError(res, 404, { ok: false, error: r.error }); return }
+        // ⚠️ **立刻落盘**（2026-10-11 加，修"撤销有延迟"）
+        //   默认路径是 applyWrite → debouncedFlush（1500ms ✗），而查看器是**等文件变化**
+        //   才刷新正文的 → 两段延迟叠起来手感很明显（主人报"撤回重做有延迟"）。
+        //   撤销/重做是**人的一次性动作**，没有连打的场景 —— 不值得为它省一次写盘 ✓
+        //   所以这里跳过 debounce 直接 flush（写盘量很小，就一篇文档 ✓）。
+        try { await flushDirty() } catch (_) {}
+        httpJson(res, { ok: true, noop: !!r.noop, content: r.content, version: r.version, source: r.source || null, canUndo: canUndo(c), canRedo: canRedo(c) })
+      } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
+    }}))
+  }
+  undoRedoEndpoint('/api/canvas/undo', undoCanvas)
+  undoRedoEndpoint('/api/canvas/redo', redoCanvas)
   // POST /api/canvas/create?sid=xxx —— 新建即记入当前会话清单
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/create', handler: async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x')
-      const body = await readBody(req)
+      const body = await httpReadJson(req)
       const c = createCanvasDoc(body.title || '新话布')
-      sessAdd(url.searchParams.get('sid'), c.id)
-      json(res, { ok: true, id: c.id, title: c.title })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      // 同上：sid 没带就别登记 ✓（别塞进假会话 'default' ✗）
+      const sidCreate = url.searchParams.get('sid')
+      if (sidCreate) sessAddExclusive(sidCreate, c.id)
+      httpJson(res, { ok: true, id: c.id, title: c.title })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // ─── 客户端诊断日志（排障用）─────────────────────────
   // 环境里用户开不了浏览器控制台，客户端把关键判定点 POST 到这里，
@@ -1106,19 +1517,61 @@ function initCanvasHttpEndpoints(ctx, webServer) {
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/log', handler: async (req, res) => {
     try {
       if (req.method === 'POST') {
-        const body = await readBody(req)
+        const body = await httpReadJson(req)
         const lines = Array.isArray(body.lines) ? body.lines : [String(body.line || '')]
         lines.forEach(function (l) { _dbg.push(ts() + ' ' + String(l)) })
         if (_dbg.length > DBG_MAX) _dbg = _dbg.slice(_dbg.length - DBG_MAX)
         dbgWrite()
-        json(res, { ok: true, n: _dbg.length, file: DEBUG_LOG })
+        httpJson(res, { ok: true, n: _dbg.length, file: DEBUG_LOG })
       } else {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
         res.end(_dbg.join('\n') + '\n')
       }
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
-  // ─── 打开文档所在文件夹 ─────────────────────────────
+  // ─── POST /api/canvas/move-group —— 把一篇文档挪到另一个分组 ──────────
+  //   2026-10-24 主人要求「我要能自由拖动改分组」✓
+  //   分组**只是索引** ✓ 这里只动 .sessions/*.json 里的 id 数组 ✓
+  //   **绝不碰 md 文件、绝不碰 filePath、绝不碰内容** ✓（主人确认过这条 ✓）
+  //   body: { id, toSid }   toSid 为空字符串 = 移出所有组（回到「未归属」）✓
+  //   ⚠️ 改完必须清 sessStore 缓存 ✗ 否则内存里还是旧清单 ✓
+  ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/move-group', handler: async (req, res) => {
+    try {
+      if (req.method !== 'POST') { httpError(res, 405, { ok: false, error: '只收 POST' }); return }
+      const body = await httpReadJson(req)
+      const id = String((body && body.id) || '').trim()
+      const toSid = String((body && body.toSid) || '').trim()
+      if (!id) { httpError(res, 400, { ok: false, error: '缺 id' }); return }
+      const c = canvases.get(id)
+      if (!c) { httpError(res, 404, { ok: false, error: '文档不存在' }); return }
+      if (c.type === 'scratch') { httpError(res, 400, { ok: false, error: 'scratch 不进任何分组' }); return }
+      const dir = sessDirPath()
+      let files = []
+      try { files = nodefs.readdirSync(dir).filter((f) => /\.json$/i.test(f)) } catch (_) {}
+      let removed = 0
+      for (const f of files) {
+        const fp = joinPath(dir, f)
+        let j = null
+        try { j = JSON.parse(nodefs.readFileSync(fp, 'utf8')) } catch (_) { continue }
+        if (!j || !Array.isArray(j.ids) || j.ids.indexOf(id) < 0) continue
+        j.ids = j.ids.filter((x) => x !== id)
+        const nextActive = (j.activeId === id) ? (j.ids[0] || null) : (j.activeId || null)
+        try { nodefs.writeFileSync(fp, JSON.stringify({ activeId: nextActive, ids: j.ids }, null, 2)) } catch (_) {}
+        sessStore.delete(String(f).replace(/\.json$/i, ''))
+        removed++
+      }
+      let targetSid = ''
+      if (toSid) {
+        targetSid = sessSafe(toSid)
+        const st = sessLoad(targetSid)          // 从盘读，别用可能过期的缓存 ✓
+        if (st.ids.indexOf(id) < 0) st.ids.push(id)
+        const keepActive = (st.activeId && st.ids.indexOf(st.activeId) >= 0) ? st.activeId : id
+        sessPersist(targetSid, { activeId: keepActive, ids: st.ids })
+        sessStore.delete(targetSid)
+      }
+      httpJson(res, { ok: true, id, removed, toSid: targetSid })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
+  }}))
   // 客户端「📁」按钮调用；host 是 Node 主进程，用 explorer/open/xdg-open
   // 在系统文件管理器里打开当前画布文档所在的目录。
   // 注意：不要用 fs.resolve —— 它返回的是沙箱内部标记，不是文件系统路径，
@@ -1167,7 +1620,7 @@ function initCanvasHttpEndpoints(ctx, webServer) {
       dbgWrite()
     }, 1200)
     console.log('[collab-canvas] open-folder', JSON.stringify(info))
-    json(res, { ok: true, dir: dir, raw: raw, exists: info.exists, pid: info.pid, strategy: info.strategy })
+    httpJson(res, { ok: true, dir: dir, raw: raw, exists: info.exists, pid: info.pid, strategy: info.strategy })
   }}))
   console.log('[collab-canvas] HTTP endpoints registered: /api/canvas/* (debug log -> ' + DEBUG_LOG + ')')
 }
@@ -1185,28 +1638,6 @@ function initCanvasHttpEndpoints(ctx, webServer) {
 // 依赖同作用域：docsDirBase, docsDir, canvases, createCanvasDoc, applyWrite,
 //               saveCanvas, persistMeta, nodefs, path（均由其他模块提供）
 function initCanvasExtraEndpoints(ctx, webServer) {
-  // JSON 响应辅助（与 09-http 同款，本文件自包含）
-  function json(res, data) {
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(data))
-  }
-  function error(res, status, data) {
-    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(data))
-  }
-  function readBody(req, limit) {
-    return new Promise((resolve, reject) => {
-      const chunks = []
-      let size = 0
-      req.on('data', (c) => {
-        size += c.length
-        if (limit && size > limit) { reject(new Error('文件超过大小上限')); try { req.destroy() } catch (_) {} ; return }
-        chunks.push(c)
-      })
-      req.on('end', () => resolve(Buffer.concat(chunks)))
-      req.on('error', reject)
-    })
-  }
 
   // 会话工作区目录（@ 文件选择器索引的目录）
   function sessionWorkspaceDir() {
@@ -1218,7 +1649,7 @@ function initCanvasExtraEndpoints(ctx, webServer) {
         const cwd = holder && holder.cwd
         if (typeof cwd === 'string' && cwd.length > 2) return cwd
       }
-    } catch (e) { console.error('[collab-canvas] session-cwd probe failed:', e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] session-cwd probe failed:', e && e.message) }
     return docsDirBase()
   }
 
@@ -1238,13 +1669,13 @@ function initCanvasExtraEndpoints(ctx, webServer) {
         const j = JSON.parse(nodefs.readFileSync(f, 'utf8'))
         if (Array.isArray(j.folders)) return j.folders.filter(p => typeof p === 'string' && path.isAbsolute(p))
       }
-    } catch (e) { console.error('[collab-canvas] registry config read failed:', e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] registry config read failed:', e && e.message) }
     return []
   }
   function regSaveConfig(folders) {
     try {
       nodefs.writeFileSync(REG_CONFIG_FILE(), JSON.stringify({ folders: folders }, null, 2))
-    } catch (e) { console.error('[collab-canvas] registry config write failed:', e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] registry config write failed:', e && e.message) }
   }
   function regScanFolder(folder) {
     const map = new Map()
@@ -1288,7 +1719,7 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       regTotal = 0
       regIndex.forEach(m => { m.forEach(arr => { regTotal += arr.length }) })
       if (changed) console.log('[collab-canvas] registry scanned', folder, '->', n, 'files')
-    } catch (e) { console.error('[collab-canvas] registry scan failed:', folder, e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] registry scan failed:', folder, e && e.message) }
   }
   const regLastSig = new Map()   // folder -> 上次索引签名（文件数+路径集），无变化的重扫静默处理
   const regRescanTimers = new Map()
@@ -1303,7 +1734,7 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       const w = nodefs.watch(folder, { recursive: true }, function () { regScheduleRescan(folder) })
       w.on('error', function () {})
       regWatchers.set(folder, w)
-    } catch (e) { console.error('[collab-canvas] registry watch failed:', folder, e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] registry watch failed:', folder, e && e.message) }
   }
   function regUnwatch(folder) {
     const w = regWatchers.get(folder)
@@ -1330,10 +1761,10 @@ function initCanvasExtraEndpoints(ctx, webServer) {
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/registry', handler: async (req, res) => {
     try {
       if (req.method === 'POST') {
-        const body = await readBody(req)
+        const body = await httpReadBody(req)
         const folders = Array.isArray(body.folders) ? body.folders.map(s => String(s).trim()).filter(Boolean) : []
         const invalid = folders.filter(f => !path.isAbsolute(f) || !nodefs.existsSync(f) || !nodefs.statSync(f).isDirectory())
-        if (invalid.length) { error(res, 400, { ok: false, error: '以下路径无效或不是文件夹: ' + invalid.join(', ') }); return }
+        if (invalid.length) { httpError(res, 400, { ok: false, error: '以下路径无效或不是文件夹: ' + invalid.join(', ') }); return }
         const uniq = Array.from(new Set(folders))
         regFolders.length = 0
         regFolders.push(...uniq)
@@ -1344,11 +1775,11 @@ function initCanvasExtraEndpoints(ctx, webServer) {
           regWatch(f)
           setTimeout(function () { regRescanFolder(f) }, 0)
         })
-        json(res, { ok: true, folders: regFolders.slice(), files: regTotal, note: '索引构建中' })
+        httpJson(res, { ok: true, folders: regFolders.slice(), files: regTotal, note: '索引构建中' })
         return
       }
-      json(res, { ok: true, folders: regFolders.slice(), files: regTotal })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, folders: regFolders.slice(), files: regTotal })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // GET /api/canvas/locate?name=xxx —— 按文件名查登记索引，返回真实路径
   //（rel = 会话工作区相对路径；docsRel = 画布文档目录相对路径，形如 canvas-docs/xxx.md）
@@ -1372,8 +1803,8 @@ function initCanvasExtraEndpoints(ctx, webServer) {
           matches.push({ path: norm, rel: rel, docsRel: docsRel })
         })
       })
-      json(res, { ok: true, name: name, matches: matches, folders: regFolders.length })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, name: name, matches: matches, folders: regFolders.length })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // GET /api/canvas/load-doc?rel=canvas-docs/xxx.md —— 把 canvas-docs 里的 md
   // 注册为话布（按标题找已有，找不到新建）并返回画布 id——即 canvas_load 的最小实现
@@ -1381,9 +1812,9 @@ function initCanvasExtraEndpoints(ctx, webServer) {
     try {
       const url = new URL(req.url, 'http://x')
       const rel = String(url.searchParams.get('rel') || '')
-      if (!/^canvas-docs\/[^\\/]+\.md$/i.test(rel)) { error(res, 400, { ok: false, error: '仅支持 canvas-docs/ 下的 .md 文件' }); return }
+      if (!/^canvas-docs\/[^\\/]+\.md$/i.test(rel)) { httpError(res, 400, { ok: false, error: '仅支持 canvas-docs/ 下的 .md 文件' }); return }
       const full = path.join(docsDir(), rel.slice('canvas-docs/'.length))
-      if (!nodefs.existsSync(full)) { error(res, 404, { ok: false, error: '文件不存在' }); return }
+      if (!nodefs.existsSync(full)) { httpError(res, 404, { ok: false, error: '文件不存在' }); return }
       const content = nodefs.readFileSync(full, 'utf8')
       const title = rel.split('/').pop().replace(/\.(md|markdown)$/i, '')
       let c = null
@@ -1403,12 +1834,12 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       if (!c) {
         c = createCanvasDoc(title)
         applyWrite(c, content, 'replace', undefined, 'human')
-        try { await saveCanvas(c) } catch (e) { console.error('[collab-canvas] load-doc save failed:', e && e.message) }
+        try { await saveCanvas(c) } catch (e) { console.httpError('[collab-canvas] load-doc save failed:', e && e.message) }
         created = true
       }
-      sessAdd(url.searchParams.get('sid'), c.id)   // 登记即记入当前会话清单
-      json(res, { ok: true, id: c.id, title: c.title, created: created })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      sessAddExclusive(url.searchParams.get('sid'), c.id)   // 登记即记入当前会话清单
+      httpJson(res, { ok: true, id: c.id, title: c.title, created: created })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // ─── 白名单：本地文档「就地」登记为话布 ───────────────────────────
   // 允许范围 = 会话工作区 ∪ 画布目录 ∪ 文件登记表里登记的文件夹。
@@ -1434,23 +1865,23 @@ function initCanvasExtraEndpoints(ctx, webServer) {
     try {
       const url = new URL(req.url, 'http://x')
       const raw = String(url.searchParams.get('path') || '').trim()
-      if (!raw) { error(res, 400, { ok: false, error: '缺少 path 参数' }); return }
-      if (!/\.(md|markdown|txt|text)$/i.test(raw)) { error(res, 400, { ok: false, error: '仅支持 .md/.markdown/.txt' }); return }
+      if (!raw) { httpError(res, 400, { ok: false, error: '缺少 path 参数' }); return }
+      if (!/\.(md|markdown|txt|text)$/i.test(raw)) { httpError(res, 400, { ok: false, error: '仅支持 .md/.markdown/.txt' }); return }
       const abs = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(sessionWorkspaceDir(), raw)
       if (!pathAllowedInTarget(abs)) {
-        error(res, 403, { ok: false, error: '路径不在允许范围内（会话工作区 / 画布目录 / 已登记文件夹）' })
+        httpError(res, 403, { ok: false, error: '路径不在允许范围内（会话工作区 / 画布目录 / 已登记文件夹）' })
         return
       }
-      if (!nodefs.existsSync(abs)) { error(res, 404, { ok: false, error: '文件不存在' }); return }
+      if (!nodefs.existsSync(abs)) { httpError(res, 404, { ok: false, error: '文件不存在' }); return }
       let c = null
       canvases.forEach(function (x) {
         if (!c && x.filePath) { try { if (path.resolve(x.filePath) === abs) c = x } catch (_) {} }
       })
       let created = false
       if (!c) { c = await loadFileDoc(abs); created = true }
-      sessAdd(url.searchParams.get('sid'), c.id)
-      json(res, { ok: true, id: c.id, title: c.title, filePath: c.filePath, created: created })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      sessAddExclusive(url.searchParams.get('sid'), c.id)
+      httpJson(res, { ok: true, id: c.id, title: c.title, filePath: c.filePath, created: created })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // GET /api/canvas/delete?id=xxx&sid=xxx —— 从当前会话清单移除画布；
   // 若其他会话清单仍引用该画布则只摘引用保留文件，无人引用才连 md 一起删
@@ -1460,7 +1891,7 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       const id = url.searchParams.get('id')
       const sid = sessSafe(url.searchParams.get('sid'))
       const c = id ? canvases.get(id) : null
-      if (!c) { error(res, 404, { ok: false, error: '画布不存在' }); return }
+      if (!c) { httpError(res, 404, { ok: false, error: '画布不存在' }); return }
       sessRemove(sid, id)
       let referenced = false
       try {
@@ -1478,29 +1909,29 @@ function initCanvasExtraEndpoints(ctx, webServer) {
         if (activeId === id) activeId = null
         try {
           if (c.filePath && nodefs.existsSync(c.filePath)) nodefs.unlinkSync(c.filePath)
-        } catch (e) { console.error('[collab-canvas] delete file failed:', e && e.message) }
+        } catch (e) { console.httpError('[collab-canvas] delete file failed:', e && e.message) }
         persistMeta()
       }
-      json(res, { ok: true, id: id, title: c.title, fileDeleted: !referenced })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, id: id, title: c.title, fileDeleted: !referenced })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // POST /api/canvas/import-doc?name=xxx —— 外部文档拖入/上传：复制到会话工作区
   // 的 uploads/ 文件夹（@ 文件选择器可索引到），返回相对路径供 @ 引用
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/import-doc', handler: async (req, res) => {
     try {
-      if (req.method !== 'POST') { error(res, 405, { ok: false, error: 'POST only' }); return }
+      if (req.method !== 'POST') { httpError(res, 405, { ok: false, error: 'POST only' }); return }
       const url = new URL(req.url, 'http://x')
       let name = url.searchParams.get('name') || 'doc.md'
       name = String(name).replace(/[\\/:*?"<>|\r\n]/g, '_').trim() || 'doc.md'
-      const body = await readBody(req, UPLOAD_LIMIT)
-      if (!body || !body.length) { error(res, 400, { ok: false, error: '空文件' }); return }
+      const body = await httpReadBody(req, UPLOAD_LIMIT)
+      if (!body || !body.length) { httpError(res, 400, { ok: false, error: '空文件' }); return }
       const dir = path.join(sessionWorkspaceDir(), 'uploads')
       try { nodefs.mkdirSync(dir, { recursive: true }) } catch (e) {}
       const fname = Date.now() + '-' + Math.random().toString(36).slice(2, 6) + '-' + name
       nodefs.writeFileSync(path.join(dir, fname), body)
       console.log('[collab-canvas] import-doc:', fname, body.length + 'B')
-      json(res, { ok: true, path: 'uploads/' + fname, name: name, size: body.length })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, path: 'uploads/' + fname, name: name, size: body.length })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // GET /api/canvas/open-upload?name=xxx —— 把拖入上传的文档变成/打开话布：
   // 已有同名（去掉时间戳前缀后的标题，含/不含 .md 扩展名）话布 → 直接返回其 id；
@@ -1509,11 +1940,11 @@ function initCanvasExtraEndpoints(ctx, webServer) {
     try {
       const url = new URL(req.url, 'http://x')
       const fname = String(url.searchParams.get('name') || '')
-      if (!/^\d{13}-[a-z0-9]{2,8}-[^\r\n\\/:"*?<>|]{1,120}$/i.test(fname)) { error(res, 400, { ok: false, error: '非法文件名' }); return }
+      if (!/^\d{13}-[a-z0-9]{2,8}-[^\r\n\\/:"*?<>|]{1,120}$/i.test(fname)) { httpError(res, 400, { ok: false, error: '非法文件名' }); return }
       const upDir = path.join(sessionWorkspaceDir(), 'uploads')
       const full = path.join(upDir, fname)
-      if (path.resolve(full).indexOf(path.resolve(upDir) + path.sep) !== 0) { error(res, 403, { ok: false, error: '非法路径' }); return }
-      if (!nodefs.existsSync(full)) { error(res, 404, { ok: false, error: '文件不存在' }); return }
+      if (path.resolve(full).indexOf(path.resolve(upDir) + path.sep) !== 0) { httpError(res, 403, { ok: false, error: '非法路径' }); return }
+      if (!nodefs.existsSync(full)) { httpError(res, 404, { ok: false, error: '文件不存在' }); return }
       const content = nodefs.readFileSync(full, 'utf8')
       const title = fname.replace(/^\d{13}-[a-z0-9]{2,8}-/i, '')
       const baseTitle = title.replace(/\.(md|markdown)$/i, '')
@@ -1528,12 +1959,12 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       if (!c) {
         c = createCanvasDoc(title)
         applyWrite(c, content, 'replace', undefined, 'human')
-        try { await saveCanvas(c) } catch (e) { console.error('[collab-canvas] open-upload save failed:', e && e.message) }
+        try { await saveCanvas(c) } catch (e) { console.httpError('[collab-canvas] open-upload save failed:', e && e.message) }
         created = true
       }
-      sessAdd(url.searchParams.get('sid'), c.id)   // 导入即记入当前会话清单
-      json(res, { ok: true, id: c.id, title: c.title, created: created, matched: matched })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      sessAddExclusive(url.searchParams.get('sid'), c.id)   // 导入即记入当前会话清单
+      httpJson(res, { ok: true, id: c.id, title: c.title, created: created, matched: matched })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // 画布附件与独立模块源码服务（file / docdrop.js / doclink.js）
   function canvasDocDir() {
@@ -1560,10 +1991,10 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       const full = path.resolve(base, rel)
       const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p)
       if (norm(full) !== norm(base) && norm(full).indexOf(norm(base) + path.sep) !== 0) {
-        error(res, 403, { ok: false, error: '非法路径' }); return
+        httpError(res, 403, { ok: false, error: '非法路径' }); return
       }
       if (!nodefs.existsSync(full) || !nodefs.statSync(full).isFile()) {
-        error(res, 404, { ok: false, error: '文件不存在' }); return
+        httpError(res, 404, { ok: false, error: '文件不存在' }); return
       }
       const ext = (full.split('.').pop() || '').toLowerCase()
       const mime = MIME_MAP[ext] || 'application/octet-stream'
@@ -1577,24 +2008,24 @@ function initCanvasExtraEndpoints(ctx, webServer) {
         'Cache-Control': 'no-cache',
       })
       res.end(buf)
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   // POST /api/canvas/upload?name=xxx —— 画布附件上传（图片粘贴等），存 canvas-docs/attachments/
   ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/upload', handler: async (req, res) => {
     try {
-      if (req.method !== 'POST') { error(res, 405, { ok: false, error: 'POST only' }); return }
+      if (req.method !== 'POST') { httpError(res, 405, { ok: false, error: 'POST only' }); return }
       const url = new URL(req.url, 'http://x')
       let name = url.searchParams.get('name') || 'file.bin'
       name = String(name).replace(/[\\/:*?"<>|\r\n]/g, '_').trim() || 'file.bin'
       const body = await readRawBody(req, UPLOAD_LIMIT)
-      if (!body || !body.length) { error(res, 400, { ok: false, error: '空文件' }); return }
+      if (!body || !body.length) { httpError(res, 400, { ok: false, error: '空文件' }); return }
       const dir = path.join(canvasDocDir(), 'attachments')
       try { nodefs.mkdirSync(dir, { recursive: true }) } catch (e) {}
       const fname = Date.now() + '-' + name
       nodefs.writeFileSync(path.join(dir, fname), body)
       console.log('[collab-canvas] upload:', fname, body.length + 'B')
-      json(res, { ok: true, path: 'attachments/' + fname, name: name, size: body.length })
-    } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      httpJson(res, { ok: true, path: 'attachments/' + fname, name: name, size: body.length })
+    } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
   }}))
   function readRawBody(req, limit) {
     return new Promise((resolve, reject) => {
@@ -1609,18 +2040,20 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       req.on('error', reject)
     })
   }
-  // GET /api/canvas/docdrop.js、doclink.js、selref.js —— 提供独立客户端模块源码
+  // GET /api/canvas/selref.js、viewer-md.js、doc-model.js —— 提供独立客户端模块源码
   //（client 入口动态挂载；每次读盘，改完刷新页面即生效，无需重启）。
   // 注意：运行时路径相对于部署目录的 dist/host.js 解析（../lib/…）
   // ⚠️ 这个名单是服务端常量，新增一项需要重启 dsh web 才认得出该端点。
-  ;['docdrop.js', 'doclink.js', 'selref.js'].forEach(function (modFile) {
+  // ⚠️ docdrop.js / doclink.js 于 2026-10-11 随画布面板一起删除（面板专属 ✗）。
+  // ⚠️ doc-model.js 于 2026-10-15 加入（A4：按块转换要用它 ✓ 必须排在 viewer-md 之前 ✓）
+  ;['ccv-logic.js', 'doc-model.js', 'selref.js', 'viewer-md.js'].forEach(function (modFile) {
     ctx.effect(() => webServer.register({ kind: 'exact', path: '/api/canvas/' + modFile, handler: async (req, res) => {
       try {
         const srcPath = new URL('../lib/' + modFile, import.meta.url)
         const src = nodefs.readFileSync(srcPath, 'utf8')
         res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache' })
         res.end(src)
-      } catch (e) { error(res, 500, { ok: false, error: e.message }) }
+      } catch (e) { httpError(res, 500, { ok: false, error: e.message }) }
     }}))
   })
 
@@ -1633,7 +2066,7 @@ function initCanvasExtraEndpoints(ctx, webServer) {
       }
       regSeedIfEmpty()
       console.log('[collab-canvas] file registry:', regFolders.length ? regFolders.join(' | ') : '(未登记文件夹)', '索引', regTotal, '文件')
-    } catch (e) { console.error('[collab-canvas] registry init failed:', e && e.message) }
+    } catch (e) { console.httpError('[collab-canvas] registry init failed:', e && e.message) }
   }, 0)
 }
 
@@ -1876,28 +2309,45 @@ function ccvPinAdd(p) {
   }
 }
 
-// 找出这条引用对应的上报记录。取**最新**的一条 —— 用户的操作顺序天然是
-// 「先划选、再发送」，所以最新那条就是这次的。
-// ⚠️ 已知边界：同一段原文连着划两次、却只发出第一条引用时，会取到后一条的序数。
-//   罕见，且注入文案里保留了每处的上下文供核对，不会静默改错。
+// 找出这条引用对应的上报记录。
+//
+// 🔴 2026-10-04 修正：**不再无脑取最新**，改成取「从后往前第 remaining 条」。
+//
+//   为什么：一条消息里出现两条**文字完全相同**的引用时（同一篇里同一个词选两处），
+//   无脑取最新会让两条引用抢同一条上报、最后**正好互换**：
+//       划第 5 处  → 上报 A(序数 5)     消息里第 1 条引用 → 从最新找 → 拿到 B(10) ✗
+//       划第 10 处 → 上报 B(序数 10)    消息里第 2 条引用 → B 用过了 → 拿到 A(5)  ✗
+//   主人 2026-10-04 实测的「改反了」就是这个 —— 而且是**静默改错**，界面上看不出来。
+//   （旧注释把它判成"罕见、不会静默改错"，判错了。）
+//
+//   remaining = 这条消息里与它**文字相同**的引用还剩几条（含自己）：
+//     · 只有 1 条引用（哪怕手上有历史上报）→ remaining=1 → 取最后一条 = 最新 ✓
+//       保持原来的正确行为：重新引用同一段时，不会取到上次那条旧上报。
+//     · 两条相同 → 第 1 条取倒数第 2 条、第 2 条取最后一条 ✓ 两条各归各位。
 //
 // 🔴 `used` 是**本次拼装里已经用掉的上报**：一条消息里引用了两段不同的原文、
 //   但它们被解析成同一个 `q`（比如原文本身含「」被截短）时，两条会抢同一条上报
 //   → 第二条拿到第一条的序数 → 改错地方。所以用过的不能再给下一条用。
-function ccvPinFind(path, quote, used) {
+function ccvPinFind(path, quote, used, remaining) {
   var want = ccvNormPathForRef(path)
   var q = String(quote || '')
   if (!q) return null
-  for (var i = ccvPins.length - 1; i >= 0; i--) {
+  // 先按**时间顺序**（旧 → 新）把所有匹配且没用过的收集起来，再按 remaining 从后往前取
+  var matched = []
+  for (var i = 0; i < ccvPins.length; i++) {
     var p = ccvPins[i]
     if (used && used.length && used.indexOf(p) >= 0) continue
     // 精确相等最好；但解析出来的原文在"原文本身含「」"时会被截短，
     // 所以也接受"它是上报原文的前缀"（截短只会往前截，不会变形）。
     if (p.text !== q && p.text.indexOf(q) !== 0) continue
     if (want && p.path && p.path !== want) continue
-    return p
+    matched.push(p)
   }
-  return null
+  if (!matched.length) return null
+  var back = (typeof remaining === 'number' && remaining > 0) ? remaining : 1
+  var k = matched.length - back
+  if (k < 0) k = 0
+  return matched[k]
 }
 
 // ── 二、从消息正文里认出「话布选区引用」──────────────────────────
@@ -2068,7 +2518,7 @@ function ccvSpotExcerpt(content, idx, quote) {
 
 // 单条引用 → 一段话。返回 '' 表示这条不值得注入（比如找不到文档）。
 // `used` 见 ccvPinFind：同一次拼装里上报记录不许被两条引用重复认领。
-function ccvDescribeRef(ref, used) {
+function ccvDescribeRef(ref, used, remaining) {
   var who = ref.path || ref.title || '（未标注）'
   var c = ccvFindDoc(ref)
   if (!c) {
@@ -2097,6 +2547,21 @@ function ccvDescribeRef(ref, used) {
       + '动手前请让用户重新划一次要引用的段落，**不要**去找相似的内容照着改。'
   }
 
+  // 定位这一条引用对应的**上报**（拿它换序数，也拿它查"有没有开过编辑区"）。
+  // 🔴 2026-10-11 起**提到分支之前** —— 单处引用也要查编辑区（编辑区与处数无关）。
+  var pin = ccvPinFind(ref.path, quote, used, remaining)
+  if (pin && used && used.indexOf(pin) < 0) used.push(pin)
+
+  // 这一条引用开过「选区编辑区」吗？（实施步骤 1：建区 + 绑定 + 注入）
+  var area = pin ? scratchForPin(pin.code) : null
+  var areaAt = -1
+  if (area) {
+    var ordA = (pin.ordinal > 0) ? pin.ordinal : 0
+    areaAt = (area.scratch && area.scratch.offset >= 0) ? area.scratch.offset
+      : ((ordA > 0 && ordA <= idxs.length) ? idxs[ordA - 1] : (idxs.length === 1 ? idxs[0] : -1))
+  }
+  var tail = area ? ('\n' + ccvScratchBlock(area, c, areaAt, quote.length)) : ''
+
   var shown = idxs.slice(0, CCV_SEL_MAX_SPOTS)
 
   // 只有一处：直接说死
@@ -2104,7 +2569,7 @@ function ccvDescribeRef(ref, used) {
     var lc1 = lineColOf(content, idxs[0])
     return '· 《' + c.title + '》「' + ccvShortQuote(quote, CCV_SEL_QUOTE_MAX)
       + '」在第 ' + lc1.line + ' 行，**全文只有这一处**：\n  '
-      + ccvSpotExcerpt(content, idxs[0], quote)
+      + ccvSpotExcerpt(content, idxs[0], quote) + tail
   }
 
   // 多处：把目标那一处标出来，其余只报行号（够模型核对，又不啰嗦）
@@ -2112,8 +2577,6 @@ function ccvDescribeRef(ref, used) {
   // 序数从哪来：**客户端刚报上来的**优先（引用正文里已经不写了）；
   // 拿不到才退回看抬头标签（兼容没更新的客户端 / 用户手打的引用）。
   // 两个都没有 → 绝不替模型挑一处，让它把每处摆给用户确认。
-  var pin = ccvPinFind(ref.path, quote, used)
-  if (pin && used && used.indexOf(pin) < 0) used.push(pin)
   var ordinal = (pin && pin.ordinal > 0) ? pin.ordinal : ref.ordinal
 
   var head = '· 《' + c.title + '》「' + ccvShortQuote(quote, CCV_SEL_QUOTE_MAX)
@@ -2143,6 +2606,36 @@ function ccvDescribeRef(ref, used) {
   } else {
     lines.push('  → 分不出用户要哪一处。请把上面每处的上下文摆给用户，让他确认改哪一处，不要自己挑一处改。')
   }
+  return lines.join('\n') + tail
+}
+
+// ─── 选区编辑区的注入（实施步骤 1：建区 + 绑定 + 注入，先不拼接）──────
+// 规格：canvas-docs/话布选区编辑区方案.md 第七节
+//
+// 为什么必须补语境：AI 只看到那一小段，你说"改成和上面一致"，它没有"上面"。
+// 为什么最后那条要求是**硬要求**：AI 的习惯是写"以下是修改后的版本"、加代码块围栏 ——
+//   将来拼回原文时那些说明文字就变成文档内容了 ✗（本步不拼接，但约束现在就立好）。
+var CCV_SCRATCH_CTX = 60   // 上文/下文各取多少字符
+
+function ccvScratchBlock(area, doc, offset, quoteLen) {
+  if (!area) return ''
+  var lines = []
+  lines.push('· 上面这一段已经开成了**选区编辑区**（它不是给你看的，是给你改的工作台）。')
+  lines.push('  改它就用现成的 canvas_write 写这个画布：id = ' + area.id
+    + '（现在 v' + area.version + '）。**不要去改主文档**。')
+  lines.push('  它现在的内容（原样）：')
+  String(area.content || '').split('\n').forEach(function (l) { lines.push('  │ ' + l) })
+  if (doc && offset >= 0) {
+    var content = String(doc.content || '')
+    var before = content.slice(Math.max(0, offset - CCV_SCRATCH_CTX), offset)
+    var after = content.slice(offset + (quoteLen || 0), offset + (quoteLen || 0) + CCV_SCRATCH_CTX)
+    if (before.replace(/\s/g, '')) lines.push('  上文：…' + before.replace(/\s+/g, ' '))
+    if (after.replace(/\s/g, '')) lines.push('  下文：' + after.replace(/\s+/g, ' ') + '…')
+  } else {
+    lines.push('  （它在原文里的位置没解析出来 —— **别自己猜**，需要定位就问用户）')
+  }
+  lines.push('  ⚠️ 要求：**只写替换后的内容本身**。不要写"以下是修改后的版本"这类说明，')
+  lines.push('     不要加代码块围栏，不要加前后缀 —— 你写的就是要放回原文那一段的东西。')
   return lines.join('\n')
 }
 
@@ -2156,6 +2649,10 @@ function ccvDescribeRef(ref, used) {
 //     只按正文做键就会把第二次挡掉，让模型拿着第一次的序数去改。
 var ccvSelCtxMemo = { key: null, val: '' }
 
+// 这一轮认到的引用（注入时留下，拼接时取用）。见 ccvBuildSelContext 里的注释：
+// 轮末再解析已经来不及 —— 队列那条消息被 claim 走了，界面那条不带引用 ✗。
+var ccvLastTurnRefs = null
+
 function ccvBuildSelContext(context) {
   try {
     var agent = context && context.agent
@@ -2168,10 +2665,40 @@ function ccvBuildSelContext(context) {
     if (ccvSelCtxMemo.key === memoKey) return ccvSelCtxMemo.val
 
     var refs = ccvParseRefs(text)
+    // 每条引用的 remaining = **从它起**（含自己）还有几条"同一篇 + 同一段原文"的引用。
+    // 用途见 ccvPinFind：一条消息里两条文字完全相同的引用，靠它各归各位。
+    var remainingOf = []
+    for (var a = 0; a < refs.length; a++) {
+      var n = 0
+      for (var b = a; b < refs.length; b++) {
+        if (String(refs[a].quote) === String(refs[b].quote)
+          && (refs[a].path || refs[a].title) === (refs[b].path || refs[b].title)) n++
+      }
+      remainingOf.push(n)
+    }
+    // 🔴 把这一轮认到的引用**记下来**（2026-10-11 加，拼接要用）。
+    //   为什么不能等轮末再解析：轮次一开始，队列那条消息就被 claim 走了
+    //   （'agent/inbox/claimed' —— "One message left the inbox inside its open turn"），
+    //   轮末只能退回读「界面」那条 —— 而**它不带引用** ✗。
+    //
+    //   ⚠️⚠️ 覆盖规则是踩出来的（2026-10-11 实测两轮）：
+    //     同一轮里本函数会被调多次，而**不同通道读出来的结果不一样** ——
+    //       17:50:52 来自「队列」→ 1 条引用 ✓
+    //       17:51:11 来自「界面」→ 0 条引用 ✗
+    //       17:51:25 来自「界面」（**时间自己往前走了**：17:50:52 → 17:51:11）→ 0 条 ✗
+    //     第一版我用"时间相同 = 同一条消息"来判断 —— 失效 ✗（界面那条的时间会变）。
+    //     最终规则（不依赖时间，最简单也最稳）：
+    //       **只在看到引用时才写缓存** ✓ —— 永远不用"空的"去覆盖"有引用的" ✗
+    //     清空交给拼接那边：**每轮结束都清**（包括没有引用的轮次）。
+    try {
+      if (refs.length) {
+        ccvLastTurnRefs = { refs: refs, remaining: remainingOf, text: text, src: picked.src, time: picked.time, at: Date.now() }
+      }
+    } catch (_) {}
     var blocks = []
     var usedPins = []
     for (var i = 0; i < refs.length && i < 3; i++) {
-      var one = ccvDescribeRef(refs[i], usedPins)
+      var one = ccvDescribeRef(refs[i], usedPins, remainingOf[i])
       if (one) blocks.push(one)
     }
     var out = ''
@@ -2208,6 +2735,275 @@ try {
   console.error('[collab-canvas] selection context failed:', e && e.message)
 }
 // [[CCV-SELCTX-END]]
+
+    // ==================== 14-scratch-splice.js ====================
+// ═══ 选区编辑区的拼接（实施步骤 3）══════════════════════════════════
+// 规格：canvas-docs/话布选区编辑区方案.md 第六节 + 实施步骤 3
+//   · 纯字符串手术：newDoc = doc[0..偏移] + 编辑区内容 + doc[偏移+长度..]
+//   · 落成【一个】撤销步骤（走 applyWrite —— 它自己 push 一条历史）
+//   · 本步**先不销毁**编辑区（销毁是第 4 步）
+//   · **定位不了就报给主人，不猜、不硬拼**（设计稿第九节：不静默兜底）
+//
+// ═══ 钩子为什么是 agent/turn-stopping ═══════════════════════════════
+// 设计稿写的是 "turn/end"，但 DSH 里**没有**叫 turn/end 的事件（查过事件目录）。
+// 对应的是 agent/turn-stopping —— 原话 "The turn is about to close: the model owes
+// no response"，而且是 **serial 模式**：会被 await ✓ 正好保证"拼完才关这一轮"。
+//
+// ═══ 目标 = 本轮【引用到的】编辑区（设计稿第八节）═══════════════════
+//   1 条引用 → 改 1 个；N 条 → N 个；0 条 → 不拼（普通聊天）。
+//   靠的是与「位置主动注入」**同一套配对**（ccvParseRefs + ccvPinFind + scratchForPin）——
+//   两边必须一致，否则"注入说的"和"实际拼的"不是同一个地方 ✗（那正是最坏的情况）。
+//
+// ⚠️ 一个前提：编辑区必须**在同一个宿主进程里**活着。它是内存对象（不落盘 ✗）——
+//    重启就没了 ✓ 这是设计要的（一次性）。重启后引用还在、编辑区没了 → 这里查不到
+//    就**什么都不做**（不报错、不猜位置）。
+
+// 报给主人看的痕迹（走 ccvTrace，客户端日志里能看到）
+// [[CCV-SPLICE-BEGIN]]
+function ccvSpliceTrace(m) { try { ccvTrace('[拼接] ' + m) } catch (_) {} }
+
+// 找这一条引用对应的编辑区（配对口径与注入完全一致）
+function ccvScratchForRef(ref, used, remaining) {
+  // ⚠️ 这里传的是 ref.quote（可能被「」截短），而 ccvPinFind 接受"上报原文的前缀" ✓
+  //    —— 所以不需要再做一次变体解析（注入那边做变体是为了在文档里定位 ✗ 这里不用）。
+  var pin = ccvPinFind(ref.path, ref.quote, used, remaining)
+  if (!pin) return null
+  if (used && used.indexOf(pin) < 0) used.push(pin)
+  var area = scratchForPin(pin.code)
+  return area ? { area: area, pin: pin } : null
+}
+
+// 拼一个编辑区。返回 { ok, why } —— why 是给人看的一句话
+function ccvSpliceArea(area) {
+  try {
+    var b = (area && area.scratch) || {}
+    var doc = b.docId ? canvases.get(b.docId) : null
+    if (!doc) return { ok: false, why: '主文档不在了（可能被删/改名）' }
+    if (b.spliced) return { ok: false, why: '这个编辑区已经拼过了' }
+
+    var cur = String(doc.content || '')
+    var orig = String(b.origQuote || '')
+    var off = (typeof b.offset === 'number') ? b.offset : -1
+    var len = (typeof b.length === 'number') ? b.length : orig.length
+
+    // ── 过期校验（设计稿第十一节：版本 → 指纹 → 序数重定位，失败就报）──
+    var why = ''
+    var at = -1
+    if (off >= 0 && off + len <= cur.length && cur.slice(off, off + len) === orig) {
+      at = off                                   // ① 原位还在：直接用
+    } else if (orig) {
+      // ② 原位不在了 → 按「引文 + 序数」重定位（与建区时同一套算法）
+      var hits = occIndexes(cur, orig)
+      var ord = (typeof b.ordinal === 'number' && b.ordinal > 0) ? b.ordinal : 0
+      if (ord > 0 && ord <= hits.length) { at = hits[ord - 1]; why = '原位已变，按序数重定位到第 ' + ord + ' 处' }
+      else if (hits.length === 1) { at = hits[0]; why = '原位已变，全文只剩一处，用它' }
+      else if (!hits.length) return { ok: false, why: '这段原文在主文档里已经找不到了（引用失效）' }
+      else return { ok: false, why: '这段原文出现 ' + hits.length + ' 次、序数也对不上 —— 分不出该改哪一处，**没有拼**' }
+    } else {
+      return { ok: false, why: '没有原始引文可比对（老编辑区缺这个字段）' }
+    }
+
+    var newDoc = cur.slice(0, at) + String(area.content || '') + cur.slice(at + len)
+    if (newDoc === cur) return { ok: false, why: '拼完和原文一样（编辑区没改动）' }
+
+    // 落成**一个**撤销步骤：applyWrite 自己 push 一条历史 ✓
+    var res = applyWrite(doc, newDoc, 'replace', doc.version, 'ai')
+    if (!res || res.conflict) return { ok: false, why: '版本冲突，没拼' }
+
+    b.spliced = true
+    b.splicedAt = Date.now()
+    b.splicedVersion = res.version
+    return { ok: true, why: why || '原位拼入', doc: doc, at: at, len: len, version: res.version }
+  } catch (e) {
+    return { ok: false, why: '拼接出错：' + ((e && e.message) || e) }
+  }
+}
+
+// 这一轮结束时把所有"本轮引用到的"编辑区拼回去
+//
+// ⚠️ 入口**必须留痕**（2026-10-11 补）：处理函数"没事可做时静默返回"✗，
+//    于是"钩子没触发"和"触发了但没活干"在日志里**长得一模一样** ✗ ——
+//    主人报"根本没改"时我就是卡在这儿分不清是哪种。只记前几次，不刷屏。
+var ccvSpliceFires = 0
+async function ccvSpliceTurn(payload) {
+  try {
+    var fresh = ccvSpliceFires < 5
+    if (fresh) {
+      ccvSpliceFires++
+      ccvSpliceTrace('钩子触发第 ' + ccvSpliceFires + ' 次（turn=' + ((payload && payload.turn !== undefined) ? payload.turn : '?') + '）')
+    }
+    var agent = payload && payload.agent
+    // ⚠️ 没有 agent 也要能走：引用优先从**注入时留下的那份**取（见下），
+    //    那条路不需要 agent。只有退回"现解析"时才必须有 agent。
+    if (!agent && !(ccvLastTurnRefs && ccvLastTurnRefs.refs && ccvLastTurnRefs.refs.length)) {
+      if (fresh) ccvSpliceTrace('既没有 agent、也没有注入时留下的引用，跳过')
+      return
+    }
+
+    // 🔴 引用从**注入时留下的那份**取，不在轮末重新解析（2026-10-11 实测的坑）：
+    //   轮次一开始，队列那条消息就被 claim 走了（'agent/inbox/claimed' ——
+    //   "One message left the inbox inside its open turn"），轮末 ccvTurnMsg 只能
+    //   退回读「界面」那条 —— 而**它不带引用** ✗。
+    //   实测：注入看到 1 条引用 ✓ 拼接看到 0 条 ✗，就卡在这儿。
+    var refs = []
+    var remainingOf = []
+    if (ccvLastTurnRefs && ccvLastTurnRefs.refs && ccvLastTurnRefs.refs.length) {
+      refs = ccvLastTurnRefs.refs
+      remainingOf = ccvLastTurnRefs.remaining || []
+      if (fresh) ccvSpliceTrace('用注入时留下的引用 ' + refs.length + ' 条（来自「' + ccvLastTurnRefs.src + '」）')
+    } else {
+      var picked = ccvTurnMsg(agent)
+      if (!picked) { if (fresh) ccvSpliceTrace('取不到本轮的人消息，跳过'); return }
+      refs = ccvParseRefs(picked.text)
+      if (fresh) ccvSpliceTrace('没有注入时留下的引用，退回现解析：' + refs.length + ' 条')
+      // remaining 的口径必须与注入一致（两条一模一样的引用靠它各归各位）
+      for (var a = 0; a < refs.length; a++) {
+        var n = 0
+        for (var b2 = a; b2 < refs.length; b2++) {
+          if (String(refs[a].quote) === String(refs[b2].quote)
+            && (refs[a].path || refs[a].title) === (refs[b2].path || refs[b2].title)) n++
+        }
+        remainingOf.push(n)
+      }
+    }
+    // ★ 读出来就立刻清空 —— 无论后面怎么走（早退 / 失败 / 没配上），
+    //   这一轮的引用都不该留给下一轮 ✗（否则下一轮没引用时会拿旧引用乱拼 ✗✗）
+    try { ccvLastTurnRefs = null } catch (_) {}
+    if (!refs.length) { if (fresh) ccvSpliceTrace('本轮没有引用，跳过'); return }
+
+    // 配到了几个编辑区 —— 留一行痕：万一下一环（配对）出问题，一眼能看到 ✗→✓
+    if (fresh) {
+      var probe = 0
+      var probeUsed = []
+      for (var pi = 0; pi < refs.length && pi < 3; pi++) {
+        if (ccvScratchForRef(refs[pi], probeUsed, remainingOf[pi] || 1)) probe++
+      }
+      ccvSpliceTrace('引用 ' + refs.length + ' 条，其中配到编辑区 ' + probe + ' 个'
+        + (probe ? '' : '（配不上 → 检查 pinCode 绑定）'))
+    }
+
+    // ── 先把「引用 ↔ 编辑区」全配好（**配对口径不能乱** ✗）──────────────
+    // 配对必须按引用在消息里的顺序做（第 N 条引用 ↔ 第 N 笔上报，见 ccvPinFind ✓），
+    // 但**拼接的顺序不能跟着它** —— 见下面的排序。
+    var used = []
+    var jobs = []
+    for (var i = 0; i < refs.length && i < 3; i++) {
+      var hit = ccvScratchForRef(refs[i], used, remainingOf[i])
+      if (!hit) continue                    // 这一条引用没开过编辑区 → 不拼（普通引用）
+      var sb = hit.area.scratch || {}
+      jobs.push({
+        area: hit.area,
+        off: (typeof sb.offset === 'number') ? sb.offset : -1,
+        docId: sb.docId || '',
+      })
+    }
+
+    // ★ 设计稿第 5 步的「串行」（2026-10-11 补）：**同一篇文档里多个编辑区，
+    //   按偏移从大到小拼** ✓
+    //   为什么必须这样：拼接是"换掉文档 [偏移, 偏移+长度) 那一段"，
+    //   先拼**前面**那个会让**后面**那个的偏移整体前移/后移 ✗ ——
+    //   接着拼第二个时，"原位那段还在吗"的校验会失败 ✗，然后退回按序数重定位；
+    //   而序数是"这段文字第几次出现"——第一个区已经被换掉了，计数跟着变 ✗
+    //   → 可能重定位到**错误的**那一处，静默改错地方 ✗✗
+    //   从大到小拼就没有这个问题：动后面那一段，不影响前面任何偏移 ✓
+    jobs.sort(function (a, b) { return b.off - a.off })
+
+    var tried = 0
+    var done = 0
+    var failed = []
+    for (var j = 0; j < jobs.length; j++) {
+      var area = jobs[j].area
+      tried++
+      var r = ccvSpliceArea(area)
+      if (r.ok) {
+        done++
+        ccvSpliceTrace('拼入《' + (r.doc ? r.doc.title : '?') + '》第 ' + r.at + ' 字处（'
+          + r.len + ' 字 → ' + String(area.content || '').length + ' 字），'
+          + r.why + '，现在 v' + r.version)
+        // ★ 第 4 步：拼接成功 → **立刻销毁**编辑区（设计稿第四节：一次性对象，全自动）
+        //   它是内存对象（不落盘 ✓），删掉即消失 ✓ 主人不需要做任何操作 ✓
+        //   ⚠️ 只在**成功**时销毁：失败时留着 —— 第九节是"报给主人"，不是"偷偷丢掉证据" ✗
+        try {
+          canvases.delete(area.id)
+          ccvSpliceTrace('编辑区 ' + area.id + ' 已销毁（一次性对象）')
+        } catch (_) {}
+      } else {
+        failed.push(r.why)
+        ccvSpliceTrace('没拼：' + r.why + '（编辑区 ' + area.id + ' 留着）')
+      }
+    }
+    // 用掉就清空 —— 现在改成"读出来就清"（见上），这里不再重复。
+    // 失败也清：设计稿第九节是"报给主人"，不是"下轮偷偷重试" ✓
+    if (!tried) return
+    if (failed.length) {
+      // ⚠️ 设计稿第九节：**不静默兜底** —— 定位不了就报给主人
+      try {
+        console.warn('[collab-canvas] 选区编辑区未拼入：' + failed.join('；'))
+      } catch (_) {}
+    }
+    ccvSpliceTrace('本轮结束：引用 ' + refs.length + ' 条，带编辑区 ' + tried + ' 个，拼入 ' + done
+      + ' 个' + (failed.length ? '，没拼 ' + failed.length + ' 个' : ''))
+  } catch (e) {
+    try { console.error('[collab-canvas] scratch splice failed:', e && e.message) } catch (_) {}
+  }
+}
+
+// 注册成宿主事件监听。
+//
+// 🔴 为什么注册在 **ctx.root** 而不是插件自己的 ctx（2026-10-11 实测定位）：
+//   作用域是一棵树 ——
+//        根
+//        ├── 插件 ctx（我们的插件挂在 profile 级，是**兄弟分支**）
+//        └── 会话 / agent 作用域  ← agent/turn-stopping 从这里派发
+//   事件只往上冒到**祖先** ✓，兄弟分支收不到 ✗ —— 所以挂在自己的 ctx 上**一次都不会触发**
+//   （实测：注册留痕在 ✓ 但"钩子触发"一行都没有 ✗）。
+//   官方那些插件能收到，是因为它们挂在**会话作用域**里（agent preset 内）；我们不是，
+//   所以必须显式挂到根上。
+//
+// 注册处**必须留痕**：主人报"根本没改"时，我分不清
+//   ① 跑着的宿主里有没有这个模块（重启了没）
+//   ② 有模块、但事件没触发
+// 两者表现**一模一样** ✗。留一行痕就一眼分得清。
+//
+// 两个钩子都挂（重复触发是安全的：编辑区上有 `spliced` 标记，拼过的不会再拼 ✓）：
+//   · agent/turn-stopping —— 语义最准（"这一轮就要关了"），serial 模式会被 await ✓
+//   · agent/status → idle —— 兜底
+try {
+  var evCtx = (ctx && ctx.root) ? ctx.root : ctx
+  var onRoot = !!(ctx && ctx.root && evCtx === ctx.root)
+  if (evCtx && typeof evCtx.on === 'function') {
+    // ★ 主力：官方的**持久事件流**（post-commit），turn/end 是轮末的权威信号。
+    //   抄的是官方插件 dsh-workspace-changes 的写法（它干的正是"一轮结束后收尾"）。
+    //   为什么它比 agent/turn-stopping 可靠：
+    //     · 它是**持久**事件 —— 不依赖收件箱那条消息还在不在（那条会被 claim 走 ✗）
+    //     · 它带 turn 号 —— 出问题时能对着会话日志查
+    evCtx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'turn/end') return
+        var turn = (event.data && event.data.turn !== undefined) ? event.data.turn : '?'
+        if (ccvSpliceFires < 5) ccvSpliceTrace('session/event: turn/end（turn=' + turn + '）→ 触发拼接')
+        return ccvSpliceTurn({ session: session, turn: turn, fromSessionEvent: true })
+      } catch (_) {}
+    })
+    // 次选：agent 侧那两个（语义也准，但实测依赖收件箱/作用域，容易哑火）
+    evCtx.on('agent/turn-stopping', ccvSpliceTurn)
+    evCtx.on('agent/status', function (payload) {
+      try {
+        if (payload && payload.status === 'idle') return ccvSpliceTurn(payload)
+      } catch (_) {}
+    })
+    ccvSpliceTrace('已注册（挂到 ' + (onRoot ? 'ctx.root ✓' : '插件自己的 ctx ✗ 收不到 agent 事件')
+      + '；主力 session/event:turn/end + 次选 agent/turn-stopping、agent/status:idle）—— 模块已加载')
+    console.log('[collab-canvas]', 'scratch splice registered on ' + (onRoot ? 'ctx.root' : 'own ctx'))
+  } else {
+    ccvSpliceTrace('没注册上：ctx.on 不可用')
+    console.error('[collab-canvas] ctx.on 不可用，编辑区拼接没注册上')
+  }
+} catch (e) {
+  ccvSpliceTrace('注册失败：' + ((e && e.message) || e))
+  console.error('[collab-canvas] scratch splice register failed:', e && e.message)
+}
+// [[CCV-SPLICE-END]]
 
     // ==================== 99-tail.js ====================
 // 启动引导：恢复持久化状态 + 注册 HTTP 端点

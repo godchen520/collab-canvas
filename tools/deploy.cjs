@@ -46,12 +46,23 @@ const CLIENT_SRC = 'src/client/editor-panel.js'
 const CLIENT_OUT = 'lib/client.js'
 
 // 要和工作区保持一致的全部文件（与 verify-all.cjs 第 3 节同一份清单）
+//  ⚠️ 2026-10-22 事故：这份清单**漏了 lib/doc-model.js** ✗✗
+//    → 它从来没被搬到部署副本 ✓ → 服务端读不到 → /api/canvas/doc-model.js 返回 500 ✗
+//    → 浏览器加载不到模型 ✓ → **A4 的"按块转换"从上线起一次都没生效过** ✓✓
+//    → 而且那个 500 在控制台里一直没人看 ✗
+//  教训：**新增一个侧模块 = 同时改四处** ✓
+//     ① lib/ 里真的建了文件 ✓  ② 本清单 ✓
+//     ③ src/host/11-canvas-extras.js 的名单 ✓  ④ src/client/editor-panel.js 的加载列表 ✓
+//   少任何一处都是**静默失效** ✗（不报错、只是功能不发生 ✓）
 const FILES = [
   'dist/host.js',
   'lib/client.js',
   'lib/selref.js',
-  'lib/doclink.js',
-  'lib/docdrop.js',
+  'lib/viewer-md.js',
+  'lib/doc-model.js',
+  // 纯逻辑共享层（2026-10-26 重构 P1）：可被 Node 直接测试 ✓ 浏览器由侧模块引导加载 ✓
+  'lib/ccv-logic.js',
+  // doclink.js / docdrop.js 于 2026-10-11 随画布面板删除（面板专属）
   'package.json',
   'cordis.patch.yml',
 ]

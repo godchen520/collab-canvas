@@ -236,28 +236,45 @@ function ccvPinAdd(p) {
   }
 }
 
-// 找出这条引用对应的上报记录。取**最新**的一条 —— 用户的操作顺序天然是
-// 「先划选、再发送」，所以最新那条就是这次的。
-// ⚠️ 已知边界：同一段原文连着划两次、却只发出第一条引用时，会取到后一条的序数。
-//   罕见，且注入文案里保留了每处的上下文供核对，不会静默改错。
+// 找出这条引用对应的上报记录。
+//
+// 🔴 2026-10-04 修正：**不再无脑取最新**，改成取「从后往前第 remaining 条」。
+//
+//   为什么：一条消息里出现两条**文字完全相同**的引用时（同一篇里同一个词选两处），
+//   无脑取最新会让两条引用抢同一条上报、最后**正好互换**：
+//       划第 5 处  → 上报 A(序数 5)     消息里第 1 条引用 → 从最新找 → 拿到 B(10) ✗
+//       划第 10 处 → 上报 B(序数 10)    消息里第 2 条引用 → B 用过了 → 拿到 A(5)  ✗
+//   主人 2026-10-04 实测的「改反了」就是这个 —— 而且是**静默改错**，界面上看不出来。
+//   （旧注释把它判成"罕见、不会静默改错"，判错了。）
+//
+//   remaining = 这条消息里与它**文字相同**的引用还剩几条（含自己）：
+//     · 只有 1 条引用（哪怕手上有历史上报）→ remaining=1 → 取最后一条 = 最新 ✓
+//       保持原来的正确行为：重新引用同一段时，不会取到上次那条旧上报。
+//     · 两条相同 → 第 1 条取倒数第 2 条、第 2 条取最后一条 ✓ 两条各归各位。
 //
 // 🔴 `used` 是**本次拼装里已经用掉的上报**：一条消息里引用了两段不同的原文、
 //   但它们被解析成同一个 `q`（比如原文本身含「」被截短）时，两条会抢同一条上报
 //   → 第二条拿到第一条的序数 → 改错地方。所以用过的不能再给下一条用。
-function ccvPinFind(path, quote, used) {
+function ccvPinFind(path, quote, used, remaining) {
   var want = ccvNormPathForRef(path)
   var q = String(quote || '')
   if (!q) return null
-  for (var i = ccvPins.length - 1; i >= 0; i--) {
+  // 先按**时间顺序**（旧 → 新）把所有匹配且没用过的收集起来，再按 remaining 从后往前取
+  var matched = []
+  for (var i = 0; i < ccvPins.length; i++) {
     var p = ccvPins[i]
     if (used && used.length && used.indexOf(p) >= 0) continue
     // 精确相等最好；但解析出来的原文在"原文本身含「」"时会被截短，
     // 所以也接受"它是上报原文的前缀"（截短只会往前截，不会变形）。
     if (p.text !== q && p.text.indexOf(q) !== 0) continue
     if (want && p.path && p.path !== want) continue
-    return p
+    matched.push(p)
   }
-  return null
+  if (!matched.length) return null
+  var back = (typeof remaining === 'number' && remaining > 0) ? remaining : 1
+  var k = matched.length - back
+  if (k < 0) k = 0
+  return matched[k]
 }
 
 // ── 二、从消息正文里认出「话布选区引用」──────────────────────────
@@ -428,7 +445,7 @@ function ccvSpotExcerpt(content, idx, quote) {
 
 // 单条引用 → 一段话。返回 '' 表示这条不值得注入（比如找不到文档）。
 // `used` 见 ccvPinFind：同一次拼装里上报记录不许被两条引用重复认领。
-function ccvDescribeRef(ref, used) {
+function ccvDescribeRef(ref, used, remaining) {
   var who = ref.path || ref.title || '（未标注）'
   var c = ccvFindDoc(ref)
   if (!c) {
@@ -457,6 +474,21 @@ function ccvDescribeRef(ref, used) {
       + '动手前请让用户重新划一次要引用的段落，**不要**去找相似的内容照着改。'
   }
 
+  // 定位这一条引用对应的**上报**（拿它换序数，也拿它查"有没有开过编辑区"）。
+  // 🔴 2026-10-11 起**提到分支之前** —— 单处引用也要查编辑区（编辑区与处数无关）。
+  var pin = ccvPinFind(ref.path, quote, used, remaining)
+  if (pin && used && used.indexOf(pin) < 0) used.push(pin)
+
+  // 这一条引用开过「选区编辑区」吗？（实施步骤 1：建区 + 绑定 + 注入）
+  var area = pin ? scratchForPin(pin.code) : null
+  var areaAt = -1
+  if (area) {
+    var ordA = (pin.ordinal > 0) ? pin.ordinal : 0
+    areaAt = (area.scratch && area.scratch.offset >= 0) ? area.scratch.offset
+      : ((ordA > 0 && ordA <= idxs.length) ? idxs[ordA - 1] : (idxs.length === 1 ? idxs[0] : -1))
+  }
+  var tail = area ? ('\n' + ccvScratchBlock(area, c, areaAt, quote.length)) : ''
+
   var shown = idxs.slice(0, CCV_SEL_MAX_SPOTS)
 
   // 只有一处：直接说死
@@ -464,7 +496,7 @@ function ccvDescribeRef(ref, used) {
     var lc1 = lineColOf(content, idxs[0])
     return '· 《' + c.title + '》「' + ccvShortQuote(quote, CCV_SEL_QUOTE_MAX)
       + '」在第 ' + lc1.line + ' 行，**全文只有这一处**：\n  '
-      + ccvSpotExcerpt(content, idxs[0], quote)
+      + ccvSpotExcerpt(content, idxs[0], quote) + tail
   }
 
   // 多处：把目标那一处标出来，其余只报行号（够模型核对，又不啰嗦）
@@ -472,8 +504,6 @@ function ccvDescribeRef(ref, used) {
   // 序数从哪来：**客户端刚报上来的**优先（引用正文里已经不写了）；
   // 拿不到才退回看抬头标签（兼容没更新的客户端 / 用户手打的引用）。
   // 两个都没有 → 绝不替模型挑一处，让它把每处摆给用户确认。
-  var pin = ccvPinFind(ref.path, quote, used)
-  if (pin && used && used.indexOf(pin) < 0) used.push(pin)
   var ordinal = (pin && pin.ordinal > 0) ? pin.ordinal : ref.ordinal
 
   var head = '· 《' + c.title + '》「' + ccvShortQuote(quote, CCV_SEL_QUOTE_MAX)
@@ -503,6 +533,36 @@ function ccvDescribeRef(ref, used) {
   } else {
     lines.push('  → 分不出用户要哪一处。请把上面每处的上下文摆给用户，让他确认改哪一处，不要自己挑一处改。')
   }
+  return lines.join('\n') + tail
+}
+
+// ─── 选区编辑区的注入（实施步骤 1：建区 + 绑定 + 注入，先不拼接）──────
+// 规格：canvas-docs/话布选区编辑区方案.md 第七节
+//
+// 为什么必须补语境：AI 只看到那一小段，你说"改成和上面一致"，它没有"上面"。
+// 为什么最后那条要求是**硬要求**：AI 的习惯是写"以下是修改后的版本"、加代码块围栏 ——
+//   将来拼回原文时那些说明文字就变成文档内容了 ✗（本步不拼接，但约束现在就立好）。
+var CCV_SCRATCH_CTX = 60   // 上文/下文各取多少字符
+
+function ccvScratchBlock(area, doc, offset, quoteLen) {
+  if (!area) return ''
+  var lines = []
+  lines.push('· 上面这一段已经开成了**选区编辑区**（它不是给你看的，是给你改的工作台）。')
+  lines.push('  改它就用现成的 canvas_write 写这个画布：id = ' + area.id
+    + '（现在 v' + area.version + '）。**不要去改主文档**。')
+  lines.push('  它现在的内容（原样）：')
+  String(area.content || '').split('\n').forEach(function (l) { lines.push('  │ ' + l) })
+  if (doc && offset >= 0) {
+    var content = String(doc.content || '')
+    var before = content.slice(Math.max(0, offset - CCV_SCRATCH_CTX), offset)
+    var after = content.slice(offset + (quoteLen || 0), offset + (quoteLen || 0) + CCV_SCRATCH_CTX)
+    if (before.replace(/\s/g, '')) lines.push('  上文：…' + before.replace(/\s+/g, ' '))
+    if (after.replace(/\s/g, '')) lines.push('  下文：' + after.replace(/\s+/g, ' ') + '…')
+  } else {
+    lines.push('  （它在原文里的位置没解析出来 —— **别自己猜**，需要定位就问用户）')
+  }
+  lines.push('  ⚠️ 要求：**只写替换后的内容本身**。不要写"以下是修改后的版本"这类说明，')
+  lines.push('     不要加代码块围栏，不要加前后缀 —— 你写的就是要放回原文那一段的东西。')
   return lines.join('\n')
 }
 
@@ -516,6 +576,10 @@ function ccvDescribeRef(ref, used) {
 //     只按正文做键就会把第二次挡掉，让模型拿着第一次的序数去改。
 var ccvSelCtxMemo = { key: null, val: '' }
 
+// 这一轮认到的引用（注入时留下，拼接时取用）。见 ccvBuildSelContext 里的注释：
+// 轮末再解析已经来不及 —— 队列那条消息被 claim 走了，界面那条不带引用 ✗。
+var ccvLastTurnRefs = null
+
 function ccvBuildSelContext(context) {
   try {
     var agent = context && context.agent
@@ -528,10 +592,40 @@ function ccvBuildSelContext(context) {
     if (ccvSelCtxMemo.key === memoKey) return ccvSelCtxMemo.val
 
     var refs = ccvParseRefs(text)
+    // 每条引用的 remaining = **从它起**（含自己）还有几条"同一篇 + 同一段原文"的引用。
+    // 用途见 ccvPinFind：一条消息里两条文字完全相同的引用，靠它各归各位。
+    var remainingOf = []
+    for (var a = 0; a < refs.length; a++) {
+      var n = 0
+      for (var b = a; b < refs.length; b++) {
+        if (String(refs[a].quote) === String(refs[b].quote)
+          && (refs[a].path || refs[a].title) === (refs[b].path || refs[b].title)) n++
+      }
+      remainingOf.push(n)
+    }
+    // 🔴 把这一轮认到的引用**记下来**（2026-10-11 加，拼接要用）。
+    //   为什么不能等轮末再解析：轮次一开始，队列那条消息就被 claim 走了
+    //   （'agent/inbox/claimed' —— "One message left the inbox inside its open turn"），
+    //   轮末只能退回读「界面」那条 —— 而**它不带引用** ✗。
+    //
+    //   ⚠️⚠️ 覆盖规则是踩出来的（2026-10-11 实测两轮）：
+    //     同一轮里本函数会被调多次，而**不同通道读出来的结果不一样** ——
+    //       17:50:52 来自「队列」→ 1 条引用 ✓
+    //       17:51:11 来自「界面」→ 0 条引用 ✗
+    //       17:51:25 来自「界面」（**时间自己往前走了**：17:50:52 → 17:51:11）→ 0 条 ✗
+    //     第一版我用"时间相同 = 同一条消息"来判断 —— 失效 ✗（界面那条的时间会变）。
+    //     最终规则（不依赖时间，最简单也最稳）：
+    //       **只在看到引用时才写缓存** ✓ —— 永远不用"空的"去覆盖"有引用的" ✗
+    //     清空交给拼接那边：**每轮结束都清**（包括没有引用的轮次）。
+    try {
+      if (refs.length) {
+        ccvLastTurnRefs = { refs: refs, remaining: remainingOf, text: text, src: picked.src, time: picked.time, at: Date.now() }
+      }
+    } catch (_) {}
     var blocks = []
     var usedPins = []
     for (var i = 0; i < refs.length && i < 3; i++) {
-      var one = ccvDescribeRef(refs[i], usedPins)
+      var one = ccvDescribeRef(refs[i], usedPins, remainingOf[i])
       if (one) blocks.push(one)
     }
     var out = ''

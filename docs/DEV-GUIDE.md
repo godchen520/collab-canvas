@@ -30,8 +30,13 @@
 - **Client 半边**：`lib/client.js` —— 独立的 `__ModuleLoader__.load` 模块，
   源文件是 `src/client/editor-panel.js`；由 package.json 的 `dsh.client` 声明加载
   ⚠️ **它不走 build.cjs**（该脚本只构建 host），由 `tools/deploy.cjs` 自动同步（见下一节）
-- 另有 `lib/selref.js`、`lib/docdrop.js`、`lib/doclink.js`：host **按请求实时读盘**供出去的
+- 另有 `lib/selref.js`、`lib/viewer-md.js`、`lib/doc-model.js`：host **按请求实时读盘**供出去的
   独立客户端模块 —— 改完**刷新页面即生效**，不用重启
+  ⚠️ **服务端那份名单是常量**（`src/host/11-canvas-extras.js` 里的 `['doc-model.js','selref.js','viewer-md.js']`）
+     —— **新增一个侧模块必须重启 `dsh web`** 才认得出该端点 ✗（2026-10-17 踩过 ✓）
+  ⚠️ 侧模块是 `new Function(src)()` 裸执行的 ✗ → **没有 `require`** ✗ 也不能用 `import`
+     → 要用什么只能从 `window.__ccvKit` 借 ✓（主模块借出来的 ✓）
+  ⚠️ 2026-10-11：`lib/docdrop.js` / `lib/doclink.js` **已随画布面板一起删除** ✗（别去找它们 ✓）
 - 已注册 **9 个** AI 工具（经 `ctx.tools.register`，全在 `src/host/07-tools.js`）：
   `canvas_list` / `create` / `read` / `write` / `save` / `load` / `configure` / `delete` / `locate`
 - 数据持久化到：`canvas-docs/`，会话清单在 `canvas-docs/.sessions/<sid>.json`
@@ -69,19 +74,23 @@ node tools/verify-all.cjs   # 上线前总检：真跑测试 + 工作区↔部�
 
 ### 🔴 同步清单（已由 deploy.cjs 代劳）
 
-改完源码后要保证这 **7 份**在**工作区与部署副本**两边一致：
+改完源码后要保证这几份在**工作区与部署副本**两边一致：
 
 ```
-dist/host.js   lib/client.js   lib/selref.js
-lib/doclink.js lib/docdrop.js  package.json  cordis.patch.yml
+dist/host.js   lib/client.js   lib/selref.js   lib/viewer-md.js
+lib/doc-model.js   package.json   cordis.patch.yml
 ```
+
+> ⚠️ 2026-10-17 更正两处旧说法：
+> · 原来写的是 `lib/doclink.js` / `lib/docdrop.js` —— **这两个文件已删** ✗
+> · 原来写"还没有一键搬运脚本" —— **早有了** ✓ 就是下面这条 `npm run deploy` ✓
 
 `node tools/verify-all.cjs` 的第 3 节会把它们逐个比一遍并指出哪份不一致；
 要动手搬运则用下面这条（不用再挨个拷）。
 
 ~~~bash
-node tools/deploy.cjs           # 一键搬运：本仓库 → 部署副本（npm run deploy）
-node tools/deploy.cjs --check   # 只看差哪几份，一个字节都不动
+npm run deploy                  # 一键搬运：本仓库 → 部署副本（= node tools/deploy-all.cjs）
+node tools/deploy-all.cjs --check   # 只看差哪几份，一个字节都不动
 ~~~
 
 它顺带把两件最容易做错的事一起做了：
@@ -96,6 +105,105 @@ node tools/deploy.cjs --check   # 只看差哪几份，一个字节都不动
 搬运是纯拷贝、可反复跑，两边已一致时会全部跳过。
 
 ---
+
+
+## 零点六、改客户端代码前必读（2026-10-26）
+
+### 纯逻辑放哪
+
+| 你要改的东西 | 放哪 | 要加测试吗 |
+|--------------|------|------------|
+| 哈希 / 地址拼装 / 分组 / 归属归一 / 目录切分 / 样式对象 | `lib/ccv-logic.js` | **必须** ✓ `tools/test-ccv-logic*.cjs` |
+| 文档模型（parse/serialize） | `lib/doc-model.js` | **必须** ✓ `tools/test-doc-model*.cjs` |
+| 需要 DOM / window / React hook / ctx | 主模块或 viewer-md.js | 只能靠 verify-all 文本守卫 |
+
+**判断标准**：这段代码"给定输入就有确定输出"吗？是 → 纯逻辑 → 进 ccv-logic ✓
+
+### 三条会咬人的坑
+
+1. **本包是 `"type": "module"`** —— `lib/*.js` 在 Node 里是 ESM，`module.exports` 不生效。
+   测试要显式装载：`new Function("module","exports","window", src)(...)`
+2. **文件是 CRLF** —— 所有字符串匹配必须容忍 `\r\n`，否则"明明有却找不到"
+3. **hook 不许写进循环/回调** —— 违反会让整个标签页崩成空白（3c 节守卫会抓）
+
+
+### 现在有哪几层测试（2026-10-27）
+
+| 层 | 命令 | 覆盖 | 抓得到什么 |
+|----|------|------|------------|
+| 纯逻辑 | `tools/test-ccv-logic*.cjs` | 哈希 / 地址 / 分组 / 归一 / 目录切分 / 样式对象 | 算法错 ✓ |
+| 文档模型 | `tools/test-doc-model*.cjs` | parse / serialize / roundTrip | 往返丢内容 ✓ |
+| 主机端 | `tools/test-host-*.cjs` + `test-selref-offset.cjs` | 变更 / 定位 / 恢复 / 选区 / 拼接 | 服务端逻辑错 ✓ |
+| 客户端冒烟 | `tools/test-client-smoke.cjs` | 装载 / 接线 / 注册标签页 / 渲染 / 点一级页 | 漏传依赖、搬坏组件 ✓ |
+| 查看器冒烟 | `tools/test-viewer-smoke.cjs` | 装载 / 声明 .md / 注册正文组件 / 渲染不抛错 | 同上（部分）✓ |
+
+全部由 `node tools/test-all.cjs` 自动收进来（命名 `test-*.cjs` 即可）✓
+
+### 查看器冒烟的已知局限（别当成万能）
+
+正文组件在**宿主资源没就绪**时会返回 `null` ✓ 这是它的设计 ✓
+所以查看器冒烟目前只验到"不抛错 / 注册成功"，**还没验到正文真的被构建** ✗
+→ 想让它变硬，需要在测试里补齐 `props.resourceAddress` 对应的资源桩与 `absPath` 解析链路 ✓
+→ 在那之前，**不要**用字符串搬运的方式大改 `BodyInner` ✗（2026-10-26 就是这么坏的）
+
+### 删+插必须「先删后插」（2026-10-27 实测）
+
+搬代码时常见写法是「插入新定义 + 删除原块」。**顺序反了就会删错**：
+
+```js
+// ✗ 错：先插定义，再用 replace 删"原块"
+//   此时文本里有两份一模一样的内容，replace 命中第一份 = 刚插进去的 ✓
+//   → 结果是：组件里那块还在，新 hook 却是空的 ✗
+//   → 更坑：冒烟测试**仍然是绿的**（空 hook 不报错）✓
+
+// ✓ 对：先删原位（换成一行注释），再插新定义
+```
+
+判断方法：搬完看**组件行数是否真的下降**。
+如果"搬了 84 行但组件只多 3 行"，就是命中错了 ✓
+
+### 拆 BodyInner 这类 hooks 函数时的坑（2026-10-27 实测）
+
+**坑：把 effect 搬成自定义 hook 时，参数是"调用那一刻的值"**
+
+BodyInner 里有个顺序问题：
+
+```
+L3410  r.useEffect(...)            ← 用到 dockedRef / outlineRef
+L3584  var dockedRef = r.useRef()  ← 声明在后面（靠 var 提升在 effect 里才可用）
+L3610  var outline = outSt[0]
+```
+
+在原函数里这是合法的：effect 是**渲染之后**才执行的，那时所有 var 都已赋值 ✓
+但一旦抽成 `useXxxWiring(D)` 并把调用放在原位：
+
+```
+var dockedRef = D.dockedRef   // ← 此刻 D.dockedRef 还是 undefined ✗
+```
+
+→ 别名在调用那一刻就被"钉死"成 undefined，effect 之后读到还是 undefined ✗
+→ 表现为 `Cannot read properties of undefined (reading 'current')`
+
+**两条正确做法**：
+
+1. 把 hook 调用**放到所有 ref/state 声明之后** ✓（hook 顺序只要每次一致即可）
+2. 或者传取值函数而不是值：`D.getDockedRef = function () { return dockedRef }` ✓
+
+⚠️ 顺带记住：光靠"机器算依赖清单"不够 ✗ 还要看**依赖的声明位置**与**取值时机** ✓
+   验证手段：`tools/test-viewer-smoke.cjs` 会真的执行 effect（含 cleanup）✓
+   那次抽 hook 失败就是它当场报出来的 ✓
+
+### 搬大段代码的规矩（血泪版）
+
+1. 先用测试证明"现状是绿的" ✓
+2. 算清这段代码**定义了什么**（不只是引用了什么）✗ 漏这步最致命
+3. 算清**谁还要用它** → 被搬走的定义必须由工厂 return 回来 ✓
+4. 算清**它要用谁** → 包括函数参数（apply 的 ctx 就这么漏过）与模块级变量 ✓
+5. 搬完立刻跑冒烟；红了当场回滚，不要往下叠 ✓
+### 体积纪律
+
+`verify-all` 第 3e 节盯着两个巨石函数：`apply()` ≤ 1000 行、`BodyInner` ≤ 760 行。
+只许往下走，不许反弹 ✗
 
 ## 一、为什么不能用 cordis_define（重要教训）
 
@@ -238,7 +346,7 @@ rootOverride（持久化 meta）> sessions.cwd > workspaceRegistry > 部署根
 
 | 位置 | 谁在用 |
 | --- | --- |
-| **画布内存**（host 的 `canvases` Map） | 画布面板显示的就是这份 |
+| **画布内存**（host 的 `canvases` Map） | **文档查看器里显示的就是这份** ✓（旧的画布面板已删 ✗） |
 | **磁盘文件** | git、外部工具、AI 读文件时看的是这份 |
 
 **直接写文件只更新磁盘，画布内存仍是旧内容**，后果有两个：

@@ -11,7 +11,13 @@ window.__ModuleLoader__.load({
     try {
       if (!window.__ccvSideModulesBooted) {
         window.__ccvSideModulesBooted = true;
-        ["/api/canvas/docdrop.js", "/api/canvas/doclink.js", "/api/canvas/selref.js"].forEach(function (u) {
+        // docdrop.js / doclink.js 随画布面板一起删了（2026-10-11）——它们是面板专属的：
+        //   docdrop  把文件拖到**面板上**上传；doclink 把对话里的文档名链接指向**面板**。
+        // 留着两个没人调的模块只会白拉两次源码 ✗
+        // ⚠️ doc-model.js 必须排在 viewer-md.js **前面** ✓
+        //   （A4：viewer-md 按块转换要用 window.__ccvDocModel ✓ 虽然是在渲染时才用，
+        //     但先加载它能让"模型没到 → 退回老路"这个兜底尽量不触发 ✓）
+        ["/api/canvas/ccv-logic.js", "/api/canvas/doc-model.js", "/api/canvas/selref.js", "/api/canvas/viewer-md.js"].forEach(function (u) {
           var name = u.slice(u.lastIndexOf("/") + 1);
           fetch(u + "?ts=" + Date.now()).then(function (r) {
             ccvLog(name + ": 源码拉取 HTTP " + r.status);
@@ -36,9 +42,28 @@ window.__ModuleLoader__.load({
     // ─── 会话标识：侧边栏「当前选中会话行」的标题 ───
     // 选中行有独立的 selected 类，切会话即变、同会话稳定——比窗口标题可靠
     //（窗口标题会随视图/加载状态变成无会话名的形态，导致键漂移）
+    //
+    // ★ 2026-10-26 重构 P1：纯逻辑搬进 lib/ccv-logic.js ★
+    //   hashStr / 地址拼装 / 分组拼装 / 旧键反查 全部在那边 ✓ 单一实现 ✓ 可被 Node 测试 ✓
+    //   这里只保留**需要 DOM / window / ctx** 的部分 ✓（这些本来就测不了 ✓）
+    //   ⚠️ 逻辑模块由侧模块引导异步加载 ✗ 所以用这个取值器：
+    //      真正用到它时（用户点开列表 / 打开文档）早就加载完了 ✓
+    //      取不到就**明确报错**并降级 ✓ 不静默 ✗
+    function ccvLogic() {
+      try {
+        var L = window.__ccvLogic
+        if (L && typeof L.buildGroups === 'function') return L
+      } catch (_) {}
+      ccvLog('逻辑层未加载 ✗（lib/ccv-logic.js 没到）—— 分组/地址功能会降级')
+      return null
+    }
+    // 兜底哈希：只在逻辑层没到时用 ✓（宁可算得对但重复，也不要直接崩 ✗）
     function hashStr(s) {
+      var L = ccvLogic()
+      if (L) return L.hashStr(s)
       let h = 5381;
-      for (let i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; }
+      const str = String(s == null ? '' : s)
+      for (let i = 0; i < str.length; i++) { h = ((h << 5) + h + str.charCodeAt(i)) >>> 0; }
       return h.toString(36);
     }
     // 标题形如 "DeepSeek Harness - <会话名> — DeepSeek Harness"，随会话切换变化；
@@ -54,11 +79,27 @@ window.__ModuleLoader__.load({
       } catch (_) {}
       return null;
     }
+    // ★ 2026-10-24：会话键优先用**真 sessionId** ★
+    //   主人原话：「现在要准确把分组名字显示成会话的名字」
+    //   老做法 = hash(会话名) ✗ 单向哈希 → 查不回会话名 → 分组只能显示乱码 ✓
+    //   真 sessionId 一直拿得到：
+    //     · 查看器 props.sessionId → window.__ccvSessionId（publishInput 里写的 ✓）
+    //     · 话布标签页 props.sessionId → 挂载时也写进同一个全局量 ✓
+    //   → 有真 id 就用真 id ✓ 没有才退回老的哈希键（不能让功能炸 ✗）
+    function realSessionId() {
+      try {
+        const v = window.__ccvSessionId
+        if (v && typeof v === 'string' && /^session-/.test(v)) return v
+      } catch (_) {}
+      return ''
+    }
     function sessionKey() {
-      const name = activeSessionTitle();
-      if (name) return "sess-" + hashStr(name);
-      const t = (document.title || "默认会话").trim() || "默认会话";
-      return "t" + hashStr(t);
+      const real = realSessionId()
+      if (real) return real                    // ← 新行为 ✓
+      const name = activeSessionTitle()        // ← 老兜底（哈希键 ✓）
+      if (name) return 'sess-' + hashStr(name)
+      const t = (document.title || '默认会话').trim() || '默认会话'
+      return 't' + hashStr(t)
     }
     function canvasApi(path) {
       try { return path + (path.indexOf("?") >= 0 ? "&" : "?") + "sid=" + encodeURIComponent(sessionKey()); } catch (_) { return path; }
@@ -72,11 +113,6 @@ window.__ModuleLoader__.load({
         }).then(function () {}, function () {});
       } catch (_) {}
     }
-    // 只在高频路径上用的日志：CCV_DEBUG 关着时连字符串拼接都不做（msg 可传函数，按需求值）
-    function ccvLogD(msg) {
-      if (!CCV_DEBUG) return;
-      try { ccvLog(typeof msg === "function" ? msg() : msg); } catch (_) {}
-    }
     // ─── 子模块共用的小工具 ────────────────────────────────
     // docdrop.js / doclink.js 是「单文件、由 host 按请求供源码」的模块：改完刷新页面即生效、
     // 不用重启。代价是它们没法互相 require，只能复制代码 —— 日志、轻提示条、会话查询串
@@ -87,6 +123,37 @@ window.__ModuleLoader__.load({
       log: function (msg, tag) {
         ccvLog(tag ? "[" + tag + "] " + msg : msg);
       },
+      // markdown → HTML。给「接管查看器 .md」那个侧模块用（lib/viewer-md.js）：
+      // 它要把文件内容渲染出来，而渲染器是本模块里的 mdToHtml —— 不重复造一份。
+      mdToHtml: function (md) { try { return mdToHtml(md); } catch (_) { return ""; } },
+      // React 也要借出去 —— 2026-10-04 补，这一条踩过坑：
+      //   React 是本模块从**模块加载器** require("react") 拿的（见文件开头 L30），
+      //   而侧模块是 host 端点供源码后 `new Function(src)()` **裸 eval** 的 ——
+      //   它既没有 require，也没有 window.React。viewer-md.js 里写
+      //   `window.React.createElement` 拿到的是 undefined → 组件 return null →
+      //   查看器里**一片空白**（而且看不出原因，因为组件明明被调用了）。
+      //   诊断日志打出 `React=没有` 才一眼定位。
+      React: React,
+      h: h,
+      // htmlToMd 也借出去 —— 2026-10-11 加。
+      // 为什么：往返自检（md → mdToHtml → htmlToMd → md2）本来挂在**面板**的加载流程里，
+      // 结果主人在**查看器**里翻文档，自检一次都没跑 ✗。
+      // 借给查看器之后，打开任何文档都能量到往返差异 —— 测量点跟着人走，而不是跟着代码走。
+      htmlToMd: function (el) { try { return htmlToMd(el); } catch (_) { return null; } },
+      // 建编辑区：**唯一实现**在主模块（见 ccvCreateScratch 的注释）——
+      // 查看器的划词按钮从这里取，保证两个入口行为一模一样。
+      createScratch: function (rec) { try { ccvCreateScratch(rec); } catch (_) {} },
+      // 草稿（未保存内容的本地兜底）—— **唯一实现在面板里** ✓
+      // 查看器拿它做"关页/崩溃不丢" ✓ 两个入口共用一份，行为必然一致 ✓
+      // （面板的做法见 draftSet / draftDropIf：打字停一下就存 localStorage ✓
+      //   打开文档时若草稿的基准版本对得上就恢复 ✓ 保存成功后丢掉 ✓）
+      draftGet: function (id) { try { return draftGet(id); } catch (_) { return null; } },
+      draftSet: function (id, content, base) { try { draftSet(id, content, base); } catch (_) {} },
+      draftDropIf: function (id, md) { try { draftDropIf(id, md); } catch (_) {} },
+      // 无条件丢掉草稿。用途：内容**回到基准**了（用户自己按 Ctrl+Z 撤回去了 ✓）
+      // 那份草稿就作废了 —— 不丢的话下次一查又会"恢复"回那次编辑 ✗✗
+      // （主人 2026-10-15 报的正是这个：改成斜体 → Ctrl+Z → 提示恢复了未保存的草稿 → 又变回斜体）
+      draftDrop: function (id) { try { draftDrop(id); } catch (_) {} },
       // 轻提示条。id 由调用方给：原来两处各用自己的 id、各自去重，这里保持同样口径。
       toast: function (msg, id) {
         try {
@@ -134,17 +201,6 @@ window.__ModuleLoader__.load({
         ccvLog("会话键: " + sessionKey() + " | 窗口标题: " + (document.title || ""));
       }
     } catch (_) {}
-    function ccvDesc(el) {
-      if (!el) return "null";
-      return el.tagName + (el.id ? "#" + el.id : "") + (el.className && typeof el.className === "string" ? "." + el.className.split(/\s+/).slice(0, 2).join(".") : "");
-    }
-
-    // ─── 停靠模式（右侧栏）─────────────────────────────
-    // 右侧栏的标签一切走，正文组件就被整个卸载重建（实测「正文已挂载」每次 +1）。
-    // 也就是说：界面上的东西没有任何一样能指望它自己记得住。
-    // 于是——① 面板实例放到模块级，方便别处复用；② 用户「刚敲进去、还没写盘」
-    // 的内容在卸载前抢存一份到 localStorage，切回来时先恢复它。
-    var CCV_DOCK_KIND = "collab-canvas";
     // 🔍 高频路径的调试日志开关。默认 false —— 因为"鼠标松开 / 划词判定 / 隐藏划词栏"
     //    这类动作一秒能触发几十次，每次都在拼调用栈并发一条网络请求写盘，属于实打实的卡顿源。
     //    平时静默；排查划词相关问题时把它改成 true，这些日志就会照旧出现。
@@ -161,11 +217,20 @@ window.__ModuleLoader__.load({
     //   v4  2026-09-14：「过期草稿」提示改为只提示一次（加 notified 标记），并缩短文案
     //   v5  2026-09-14：代码围栏的语言标记不再丢失（mdToHtml 存到 <pre data-lang>，
     //      htmlToMd 读回）；补了往返测试用例堵住这个盲区
-    var CCV_CLIENT_VERSION = 5;
+    //   v6  2026-09-28：接上撤销/重做（工具栏两个按钮 + Ctrl+Z/Y）。
+    //      撤销栈早在 host 侧就有（history/redoStack + canvas.undo RPC），
+    //      但客户端只走 HTTP、RPC 够不着，界面上等于不存在
+    //   v7  2026-10-04：修「点了撤销没反应」两处 ——
+    //      ① 程序性重绘后把「已同步」基线重定到 DOM 自己的序列化结果
+    //         （md 往返不是无损的，拿服务端 md 当基线会误判成"用户改了字"，
+    //          于是撤销前白写一步，撤掉的是刚写的同一份内容 = 看起来没反应）；
+    //      ② 撤销/重做按钮不再用 disabled 属性，栈空时也照样能点并给出提示
+    //   v8  2026-10-04：撤销/重做**成功之后也给提示**。
+    //      原来只在失败时说话，成功时界面一片安静 —— 主人按过撤销自己也不确定，
+    //      AI 那边更查不到，于是把"点了 3 次撤销"误判成了"面板覆盖文件"。
+    var CCV_CLIENT_VERSION = 8;
     var CCV_DRAFT_KEY = "ccv-draft-cache";    // { [canvasId]: { content, at, base } }
     var ccvCtx = null;                        // 模块级 ctx：tab 正文是独立组件，拿不到 apply 的闭包
-    var ccvLiveEditor = null;                 // 当前编辑区 DOM。组件卸载后 React 会把 ref 置空，
-    var ccvLiveCanvasId = null;               // 但我们自己留的这份引用仍能读到用户刚敲的字。
     var ccvLiveVer = 0;                       // 本机已知的服务端版本号（组件内 versionRef 的镜像）
     function ccvDrafts() {
       try { var o = JSON.parse(localStorage.getItem(CCV_DRAFT_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch (_) { return {}; }
@@ -188,16 +253,6 @@ window.__ModuleLoader__.load({
       // notified 每次写新草稿都归零：新内容可能又是一份会过期的草稿，该提示还得提示
       try { var all = ccvDrafts(); all[id] = { content: content, at: Date.now(), base: b, notified: false }; localStorage.setItem(CCV_DRAFT_KEY, JSON.stringify(all)); } catch (_) {}
     }
-    // 标记「这份草稿过期的事已经提示过了」。
-    // 没有它的话，草稿会一直躺在 localStorage 里，每次打开这篇话布都弹一次同样的提示 ——
-    // 而用户看了也无事可做，只能无视（2026-09-14 手机上实测到这个问题）。
-    function draftMarkNotified(id) {
-      if (!id) return;
-      try {
-        var all = ccvDrafts();
-        if (all[id]) { all[id].notified = true; localStorage.setItem(CCV_DRAFT_KEY, JSON.stringify(all)); }
-      } catch (_) {}
-    }
     function draftDrop(id) {
       if (!id) return;
       try { var all = ccvDrafts(); if (all[id]) { delete all[id]; localStorage.setItem(CCV_DRAFT_KEY, JSON.stringify(all)); } } catch (_) {}
@@ -210,12 +265,41 @@ window.__ModuleLoader__.load({
 
     // 窄屏（手机/平板竖屏）：分栏拖拽没法用，话布一律全屏铺满。
     // 阈值 768 是常见断点；同时认 coarse pointer（触屏）兜底。
+      // ── 建「选区编辑区」（规格：canvas-docs/话布选区编辑区方案.md）──────────
+      // 点「问AI」时，除了照旧插一条引用，还把这一笔选区交给 host：
+      // 开一个临时画布（编辑区），AI 改它、**从不碰主文档**；这一轮结束时自动拼回去。
+      //
+      // 🔴 **两个入口必须共用这一份**（面板的划词栏 / 查看器的划词按钮）——
+      //    2026-10-11 主人报"我每次都是打开的老话布"：那时只有查看器接了建区 ✗，
+      //    从面板点「问AI」压根不建区 → 注入没有、拼接也不会发生 ✗。
+      //    两条入口做的是同一件事，写两遍必然走偏（今晚 CSS 那次就是教训）。
+      //    所以这份是**唯一实现**，并挂在 __ccvKit 上给查看器用（见 lib/viewer-md.js）。
+      function ccvCreateScratch(rec) {
+        try {
+          if (!rec || !rec.code) return;
+          var path = "";
+          try {
+            // rec.doc.mention 是主模块按官方引号规则算好的 @"绝对路径"
+            path = String((rec.doc && rec.doc.mention) || "").replace(/^@"?/, "").replace(/"$/, "");
+          } catch (_) {}
+          fetch("/api/canvas/scratch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              pinCode: rec.code,
+              docId: (rec.doc && rec.doc.id) || "",
+              docPath: path,
+              quote: rec.selected || "",
+              ordinal: rec.ordinal || 0,
+              dupCount: rec.dupCount || 0,
+            }),
+          }).then(function (r) { return r.json(); })
+            .then(function (d) { ccvLog("编辑区：" + JSON.stringify(d)); })
+            .catch(function (e) { ccvLog("编辑区建立失败：" + (e && e.message)); });
+        } catch (e) { ccvLog("编辑区建立异常：" + (e && e.message)); }
+      }
+
     var NARROW_MAX = 768;
-    function isNarrow() {
-      if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches &&
-          window.innerWidth < 1024) return true;
-      return window.innerWidth < NARROW_MAX;
-    }
 
     // ─── Markdown ↔ HTML 转换（纯函数）────────────────────
     // 2026-09-12 从 CanvasPanel 里搬到这里。理由：这两个只依赖传进来的 DOM / 字符串，
@@ -352,11 +436,64 @@ window.__ModuleLoader__.load({
               tblOut.push("| " + tblRows[trJ].join(" | ") + " |");
               if (trJ === 0) {
                 var sepArr = [];
-                for (var scI = 0; scI < tblW; scI++) sepArr.push("---");
+                for (var scI = 0; scI < tblW; scI++) {
+                  // 对齐（2026-10-15 加）：从**第一行**对应单元格的 inline text-align 读 ✓
+                  //   （单元格里的块级元素也可能带 text-align —— execCommand('justifyCenter')
+                  //     就是写在那上面的 ✗ 所以两处都看 ✓）
+                  //   左 / 默认 → 写裸 --- ✓（左是 markdown 的默认 ✓ 文件更干净 ✓）
+                  var al = "";
+                  try {
+                    var c0 = tblTrs[0].querySelectorAll("th,td")[scI];
+                    var stA = (c0 && c0.getAttribute("style")) || "";
+                    var amA = stA.match(/text-align:\s*(left|center|right)/);
+                    if (!amA && c0 && c0.firstElementChild) {
+                      var stB = c0.firstElementChild.getAttribute("style") || "";
+                      var amB = stB.match(/text-align:\s*(left|center|right)/);
+                      if (amB) amA = amB;
+                    }
+                    if (amA) al = amA[1];
+                  } catch (_) {}
+                  sepArr.push(al === "center" ? ":---:" : (al === "right" ? "---:" : "---"));
+                }
                 tblOut.push("| " + sepArr.join(" | ") + " |");
               }
             }
-            return "\n" + tblOut.join("\n") + "\n";
+            var tblMd = "\n" + tblOut.join("\n") + "\n";
+            // ── 列宽（2026-10-15 加）──────────────────────────────────
+            // 拖动列边界之后 DOM 里会有 <colgroup><col style="width:40%"> ✓
+            // 把它序列化成紧随表格的一行注释：<!-- ccv-table: 40,60 -->
+            // mdToHtml 读它并把 <colgroup> 放回去 ✓（往返保真 ✓）
+            // 全是 auto（没有 colgroup / 宽度都是 auto）就不写注释 ✓ 保持文件干净 ✓
+            try {
+              var colEls = n.querySelectorAll ? n.querySelectorAll("colgroup col") : [];
+              var colWs = [];
+              for (var ci2 = 0; ci2 < colEls.length; ci2++) {
+                var st2 = colEls[ci2].getAttribute("style") || "";
+                var mw = st2.match(/width:\s*([\d.]+)%/);
+                colWs.push(mw ? Math.round(parseFloat(mw[1])) : 0);
+              }
+              var hasW = false;
+              for (var wi = 0; wi < colWs.length; wi++) { if (colWs[wi] > 0) { hasW = true; break; } }
+              if (hasW) tblMd += "<!-- ccv-table: " + colWs.join(",") + " -->\n";
+            } catch (_) {}
+            // ── 行高（2026-10-15 加）──────────────────────────────────
+            // 拖过行边界之后 <tr> 上会有 style="height:32px" ✓
+            // 序列化成另一行注释：<!-- ccv-table-h: 32,auto -->
+            // auto = 没拖过（由内容撑开 ✓）→ 一个都没拖过就不写注释 ✓ 保持文件干净 ✓
+            try {
+              var trEls = n.querySelectorAll ? n.querySelectorAll("tr") : [];
+              var rowHs = [];
+              var hasH = false;
+              for (var ri2 = 0; ri2 < trEls.length; ri2++) {
+                var st3 = trEls[ri2].getAttribute("style") || "";
+                var mh = st3.match(/height:\s*(\d+(?:\.\d+)?)px/);
+                var hv = mh ? Math.round(parseFloat(mh[1])) : 0;
+                if (hv > 0) hasH = true;
+                rowHs.push(hv > 0 ? hv : "auto");
+              }
+              if (hasH) tblMd += "<!-- ccv-table-h: " + rowHs.join(",") + " -->\n";
+            } catch (_) {}
+            return tblMd;
           }
           case "a":
             var href = n.getAttribute && n.getAttribute("href") || "";
@@ -569,7 +706,64 @@ window.__ModuleLoader__.load({
               // 若在这里 i+=2 跳过分隔行，第一行正文会被 buildTable 当分隔行吃掉
               i += 1;
               while (i < lines.length && lines[i].trim() && lines[i].indexOf("|") >= 0) { tblLines.push(lines[i].trim()); i++; }
-              out.push(buildTable(tblLines));
+              var tblHtml = buildTable(tblLines);
+              // ── 列宽（2026-10-15 加）────────────────────────────────
+              // 拖过列边界的表格，紧跟一行注释：<!-- ccv-table: 40,60 -->
+              // 用注释而不是内嵌 HTML 表格：**表格保持 markdown 的可读形式** ✓
+              // 注释在渲染时不可见 ✓ 也不会被当成正文 ✓
+              // （markdown 表格语法本身没有宽高 ✗ —— 成熟 markdown 工具也是靠外挂信息 ✓）
+              var wm = (lines[i] || "").trim().match(/^<!--\s*ccv-table:\s*([\d.,\s]+?)\s*-->$/);
+              if (wm) {
+                var ws = wm[1].split(",").map(function (x) { return parseFloat(x) || 0; });
+                if (ws.length) {
+                  var cg = "<colgroup>" + ws.map(function (x) {
+                    return x > 0 ? '<col style="width:' + x + '%">' : "<col>";
+                  }).join("") + "</colgroup>";
+                  tblHtml = tblHtml.replace("<table>", "<table>" + cg);
+                  i++;   // 吃掉注释行 ✓（别让它渲染出来）
+                }
+              }
+              // ── 行高（2026-10-15 加）────────────────────────────────
+              // 同一套思路，另一个标记：<!-- ccv-table-h: 32,auto -->
+              // auto = 由内容撑开（成熟产品的默认行为 ✓）→ 不写 style ✓
+              var hm = (lines[i] || "").trim().match(/^<!--\s*ccv-table-h:\s*([\d.,auto\s]+?)\s*-->$/);
+              if (hm) {
+                var hs = hm[1].split(",").map(function (x) {
+                  var v = String(x).trim();
+                  return (v === "auto" || v === "" || !(parseFloat(v) > 0)) ? 0 : Math.round(parseFloat(v));
+                });
+                if (hs.length) {
+                  var trIdx = -1;
+                  tblHtml = tblHtml.replace(/<tr>/g, function () {
+                    trIdx++;
+                    var h = hs[trIdx] || 0;
+                    return h > 0 ? '<tr style="height:' + h + 'px">' : "<tr>";
+                  });
+                  i++;   // 吃掉注释行 ✓
+                }
+              }
+              // ── 单元格对齐（2026-10-15 加）──────────────────────────
+              // markdown 的**分隔行自带对齐语法** ✓ —— 这是标准 markdown ✓ 不用外挂注释 ✓
+              //   | :--- | :---: | ---: |   →   左 / 中 / 右
+              //   （只有左是默认，所以左可以不写冒号；中间/右边必须写 ✓）
+              var sepLine = String(tblLines[1] || "").trim().replace(/^\|/, "").replace(/\|$/, "");
+              var aligns = sepLine.split("|").map(function (cc) {
+                var s2 = cc.trim();
+                var lf = s2.charAt(0) === ":";
+                var rt = s2.charAt(s2.length - 1) === ":";
+                return (lf && rt) ? "center" : (rt ? "right" : (lf ? "left" : ""));
+              });
+              var anyAlign = false;
+              for (var ai3 = 0; ai3 < aligns.length; ai3++) { if (aligns[ai3]) { anyAlign = true; break; } }
+              if (anyAlign) {
+                var cellIdx = -1;
+                tblHtml = tblHtml.replace(/<(th|td)>/g, function (m0, tag) {
+                  cellIdx++;
+                  var a0 = aligns[cellIdx % Math.max(1, aligns.length)];
+                  return a0 ? "<" + tag + ' style="text-align:' + a0 + '">' : m0;
+                });
+              }
+              out.push(tblHtml);
               continue;
             }
           }
@@ -676,1565 +870,39 @@ window.__ModuleLoader__.load({
     }
 
     // ─── 静态资源（模块级）─────────────────────────────
-    // 2026-09-12 从 CanvasPanel 里搬出来。这些要么是纯常量、要么只依赖彼此，
-    // 与任何组件状态无关 —— 留在组件体内等于每渲染一次就重造一遍（划词栏一弹出就是几十次）。
-    
-    // ─── 黑白线条图标库（stroke=currentColor，随主题/悬停变色，避免 emoji 彩色不统一）──
-    var CCV_ICONS = {
-      ask: '<path d="M4 5h16v11H10l-6 4z"/>',
-      highlight: '<path d="M12 4.5a4.5 4.5 0 0 0-2.6 8.2c.6.4 1.1 1.2 1.1 2v.8h3v-.8c0-.8.5-1.6 1.1-2A4.5 4.5 0 0 0 12 4.5z"/><path d="M9.5 19h5M10.5 21.5h3"/><path d="M12 1.5v2M5.6 3.6L7 5M18.4 3.6L17 5M3 9h2M21.5 9h-2"/>',
-      clear: '<path d="M16 4l4 4-9 9H7l-3-3L16 4z"/><path d="M5 21h14"/><path d="M11 9l4 4"/>',
-      uploadImage: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 16v-5M9.5 13.5L12 11l2.5 2.5"/>',
-      globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c3.2 2.7 3.2 14.3 0 17-3.2-2.7-3.2-14.3 0-17z"/>',
-      file: '<path d="M13.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5L13.5 3z"/><path d="M13.5 3v5.5H19"/>',
-      table: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9.5h18M9.5 9.5V20M15.5 9.5V20"/>',
-      task: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8.5 12.5l2.5 2.5 5-5.5"/>',
-      listUl: '<path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1.2"/><circle cx="4.5" cy="12" r="1.2"/><circle cx="4.5" cy="18" r="1.2"/>',
-      listOl: '<path d="M10 6h10M10 12h10M10 18h10"/><text x="2.5" y="8.5" font-size="7.5" stroke="none" fill="currentColor">1</text><text x="2.5" y="14.5" font-size="7.5" stroke="none" fill="currentColor">2</text><text x="2.5" y="20.5" font-size="7.5" stroke="none" fill="currentColor">3</text>',
-      link: '<path d="M9.5 14.5a4 4 0 0 0 5.7 0l3.2-3.2a4 4 0 1 0-5.7-5.7l-1.6 1.6"/><path d="M14.5 9.5a4 4 0 0 0-5.7 0l-3.2 3.2a4 4 0 1 0 5.7 5.7l1.6-1.6"/>',
-      code: '<path d="M8.5 7.5L4 12l4.5 4.5M15.5 7.5L20 12l-4.5 4.5"/>',
-      codeBlock: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9.5 10L7 12.5 9.5 15M14.5 10l2.5 2.5-2.5 2.5"/>',
-      quote: '<path d="M10 6H5.5v5H9c0 2.5-1.2 3.8-3.5 4M18.5 6H14v5h3.5c0 2.5-1.2 3.8-3.5 4"/>',
-      hr: '<path d="M4 12h16"/>',
-      hlBlock: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7 12h10" stroke-width="2.4"/>',
-      indent: '<path d="M4 5h16M10 10h10M10 14h10M4 19h16M7 9.5L4.5 12 7 14.5"/>',
-      outdent: '<path d="M4 5h16M10 10h10M10 14h10M4 19h16M4.5 9.5L7 12l-2.5 2.5"/>',
-    }
-    function ccvIcon(name, size) {
-      var body = CCV_ICONS[name]
-      if (!body) return ""
-      var s = size || 15
-      return '<svg viewBox="0 0 24 24" width="' + s + '" height="' + s + '" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="display:block">' + body + '</svg>'
-    }
-    
-    var SELBAR_ITEMS = [
-      { label: ccvIcon("ask") + '<span style="margin-left:5px">问AI</span>', title: "将选中文本发送给 AI 问答", isAskAI: true },
-      { type: "sep" },
-      { label: "H", cmd: "formatBlock", val: "<h2>", title: "标题", isHeading: true, hasDropdown: true },
-      { type: "sep" },
-      { label: "≡", title: "对齐", hasDropdown: true, showAlign: true },
-      { type: "sep" },
-      { label: "<b>B</b>", cmd: "bold", title: "粗体" },
-      { label: "<i>I</i>", cmd: "italic", title: "斜体" },
-      { label: "<s>S</s>", cmd: "strikeThrough", title: "删除线" },
-      { label: "U", cmd: "underline", title: "下划线", style: "text-decoration:underline" },
-      { label: ccvIcon("highlight"), cmd: "highlight", title: "高亮" },
-      { label: ccvIcon("clear"), cmd: "clearFormat", title: "清除格式" },
-      { type: "sep" },
-      { label: "⋮", title: "更多功能", hasDropdown: true, showFullMenu: true },
-    ]
-    
-    // ─── 样式常量 ──────────────────────────────────
-    var CCV_STYLE = {
-      // 定位/宽高/边框由注入的 CSS（!important）统一控制，这里只放外观
-      // 内层根 div 必须填满 #collab-canvas-panel 宿主（flex 列、高 100vh），
-      // 否则它没有确定高度 → 编辑区 flex:1 1 0% 解析成 0 → 内容被压没、overflowY 失效、滚轮滚不动。
-      // minWidth/minHeight 必须写 0：flex 子项默认 min-width:auto，会被内容（宽表格、
-      // 长代码块）顶着涨，撑出容器 —— 停靠在窄侧栏里尤其明显。
-      panel: { flex: "1 1 0%", minHeight: 0, minWidth: 0, background: "var(--dsw-alias-bg-layer-1, #fff)", color: "var(--dsw-alias-label-primary, #1a1a1a)", display: "flex", flexDirection: "column", fontFamily: "var(--font-ui, system-ui, sans-serif)" },
-      // overflowX:auto —— 宽表格/长代码块在窄侧栏里自己横向滚动，而不是把面板撑宽
-      editorWide: { flex: "1 1 0%", minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "auto", padding: "24px 32px", outline: "none", fontSize: 14, lineHeight: 1.75, wordBreak: "break-word" },
-    // 窄屏/窄侧栏：内边距收紧，省下的宽度留给内容
-      editorCompact: { flex: "1 1 0%", minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "auto", padding: "14px 16px", outline: "none", fontSize: 14, lineHeight: 1.75, wordBreak: "break-word" }
-    };
+    // （画布面板 2026-10-11 整体删除后，这里只剩下面这些共享件：
+    //    markdown 转换、草稿、__ccvKit、侧模块加载。图标库 / 划词栏条目 /
+    //    面板布局常量都随面板一起删了 —— 那些是面板专属的 ✗）
 
-    // ─── 编辑器面板组件 ─────────────────────────────────
-    // 只以「右侧栏标签正文」这一种方式被挂载（唯一调用点：下面的 CanvasDockBody）。
-    // 自建悬浮窗口 —— 连同顶栏按钮、拖拽边框、自带全屏、宽度测量、挤压对话列的整套
-    // 布局引擎 —— 已于 2026-09-12 整体删除；官方浮动（把标签拖出面板）走的也是这条路。
-    // 现在面板宽度完全由右侧栏标签页决定，自己量，不再碰对话列。
-    function CanvasPanel({ ctx }) {
-      const [canvases, setCanvases] = useState([]);
-      const [activeId, setActiveId] = useState(null);
-      // 顶栏两行：creating = 行内新建输入框展开（不弹浮层，直接插在第一行流里）
-      // dropOpen = 文件名胶囊下的话布切换下拉（absolute，挂在第一行内）
-      const [creating, setCreating] = useState(false);
-      const [newTitle, setNewTitle] = useState("");
-      const [dropOpen, setDropOpen] = useState(false);
-      const [content, setContent] = useState("");
-      const [version, setVersion] = useState(0);
-      const [narrow, setNarrow] = useState(isNarrow());
-      // 面板宽度由右侧栏标签页给，自己量（拖宽拖窄标签页时跟着变）
-      const [selfW, setSelfW] = useState(0);
-      const [restored, setRestored] = useState(false);   // 顶栏显示「已恢复未保存内容」
-      const editorRef = useRef(null);
-      const saveTimer = useRef(null);
-      const panelRef = useRef(null);
-      const meterRef = useRef(null);
-      // 兜底宽度用 ref 存一份。下面几个测量 effect 只在挂载时重跑一次，
-      // 若把宽度写进依赖数组，就会绕成「量宽度 → setSelfW → 宽度变 → 又去量」的圈。
-      // 用 ref 读最新值：既拿不到过期的数（原来的隐患），也不会多跑。
-      const panelWRef = useRef(selfW);
-      panelWRef.current = selfW;
-      const draftTimer = useRef(null);
-      // 划词选区暂存。2026-09-12 从组件函数体的普通变量改成 ref，理由见 saveSelection 处。
-      const savedRangeRef = useRef(null);
-      // ── 并发保护（2026-09-12）────────────────────────────────
-      // version 是 useState，但自动保存跑在 setTimeout 回调里，闭包抓到的是「设定时器
-      // 那次渲染」的值，可能已经过期。所以另存一份 ref，写入时读它才是当前已知版本号。
-      const versionRef = useRef(0);
-      // 最后一次「与服务端一致」的内容。用于冲突时判断本机有没有未保存的编辑：
-      //   DOM 内容 === lastSyncedMd.current  → 用户没动过，可以安全采用服务端版本
-      //   不等                              → 用户正在编辑，绝不能拿服务端内容覆盖他
-      const lastSyncedMd = useRef(null);
-      // "窄"由面板自己的宽度决定，而不是整个窗口 ——
-      // 窗口 1600 宽、侧栏只给 315 时，面板也是窄的，得用紧凑内边距。
-      const isNarrowPane = selfW > 0 && selfW < 520;
-      const compact = narrow || isNarrowPane;
 
-      // 横竖屏切换 / 窗口缩放时刷新窄屏判定
-      useEffect(() => {
-        function onResize() { setNarrow(isNarrow()); }
-        window.addEventListener('resize', onResize);
-        window.addEventListener('orientationchange', onResize);
-        return function () {
-          window.removeEventListener('resize', onResize);
-          window.removeEventListener('orientationchange', onResize);
-        };
-      }, []);
 
-      // 读数直接写 DOM，不走 state。停靠模式只有一种读数：面板自己被侧栏分到多宽。
-      function updateMeter(w) {
-        if (!meterRef.current) return;
-        meterRef.current.textContent = Math.round(w) + "px · 侧栏";
-      }
-      // 挂载后（CSS 已生效）测一次真实宽度。必须现场量 panelRef ——
-      // 不能用上面那个渲染时就定住的 selfW，首帧它还是 0，会把读数写成 0px。
-      useEffect(() => {
-        var t = setTimeout(function () {
-          var el = panelRef.current;
-          var w = el ? el.getBoundingClientRect().width : panelWRef.current;
-          setSelfW(Math.round(w));
-          updateMeter(w);
-        }, 0);
-        return function () { clearTimeout(t); };
-      }, []);
 
-      // 宽度由右侧栏标签页给，自己量。拖宽拖窄标签页时跟着变。
-      useEffect(function () {
-        var el = panelRef.current;
-        if (!el) return;
-        var measure = function () {
-          var w = Math.round(el.getBoundingClientRect().width);
-          setSelfW(w);
-          updateMeter(w);
-        };
-        measure();
-        if (typeof ResizeObserver === "undefined") return;
-        var ro = new ResizeObserver(measure);
-        ro.observe(el);
-        return function () { ro.disconnect(); };
-      }, []);
 
-      // 把「正在编辑的 DOM + 它属于哪个话布」记到模块级：卸载后 React 会把 ref 置空，
-      // 我们留的这份引用还能读到用户刚敲进去的字，用来抢存草稿。
-      useEffect(function () { ccvLiveCanvasId = activeId; }, [activeId]);
-      // 把组件内的已知版本号镜像到模块级：draftSet 是模块级函数，读不到 versionRef，
-      // 但草稿必须记住自己的基准版本（见 draftSet 注释）。每次渲染后同步一次即可 ——
-      // versionRef 的每次变更都伴随 setVersion → 必然触发渲染。
-      useEffect(function () { ccvLiveVer = versionRef.current; });
-      useEffect(function () {
-        ccvLiveEditor = editorRef.current;
-        return function () {
-          // 卸载瞬间抢存：右侧栏标签一切走，本组件就被整个拆掉，晚一步就读不到内容了
-          try {
-            if (ccvLiveCanvasId && ccvLiveEditor) draftSet(ccvLiveCanvasId, htmlToMd(ccvLiveEditor));
-          } catch (e) { ccvLog("草稿抢存失败: " + (e && e.message)); }
-          ccvLiveEditor = null;
-        };
-      }, []);
-
-      // ── 选区引用（侧模块 lib/selref.js）的取数桥 ──────────────────────
-      // 侧模块由 new Function 执行，跑在**全局作用域**，看不到这里的
-      // canvases / activeId / editorRef / versionRef。所以只把三个「现读现取」的
-      // 取值器挂出去，**怎么算位置、怎么翻译全部留在侧模块里** ——
-      // 主文件这边保持极薄：这里只挂桥，不搬逻辑（理由见设计稿第十节）。
-      useEffect(function () {
-        window.__ccvSelRefBridge = {
-          doc: function () {
-            var c = null
-            for (var i = 0; i < canvases.length; i++) {
-              if (canvases[i] && canvases[i].id === activeId) { c = canvases[i]; break }
-            }
-            return {
-              id: activeId,
-              title: c ? c.title : "",
-              // mention 直接复用现成的 @ 路径写法（含引号规则、旧 host 的兜底），不另写一份
-              mention: ccvDocMention(activeId),
-              version: versionRef.current
-            }
-          },
-          editor: function () { return editorRef.current },
-          // 现选区优先；手指已经离开编辑区（选区塌了）就退回暂存的那份
-          range: function () { return currentRange() || savedRangeRef.current },
-          // ── 下面两个是「AI 改完跳过去给你看」用的（需求见设计稿第十五节）──
-          // 打开指定文档。AI 的改动可能落在**别的**文档里（主人在看 A，它改了 B），
-          // 那就得先把 B 打开。复用现成的 loadCanvas：它是**异步**的（要拉内容），
-          // 所以返回 true 只表示「正在切」，调用方必须等渲染完再去找位置。
-          openDoc: function (id) {
-            if (!id || id === activeId) return false;   // 已经开着就不用切
-            var hit = false;
-            for (var i = 0; i < canvases.length; i++) {
-              if (canvases[i] && canvases[i].id === id) { hit = true; break; }
-            }
-            if (!hit) return false;                     // 文档不在了（可能被删了）
-            loadCanvas(id);
-            return true;
-          },
-          // 主人是不是正在画布编辑区里打字。是的话**本轮不跳** ——
-          // 跳转会挪走滚动位置、还会抢掉他的选区，正在输入的人会直接骂。
-          // 宁可慢一拍（下次轮询再跳），也不能打断输入。
-          isEditing: function () {
-            var ed = editorRef.current;
-            if (!ed) return false;
-            var ae = document.activeElement;
-            return !!(ae && (ae === ed || (ed.contains && ed.contains(ae))));
-          }
-        }
-      }, [canvases, activeId]);
-
-      // 防抖落草稿（打字时只更新内存引用，500ms 空闲才动 localStorage）
-      function scheduleDraft() {
-        var el = editorRef.current;
-        if (!el || !activeId) return;
-        ccvLiveEditor = el;
-        ccvLiveCanvasId = activeId;
-        if (draftTimer.current) return;
-        draftTimer.current = setTimeout(function () {
-          draftTimer.current = null;
-          try {
-            if (ccvLiveEditor && ccvLiveCanvasId) draftSet(ccvLiveCanvasId, htmlToMd(ccvLiveEditor));
-          } catch (_) {}
-        }, 500);
-      }
-
-      // 关页面/刷新前也抢一次：F5 不会触发 React 卸载
-      useEffect(function () {
-        function flush() { try { if (ccvLiveCanvasId && ccvLiveEditor) draftSet(ccvLiveCanvasId, htmlToMd(ccvLiveEditor)); } catch (_) {} }
-        window.addEventListener("beforeunload", flush);
-        window.addEventListener("pagehide", flush);
-        return function () {
-          window.removeEventListener("beforeunload", flush);
-          window.removeEventListener("pagehide", flush);
-        };
-      }, []);
-
-      // 全局点击隐藏划词栏和下拉菜单
-      useEffect(() => {
-        function onGlobalMouseUp(e) {
-          var bar = document.getElementById('ccv-selbar')
-          if (bar && bar.style.display !== 'none') {
-            if (bar.contains(e.target)) return
-            if (editorRef.current && editorRef.current.contains(e.target)) return
-            ccvLog('globalMouseUp: 命中隐藏分支 target=' + ccvDesc(e.target) +
-              ' editorRef=' + (editorRef.current ? '有' : '空') +
-              ' 在编辑区内=' + !!(editorRef.current && editorRef.current.contains(e.target)))
-            hideSelbar()
-          }
-          // 下拉菜单由各自的 mousedown 事件处理关闭
-        }
-        document.addEventListener('mouseup', onGlobalMouseUp)
-        return function () { document.removeEventListener('mouseup', onGlobalMouseUp) }
-      }, [])
-
-      // 面板挂载后自检：栏元素在不在、编辑区 ref 有没有、面板祖先链状态
-      useEffect(function () {
-        var t = setTimeout(function () {
-          var bar = document.getElementById('ccv-selbar')
-          var panel = panelRef.current
-          // 版本标记：client.js 由 DSH 打包加载，浏览器缓存/未刷新时从外观上看不出来。
-          // 排查「改动没生效」时第一件事就是核对它（doclink 早就因此加了 VERSION）。
-          ccvLog('client v' + CCV_CLIENT_VERSION + ' 已挂载')
-          var host = panel ? (panel.closest('#collab-canvas-panel') || panel.parentElement) : null
-          var hostCs = host ? getComputedStyle(host) : null
-          ccvLog('挂载自检: panel=' + ccvDesc(panel) + ' host=' + ccvDesc(host) +
-            ' hostOverflow=' + (hostCs ? hostCs.overflow : '?') +
-            ' hostTransform=' + (hostCs ? hostCs.transform : '?') +
-            ' editorRef=' + (editorRef.current ? '有' : '空'))
-          ccvLog('挂载自检: #ccv-selbar=' + (bar ? ('存在 display=' + bar.style.display + ' offsetParent=' + ccvDesc(bar.offsetParent)) : '缺失'))
-        }, 600)
-        return function () { clearTimeout(t) }
-      }, [])
-
-      // contentEditable 里的 <a> 浏览器默认不跳转（单击只把光标移进去）：
-      // - 脚注引用 [1]：capture 拦截，手动 scrollIntoView 跳到文末
-      // - 普通链接：单击直接新标签页打开，两端行为一致（外链开网页，
-      //   attachments/ 附件链接触发下载）。要改链接文字/地址：选中新链接文字后
-      //   重新「插入链接」即可覆盖
-      useEffect(function () {
-        var ed = editorRef.current;
-        if (!ed) return;
-        function onClick(e) {
-          var a = e.target.closest && e.target.closest('a[href]');
-          if (!a) return;
-          var href = a.getAttribute('href') || '';
-          if (!href) return;
-          if (href.indexOf('#fn') === 0) {
-            e.preventDefault();
-            e.stopPropagation();
-            var id = href.slice(1);
-            var target = document.getElementById(id) || ed.querySelector('[id="' + id + '"]');
-            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            return;
-          }
-          // 单击直接新标签页打开（外链开网页，attachments/ 附件链接触发下载）。
-          // 两端行为一致：手机端本来就没有 Ctrl 键，桌面端跟随。
-          // 只放行 http(s) 和站内路径（附件接口），防 javascript: 之类的注入
-          var openable = /^https?:\/\//i.test(href) || href.charAt(0) === '/';
-          ccvLog('链接点击: href=' + href + ' openable=' + openable);
-          if (!openable) return;
-          e.preventDefault();
-          e.stopPropagation();
-          window.open(href, '_blank', 'noopener');
-        }
-        ed.addEventListener('click', onClick, true);
-        return function () { ed.removeEventListener('click', onClick, true); };
-      }, []);
-
-      // 编辑区增强：粘贴截图自动上传、Tab/Shift+Tab 列表缩进
-      useEffect(function () {
-        var ed = editorRef.current;
-        if (!ed) return;
-        function inListItem() {
-          var sel = document.getSelection()
-          if (!sel || sel.rangeCount === 0) return false
-          var node = sel.getRangeAt(0).startContainer
-          if (node.nodeType === 3) node = node.parentNode
-          while (node && node.nodeType === 1) {
-            var tag = node.tagName ? node.tagName.toLowerCase() : ""
-            if (tag === "li" || tag === "ul" || tag === "ol") return true
-            if (node.classList && node.classList.contains("ccv-editor")) break
-            node = node.parentNode
-          }
-          return false
-        }
-        function onKeyDown(e) {
-          if (e.key !== "Tab") return
-          e.preventDefault()
-          if (inListItem()) {
-            // 列表里：Tab 嵌套一级、Shift+Tab 退回一级，效果相反
-            document.execCommand(e.shiftKey ? "outdent" : "indent", false, null)
-          } else if (!e.shiftKey) {
-            // 非列表：Tab 插两个空格；Shift+Tab 无处可退，不做动作
-            // （之前 Shift+Tab 也走这里插空格，两种按起来一样，是 bug）
-            document.execCommand("insertText", false, "  ")
-          }
-        }
-        function onPaste(e) {
-          var items = e.clipboardData && e.clipboardData.items
-          if (!items) return
-          for (var i = 0; i < items.length; i++) {
-            var it = items[i]
-            if (it.kind === "file" && it.type && it.type.indexOf("image/") === 0) {
-              var f = it.getAsFile()
-              if (!f) continue
-              e.preventDefault()
-              // 剪贴板里的截图通常叫 image.png，重命名带上时间戳便于辨认
-              var ext = (it.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png"
-              var name = "clipboard-" + Date.now() + "." + ext
-              try { f = new File([f], name, { type: it.type }) } catch (_) { /* 旧环境保留原名 */ }
-              var rng = currentRange()
-              uploadCanvasFile(f, function(p) {
-                insertHtmlAtRange('<img src="' + escHtml(assetDisplayUrl(p)) + '" alt="截图" style="max-width:100%;height:auto;vertical-align:middle"/>', rng)
-              }, function(f2) {
-                // 上传失败兜底：dataURL 内嵌
-                fileToDataUrl(f2, function(u) {
-                  if (u) insertHtmlAtRange('<img src="' + u + '" alt="截图" style="max-width:100%;height:auto;vertical-align:middle"/>', rng)
-                  else ccvLog("paste: 图片上传失败且无兜底")
-                })
-              })
-              return
-            }
-          }
-        }
-        ed.addEventListener("keydown", onKeyDown)
-        ed.addEventListener("paste", onPaste)
-        return function () {
-          ed.removeEventListener("keydown", onKeyDown)
-          ed.removeEventListener("paste", onPaste)
-        };
-      }, []);
-
-      // 兜底触发：编辑区的 React onMouseUp 不是每次都生效（拖选结束时指针落在
-      // 编辑区外、选区在 mouseup 之后才定型等）。用 selectionchange 补一次，
-      // 只在「选区确实落在编辑区内」时才接管，避免污染会话区的划词。
-      useEffect(function () {
-        var t = null
-        function onSelChange() {
-          if (t) clearTimeout(t)
-          t = setTimeout(function () {
-            try {
-              var sel = document.getSelection()
-              if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return
-              var ed = editorRef.current
-              if (!ed || !sel.anchorNode || !ed.contains(sel.anchorNode)) return
-              var bar = document.getElementById('ccv-selbar')
-              if (bar && bar.style.display !== 'none') return   // 已经显示就不再重复渲染
-              var rect = sel.getRangeAt(0).getBoundingClientRect()
-              if (!rect || (!rect.width && !rect.height)) return
-              ccvLog('selectionchange: 兜底触发（编辑区 mouseup 未生效）')
-              updateSelFormats(sel)
-              showSelbar(rect)
-            } catch (e) {}
-          }, 30)
-        }
-        document.addEventListener('selectionchange', onSelChange)
-        return function () { if (t) clearTimeout(t); document.removeEventListener('selectionchange', onSelChange) }
-      }, [])
-
-      useEffect(() => {
-        fetch(canvasApi("/api/canvas/list")).then(r => r.json()).then(d => {
-          // pending 时让位：doclink 链接点名要打开的画布优先于默认 activeId
-          if (d.ok) { setCanvases(d.canvases); if (d.activeId && !window.__ccvPendingCanvasId) loadCanvas(d.activeId); }
-        }).catch(() => {});
-      }, []);
-
-      // doclink 桥接：外部「文档名链接」点名要打开的画布（优先于默认 activeId），
-      // 打开状态下通过事件直接切换
-      useEffect(function () {
-        var pid = window.__ccvPendingCanvasId;
-        if (pid) { window.__ccvPendingCanvasId = null; loadCanvas(pid); }
-        function onOpen(e) {
-          var id = e.detail && e.detail.id;
-          if (!id) return;
-          loadCanvas(id);
-          // 新导入的画布不在清单里，顺手刷新下拉列表
-          fetch(canvasApi("/api/canvas/list")).then(r => r.json()).then(d => {
-            if (d.ok) setCanvases(d.canvases);
-          }).catch(() => {});
-        }
-        window.addEventListener('ccv-open-canvas', onOpen);
-        return function () { window.removeEventListener('ccv-open-canvas', onOpen); };
-      }, []);
-
-      // 清单轮询：AI 通过工具创建/加载的画布自动出现在下拉清单里（10 秒一次）
-      useEffect(function () {
-        var t = setInterval(function () {
-          try {
-            fetch(canvasApi("/api/canvas/list")).then(r => r.json()).then(d => {
-              if (d.ok) setCanvases(d.canvases);
-            }).catch(() => {});
-          } catch (_) {}
-        }, 10000);
-        return () => clearInterval(t);
-      }, []);
-
-      // 把编辑器里**还没写出去**的内容立刻落一次。返回 Promise：
-      //   resolve(null)           没有待写内容（没编辑器 / 内容与服务端一致）
-      //   resolve({ ok:true,… })  写成功
-      //   resolve({ conflict:… }) 服务端版本已前进，本机这一份没写进去
-      //
-      // 🔴 2026-09-15 新增，修的是一个**静默丢字**：
-      //    以前「重载」和「切走文档」都只做 clearTimeout，把等待中的自动保存**直接丢掉**，
-      //    然后拿服务端内容覆盖界面。于是「刚敲完就点重载」= 自己敲的字被取消，
-      //    界面又变回旧内容 —— 主人报的「改了却看不到 / 改了又变回去」正是这条路径。
-      //    clearTimeout 本身没错（它防的是响应乱序），错在**只取消、不落地**。
-      //    这里两件事都做：先取消定时器，再亲手把这份内容写出去。
-      function flushPending() {
-        clearTimeout(saveTimer.current);
-        var id = ccvLiveCanvasId;
-        var el = editorRef.current;
-        if (!id || !el) return Promise.resolve(null);
-        var md;
-        try { md = htmlToMd(el); } catch (_) { return Promise.resolve(null); }
-        // 没动过就不必写（和服务端本来就一致），省一次请求
-        if (lastSyncedMd.current === null || md === lastSyncedMd.current) return Promise.resolve(null);
-        ccvLog("重载/切走前先落一次待写内容（不再直接丢弃）");
-        return writeMd(id, md);
-      }
-
-      function loadCanvas(id) {
-        var sameDoc = (id === ccvLiveCanvasId);
-        flushPending().then(function (res) {
-          // 本机有内容却没写成功（服务端版本已经前进 → 冲突）：
-          // 这时候再拿服务端内容覆盖界面，就是把主人正在编辑的东西从他眼前抹掉。
-          // 所以**保留界面不动**，只告诉他一声，留哪一份由他定。
-          if (sameDoc && res && res.conflict) {
-            ccvLog("重载已中止：本机有未提交的编辑，且服务端也有新版本");
-            if (window.__ccvKit && window.__ccvKit.toast) {
-              window.__ccvKit.toast("你还有没提交的编辑，已为你保留；服务端也有新版本，先确认要留哪一份", "ccv-reload-blocked");
-            }
-            return;
-          }
-          doLoad(id);
-        }).catch(function () { doLoad(id); });
-      }
-
-      function doLoad(id) {
-        fetch(canvasApi("/api/canvas/read?id=" + encodeURIComponent(id))).then(r => r.json()).then(d => {
-          if (!d.ok) return;
-          var dft = draftGet(d.id);
-          if (dft && dft.content !== d.content) {
-            // ⚠️ 草稿必须先验「基准版本」再用。
-            // 草稿是「本机还没写回服务端」的那一版；但如果服务端在草稿产生之后前进过
-            // （AI 改了文档、或另一处写了新内容），把草稿写回去就是用旧内容覆盖新内容。
-            // 两次「话布优化」被整段抹掉都是这条路径干的：
-            // 恢复草稿 → 用服务端的当前版本当 knownVer → 版本校验通过 → 覆盖成功。
-            var dbase = (typeof dft.base === "number") ? dft.base : null;
-            if (dbase === null || dbase !== d.version) {
-              // 基准对不上（含没有 base 的旧格式草稿）→ 不自动写回，只载入服务端内容。
-              // 草稿仍留在 localStorage 里没被删，用户的内容不会丢。
-              ccvLog("草稿基准不符(草稿 v" + dbase + " / 服务端 v" + d.version + ")，不自动写回: id=" + d.id);
-              setActiveId(d.id); setContent(d.content); setVersion(d.version);
-              versionRef.current = d.version; lastSyncedMd.current = d.content;
-              setRestored(false);
-              // 只提示一次：草稿会一直躺在 localStorage 里，每打开一次都弹就成了噪音，
-              // 而且用户看了也无事可做。保护照旧（每次都不写回），只是不再重复告知。
-              if (!dft.notified) {
-                draftMarkNotified(d.id);
-                if (window.__ccvKit && window.__ccvKit.toast) {
-                  window.__ccvKit.toast("已跳过一份过期的本地草稿，当前显示的是最新版本", "ccv-draft-stale");
-                }
-              }
-              return;
-            }
-            // 有一份没来得及写盘的草稿：它是用户刚敲的，比服务端那版新，优先恢复它。
-            // 恢复后按「停止输入 1.5 秒自动存」的同一规矩补写回服务端，
-            // 否则用户切走之后，这段内容只活在浏览器里，AI 在对话里看不到。
-            ccvLog("恢复未保存草稿: id=" + d.id + " 长度=" + dft.content.length + " 服务端长度=" + d.content.length);
-            setActiveId(d.id); setContent(dft.content); setVersion(d.version);
-            // 已知版本 = 服务端的版本；已同步内容 = 服务端那份（≠ 本地草稿，
-            // 冲突判定据此认出「本机有未保存编辑」）
-            versionRef.current = d.version; lastSyncedMd.current = d.content;
-            setRestored(true);
-            clearTimeout(saveTimer.current);
-            saveTimer.current = setTimeout(function () { writeMd(d.id, dft.content); }, 1500);
-          } else {
-            setActiveId(d.id); setContent(d.content); setVersion(d.version);
-            versionRef.current = d.version; lastSyncedMd.current = d.content;
-            setRestored(false);
-          }
-        }).catch(() => {});
-      }
-
-      // 删除话布：移出清单并删除对应 md 文件（host 端 /api/canvas/delete）
-      function deleteCanvasById(id, title) {
-        if (!confirm("确定删除话布「" + title + "」吗？\n对应的 md 文件也会一并删除，不可恢复。")) return;
-        fetch(canvasApi("/api/canvas/delete?id=" + encodeURIComponent(id))).then(r => r.json()).then(d => {
-          if (d.ok) {
-            setCanvases(prev => prev.filter(x => x.id !== id));
-            if (activeId === id) { setActiveId(null); setContent(""); setVersion(0); versionRef.current = 0; lastSyncedMd.current = null; }
-          } else alert("删除失败: " + (d.error || "未知错误"));
-        }).catch(() => alert("删除失败"));
-      }
-
-      // 并发冲突处理（host 端 applyWrite 检出 baseVersion 不匹配时回调到这里）。
-      // AI 在对话里改过这份文档 → 服务端版本已经前进，而我们手里是旧内容。
-      // 关键是别把正在编辑的人的内容丢掉，所以分两种情形：
-      //   ① 本机没有未保存编辑（DOM 内容 === 最后一次与服务端一致的内容）
-      //      → 采用服务端版本。这正是「AI 写入被编辑器覆盖」那个 bug 的修复点。
-      //   ② 本机有编辑 → 不覆盖，只提示，交给用户决定（点「重载」拿最新）。
-      function resolveConflict(localMd, d) {
-        var serverMd = typeof d.currentContent === "string" ? d.currentContent : "";
-        var base = lastSyncedMd.current;
-        if (base !== null && localMd === base) {
-          ccvLog("冲突: 本机无改动 -> 采用服务端 v" + d.currentVersion);
-          setContent(serverMd);
-          setVersion(d.currentVersion);
-          versionRef.current = d.currentVersion;
-          lastSyncedMd.current = serverMd;
-          setRestored(false);
-          if (window.__ccvKit && window.__ccvKit.toast) window.__ccvKit.toast("这份话布已被 AI 更新，已同步到最新版本");
-        } else {
-          ccvLog("冲突: 本机有未保存编辑 -> 保留本地，不覆盖");
-          if (window.__ccvKit && window.__ccvKit.toast) window.__ccvKit.toast("这份话布已被 AI 更新；你的编辑尚未提交，点「重载」可查看最新内容", "ccv-conflict-toast");
-        }
-      }
-
-      // 写盘。接受显式的 md：卸载后 / 恢复草稿时编辑器 DOM 已不可靠，
-      // 这两种情况下必须用调用方手里那份内容，不能再回头读 DOM。
-      function writeMd(id, md) {
-        if (!id || typeof md !== "string") return Promise.resolve(null);
-        return fetch(canvasApi("/api/canvas/write"), {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          // knownVer：带上去，host 端 applyWrite 才能检出「我们基于旧版本写」的并发冲突。
-          // 不带的话 typeof baseVersion !== 'number' → 直接跳过校验 → 后写覆盖先写。
-          body: JSON.stringify({ id: id, content: md, knownVer: versionRef.current })
-        }).then(r => r.json()).then(function (d) {
-          // ⚠️ 只有「写的还是当前打开的这一篇」时才更新本地基准。
-          // 「重载/切走前先落一次」会在切换途中发请求，响应回来时可能已经在看别的文档了；
-          // 那时若照旧更新，就会把**旧文档**的版本号盖到**新文档**身上。
-          var still = (id === ccvLiveCanvasId);
-          if (d && d.ok) {
-            if (still) {
-              setVersion(d.version);
-              versionRef.current = d.version;
-              lastSyncedMd.current = md;
-              setRestored(false);
-            }
-            draftDropIf(id, md);
-          } else if (d && d.conflict) {
-            if (still) resolveConflict(md, d);
-          }
-          return d;
-        }).catch(function () { return null; });
-      }
-
-      function saveCanvas() {
-        if (!activeId || !editorRef.current) return;
-        writeMd(activeId, htmlToMd(editorRef.current));
-      }
-
-      // 在系统文件管理器里打开当前文档所在的文件夹（host 端调 explorer/open/xdg-open）
-      function openFolder() {
-        fetch("/api/canvas/open-folder", { method: "POST" })
-          .then(r => r.json())
-          .then(d => { ccvLog("open-folder 响应: " + JSON.stringify(d)); })
-          .catch(e => { ccvLog("open-folder 请求失败: " + e); });
-      }
-
-      // 「登记」：管理拖拽文件来源文件夹（host 端文件登记表，命中后按真实路径 @ 引用）
-      function manageRegistry() {
-        fetch("/api/canvas/registry").then(r => r.json()).then(d => {
-          if (!d.ok) { alert("读取登记信息失败"); return; }
-          const folders = d.folders || [];
-          const tip = folders.length
-            ? folders.map((f, i) => (i + 1) + ". " + f).join("\n") + "\n\n输入序号移除对应文件夹；或直接输入新的文件夹绝对路径添加："
-            : "尚未登记文件夹。\n输入要登记的文件夹绝对路径（之后拖拽该文件夹内的文件时，将按真实路径 @ 引用）：";
-          const ans = prompt("已登记 " + folders.length + " 个文件夹，共索引 " + (d.files || 0) + " 个文件。\n\n" + tip, "");
-          if (ans === null) return;
-          const t = ans.trim();
-          let next;
-          const idx = /^\d+$/.test(t) ? parseInt(t, 10) - 1 : -1;
-          if (idx >= 0 && idx < folders.length) {
-            next = folders.filter((_, i) => i !== idx);
-          } else if (t) {
-            next = folders.concat([t]);
-          } else {
-            return;
-          }
-          fetch("/api/canvas/registry", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ folders: next })
-          }).then(r => r.json()).then(d2 => {
-            if (d2.ok) alert("已更新登记文件夹（" + (d2.folders || []).length + " 个，索引 " + (d2.files || 0) + " 个文件，构建中）");
-            else alert("更新失败: " + (d2.error || "未知错误"));
-          }).catch(() => alert("更新失败"));
-        }).catch(() => alert("读取登记信息失败"));
-      }
-
-      // ─── 顶栏：新建话布（行内输入框，替掉原生 prompt）──
-      function startCreate() { setDropOpen(false); setNewTitle(""); setCreating(true); }
-      function cancelCreate() { setCreating(false); setNewTitle(""); }
-      function submitCreate() {
-        const t = newTitle.trim();
-        if (!t) { cancelCreate(); return; }
-        fetch(canvasApi("/api/canvas/create"), {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: t })
-        }).then(r => r.json()).then(d => {
-          if (d.ok) {
-            setCanvases(prev => prev.concat([{ id: d.id, title: d.title }]));
-            loadCanvas(d.id);
-          }
-          cancelCreate();
-        }).catch(() => { cancelCreate(); });
-      }
-      function toggleDrop() { setCreating(false); setDropOpen(v => !v); }
-
-      // 点下拉/胶囊以外的地方关闭下拉；Esc 同时取消新建
-      useEffect(() => {
-        if (!dropOpen && !creating) return;
-        function onDown(e) {
-          const t = e.target;
-          if (t && t.closest && (t.closest(".ccv-drop") || t.closest(".ccv-chip") || t.closest(".ccv-ninput"))) return;
-          setDropOpen(false);
-          cancelCreate();
-        }
-        function onKey(e) { if (e.key === "Escape") { setDropOpen(false); cancelCreate(); } }
-        document.addEventListener("mousedown", onDown);
-        document.addEventListener("keydown", onKey);
-        return () => {
-          document.removeEventListener("mousedown", onDown);
-          document.removeEventListener("keydown", onKey);
-        };
-      }, [dropOpen, creating]);
-
-      // ─── Markdown ↔ HTML ──────────────────────────
-      // ⚠️ htmlToMd / mdToHtml 已搬到模块级，见文件上方「Markdown ↔ HTML 转换（纯函数）」。
-      //    找不到不是被删了 —— 往上翻。
-
-      // ↑ 已提到模块级：见文件上方「静态资源（模块级）」
-      // ─── 划词栏（参考豆包样式）──────────────────────
-      // 选区暂存。用 ref（savedRangeRef，声明在组件顶部的 ref 区），**不能用普通变量**：
-      // 写在组件函数体里的变量每次重渲染都会被重新初始化，而这里存在**真正的跨渲染访问** ——
-      // 下面 showDropdownAt 里注册的「点外部关闭」监听是异步的（setTimeout + mousedown 事件），
-      // 它会写这个变量；中间只要发生过一次重渲染，那次写入就落进了旧闭包，
-      // 当前渲染读到的还是旧值 → 之后 restoreSelection 会把内容加粗到**旧位置**。
-      // 改成 ref 后：所有渲染共享同一个对象（不再有新旧闭包之分），
-      // 同时保持"每个面板实例各存各的"——悬浮与停靠并存时不会互相覆盖。
-
-      function saveSelection() {
-        var sel = document.getSelection()
-        if (sel && sel.rangeCount > 0) savedRangeRef.current = sel.getRangeAt(0).cloneRange()
-      }
-      function restoreSelection() {
-        if (!savedRangeRef.current) return
-        var sel = document.getSelection()
-        if (sel) { sel.removeAllRanges(); sel.addRange(savedRangeRef.current) }
-        savedRangeRef.current = null
-      }
-
-      function closeDropdowns() {
-        var existing = document.querySelectorAll('.ccv-dropdown')
-        existing.forEach(function(d) { d.remove() })
-      }
-
-      // 菜单在任意屏幕坐标打开（右键菜单用）；showDropdown 走 anchor 定位也归到这里
-      function openDropdownAt(left, top, items, onSelect) {
-        closeDropdowns()
-        saveSelection()
-        var dd = document.createElement('div')
-        dd.className = 'ccv-dropdown'
-        // 黑白极简：不透明底、细灰边、轻阴影，无毛玻璃无彩色
-        dd.style.cssText = 'position:fixed;z-index:2147483001;background:var(--dsw-alias-bg-overlay,#fff);border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.35));border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.1);padding:4px 0;min-width:160px;max-width:320px;font-size:13px;color:var(--dsw-alias-label-primary,#1a1a1a);max-height:72vh;overflow-y:auto'
-        // 图标：SVG 用 innerHTML（线条图标），纯文本（如 ¹）用 textContent
-        function iconSpan(icon) {
-          var ic = document.createElement('span')
-          if (icon.indexOf('<svg') === 0) ic.innerHTML = icon
-          else ic.textContent = icon
-          ic.style.cssText = 'width:18px;display:flex;justify-content:center;flex:0 0 auto'
-          return ic
-        }
-        function addRow(item) {
-          var row = document.createElement('div')
-          row.style.cssText = 'padding:7px 14px;cursor:pointer;display:flex;align-items:center;gap:9px;transition:background .1s;border-radius:0;white-space:nowrap'
-          if (item.icon) row.appendChild(iconSpan(item.icon))
-          var lb = document.createElement('span')
-          lb.textContent = item.label
-          row.appendChild(lb)
-          if (item.style) row.style.cssText += ';' + item.style
-          // 选中态：黑白线条风 = 1px currentColor 描边 + 加粗，不用彩色
-          if (item.active) { row.style.boxShadow = 'inset 0 0 0 1px currentColor'; row.style.fontWeight = '600' }
-          row.addEventListener('mouseenter', function() { row.style.background = 'rgba(128,128,128,.12)' })
-          row.addEventListener('mouseleave', function() { row.style.background = 'transparent' })
-          row.addEventListener('click', function(e) { e.stopPropagation(); closeDropdowns(); onSelect(item) })
-          dd.appendChild(row)
-        }
-        items.forEach(function(item) {
-          if (item.type === 'sep') {
-            var sep = document.createElement('div')
-            sep.style.cssText = 'height:1px;background:rgba(128,128,128,.15);margin:4px 0'
-            dd.appendChild(sep)
-            return
-          }
-          if (item.type === 'header') {
-            // 分组标题：不可点，小号灰字、加字距
-            var hd = document.createElement('div')
-            hd.style.cssText = 'padding:6px 14px 2px;font-size:11px;color:rgba(128,128,128,.75);letter-spacing:.5px;user-select:none;-webkit-user-select:none;white-space:nowrap'
-            hd.textContent = item.label
-            dd.appendChild(hd)
-            return
-          }
-          if (item.type === 'row') {
-            // 横排：多个紧凑按钮挤一行（块区四个常用项），省菜单高度
-            var rr = document.createElement('div')
-            rr.style.cssText = 'display:flex;align-items:center;gap:2px;padding:2px 8px'
-            item.items.forEach(function(sub) {
-              var b = document.createElement('div')
-              b.style.cssText = 'flex:1 1 0;display:flex;align-items:center;justify-content:center;gap:5px;padding:7px 8px;cursor:pointer;border-radius:6px;white-space:nowrap;min-width:0'
-              if (sub.icon) b.appendChild(iconSpan(sub.icon))
-              var sl = document.createElement('span')
-              sl.textContent = sub.label
-              b.appendChild(sl)
-              b.addEventListener('mouseenter', function() { b.style.background = 'rgba(128,128,128,.12)' })
-              b.addEventListener('mouseleave', function() { b.style.background = 'transparent' })
-              b.addEventListener('click', function(e) { e.stopPropagation(); closeDropdowns(); onSelect(sub) })
-              rr.appendChild(b)
-            })
-            dd.appendChild(rr)
-            return
-          }
-          addRow(item)
-        })
-        document.body.appendChild(dd)
-        // 先挂载量尺寸，再夹到视口内；下方放不下就翻到坐标上方
-        var ddWidth = dd.offsetWidth
-        var ddHeight = dd.offsetHeight
-        var x = Math.max(8, Math.min(left, window.innerWidth - ddWidth - 8))
-        var y = top
-        if (y + ddHeight > window.innerHeight - 8) y = Math.max(8, top - ddHeight - 4)
-        dd.style.left = x + 'px'
-        dd.style.top = y + 'px'
-        // 点击外部关闭；没点菜单就关掉的话，保存的选区一并作废（防止之后误插到旧位置）
-        setTimeout(function() {
-          document.addEventListener('mousedown', function close(ev) {
-            if (!dd.contains(ev.target)) { closeDropdowns(); savedRangeRef.current = null; document.removeEventListener('mousedown', close) }
-          })
-        }, 0)
-      }
-
-      function showDropdown(anchor, items, onSelect) {
-        var rect = anchor.getBoundingClientRect()
-        openDropdownAt(rect.left, rect.bottom + 4, items, onSelect)
-      }
-
-      // ─── 画布命令统一分发（划词栏 / ⋮ / 右键菜单共用）──────────
-      function escHtml(s) {
-        return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
-      }
-      // 插入时用 host 接口地址，图/链接当场就能显示；htmlToMd 的 assetMdPath
-      // 存盘时再换回 attachments/ 相对路径，两边互逆
-      function assetDisplayUrl(p) {
-        if (/^attachments\//.test(p)) return "/api/canvas/file?name=" + encodeURIComponent(p)
-        return p
-      }
-      function selectionText() {
-        var sel = document.getSelection()
-        return sel ? sel.toString() : ""
-      }
-      function currentRange() {
-        var s = document.getSelection()
-        return (s && s.rangeCount) ? s.getRangeAt(0).cloneRange() : null
-      }
-      // 异步上传完成后在原光标处插 HTML：先聚焦编辑器、找回范围再 insertHTML
-      function insertHtmlAtRange(html, rng) {
-        var ed = editorRef.current
-        if (!ed) return
-        ed.focus()
-        if (rng) {
-          try { var s = document.getSelection(); s.removeAllRanges(); s.addRange(rng) } catch (_) {}
-        }
-        document.execCommand("insertHTML", false, html)
-      }
-      // 上传文件 → host /api/canvas/upload → 返回相对路径 attachments/xxx
-      function uploadCanvasFile(file, onOk, onFail) {
-        try {
-          fetch("/api/canvas/upload?name=" + encodeURIComponent(file.name || "file.bin"), {
-            method: "POST",
-            headers: { "Content-Type": file.type || "application/octet-stream" },
-            body: file
-          }).then(function(r) { return r.json() }).then(function(d) {
-            if (d && d.ok && d.path) onOk(d.path, file.name || "图片")
-            else onFail(file)
-          }).catch(function() { onFail(file) })
-        } catch (e) { onFail(file) }
-      }
-      // 上传失败兜底：图片转 dataURL 内嵌（md 会变大，仅作 fallback）
-      function fileToDataUrl(file, cb) {
-        try {
-          var fr = new FileReader()
-          fr.onload = function() { cb(String(fr.result)) }
-          fr.onerror = function() { cb("") }
-          fr.readAsDataURL(file)
-        } catch (_) { cb("") }
-      }
-      // 打开系统文件选择框，选中后回调（菜单点击是用户手势，input.click() 能弹出）
-      function pickFile(accept, cb) {
-        var inp = document.createElement("input")
-        inp.type = "file"
-        if (accept) inp.accept = accept
-        inp.style.display = "none"
-        document.body.appendChild(inp)
-        inp.addEventListener("change", function() {
-          var f = inp.files && inp.files[0]
-          if (f) cb(f)
-          inp.remove()
-        })
-        inp.click()
-      }
-      function insertTableHtml(rows, cols) {
-        var html = "<table>"
-        for (var r = 0; r < rows; r++) {
-          html += "<tr>"
-          for (var c = 0; c < cols; c++) html += (r === 0 ? "<th>表头</th>" : "<td></td>")
-          html += "</tr>"
-        }
-        html += "</table><div><br></div>"
-        document.execCommand("insertHTML", false, html)
-      }
-      // 引用来源的 @ 提及：算出当前话布对应的 md 真实路径。
-      // 为什么要带来源：用户引用一段文字问 AI 时，如果两篇文档含同样的文字，
-      // 光看引用块 AI 无从判断该改哪一篇 —— 只能靠记忆猜，猜错就改了错的文档，
-      // 而且是静默的（用户看不到任何变化）。带上 @路径 这一步就变成事实判断。
-      //
-      // ⚠️ 必须用 host 给的真实绝对路径，不能自己拼 "canvas-docs/<标题>.md"：
-      //    那是相对路径，只在「会话工作区 == 存储根」时才成立。存储根被
-      //    canvas_configure 固定到别处后（rootOverride），它指向的是工作区里
-      //    的残留目录 —— 文件根本不在那儿（2026-09-14 另一会话据此报过）。
-      //
-      // ⚠️ 真实路径几乎必然含空格（"DSH project"、"OneDrive - …"），必须用
-      //    DSH 的引号形式 @"path"：@ token 由空白终止，裸写会在第一个空格处截断。
-      //    规则与 dsh-file-reference 的 formatFileMention 一致。
-      function ccvDocMention(id) {
-        var c = null
-        try {
-          (canvases || []).forEach(function (x) { if (x && x.id === id) c = x })
-        } catch (_) {}
-        if (!c) return ''
-        if (c.path) {
-          var abs = String(c.path).replace(/\\/g, '/')
-          return /\s/.test(abs) ? '@"' + abs + '"' : '@' + abs
-        }
-        if (!c.title) return ''
-        // 兜底：拿不到真实路径时（旧版 host 没返回 path 字段）退回相对形式
-        var slug = String(c.title).replace(/[\\/:*?"<>|#%]+/g, '').trim().replace(/\s+/g, '-')
-        if (!slug) slug = 'untitled'
-        return '@canvas-docs/' + slug + '.md'
-      }
-
-      // 问 AI：选中文本以引用块格式塞进 DSH 输入框（划词栏💬与右键菜单共用）
-      function askAiFromSelection() {
-        var sel = document.getSelection()
-        var text = sel ? sel.toString().trim() : ''
-        if (!text) { alert('请先选中要问 AI 的文本'); return }
-
-        // 选区引用（侧模块 lib/selref.js）。两件事，顺序一步都不能动：
-        //   ① 记一笔 —— 取数由它自己从 window.__ccvSelRefBridge 读。
-        //      ⚠️ 必须赶在 hideSelbar / 输入框抢焦点之前：那之后浏览器选区就塌了，
-        //         侧模块再也取不到"用户到底划了哪一段"。
-        //   ② 请它替用户走官方两步（打开菜单 → 选中）。成功的话输入框里直接出胶囊，
-        //      这时**不能再塞老引用块** —— 否则同一段话进两遍（用户会以为坏了）。
-        //   它没加载、或自动那步没成 → 一律退回老做法（下面的 insertQuoteBlock），
-        //   保证「问AI」永远有东西可用，不会点了没反应。
-        var rec = null
-        try { if (window.__ccvSelRefCapture) rec = window.__ccvSelRefCapture() } catch (_) {}
-        hideSelbar()
-
-        var input =
-          document.querySelector('div[data-composer-input="true"]') ||
-          document.querySelector('[data-slot="conversation.input"] textarea') ||
-          document.querySelector('[data-slot="conversation.composer"] textarea') ||
-          document.querySelector('[data-slot="conversation.composer.bar"] textarea') ||
-          document.querySelector('[data-pane="conversation"] textarea') ||
-          document.querySelector('textarea[placeholder*="发消息"]') ||
-          document.querySelector('textarea[placeholder*="说话"]') ||
-          document.querySelector('textarea[placeholder*="消息"]') ||
-          document.querySelector('textarea[placeholder*="输入"]') ||
-          document.querySelector('[contenteditable="true"][role="textbox"]')
-        // 先把焦点交回输入框再请侧模块动手：胶囊是插进输入框的，
-        // 且官方那套是照着"输入框当前状态"做版本比对的。
-        if (input) { try { input.focus() } catch (_) {} }
-
-        var auto = null
-        if (rec) { try { if (window.__ccvSelRefAuto) auto = window.__ccvSelRefAuto(rec) } catch (_) {} }
-        if (auto && typeof auto.then === 'function') {
-          auto.then(function (ok) { if (!ok) insertQuoteBlock(input, text) })
-              .catch(function () { insertQuoteBlock(input, text) })
-        } else {
-          insertQuoteBlock(input, text)
-        }
-      }
-
-      // 输入框里现有几条「引用胶囊」。
-      // ⚠️ 判断方式说明：官方把草稿以**纯文字投影**给出（胶囊摊成 `@名字 > 说明`），
-      //    所以光看草稿文字是分不出"胶囊"和"用户手打的 @"的，得看胶囊清单。
-      function ccvInputChipCount() {
-        try {
-          var st = window.__ccvInputState
-          return (st && st.occurrences) ? st.occurrences.length : 0
-        } catch (_) { return 0 }
-      }
-
-      // 老做法：把选中文本以引用块格式塞进输入框。
-      // 只在「侧模块没加载」或「自动出胶囊没成功」时走这里 —— 它是兜底，不是主路。
-      //
-      // 🔴 2026-09-15 主人第二次报同一个毛病后立下的硬规矩：
-      //    **草稿里已经有胶囊时，绝不许整体重写草稿。**
-      //    因为整体重写（setDraft）要按纯文字重新填一遍，而纯文字里的胶囊
-      //    只剩 `@名字 > 说明` 这种样子 —— 重写一次就把主人前面所有引用
-      //    拍成一堆普通文字，而且**界面上毫无异常提示**。
-      //    所以顺序是：① 官方事件往末尾追加（不动已有内容，首选）
-      //                ② 一个胶囊都没有 → 才允许整体重写
-      //                ③ 有胶囊又插不进去 → 什么都不做，只告诉主人一声
-      function insertQuoteBlock(input, text) {
-        // ⚠️ 必须留一个空格：@ 提及 token 由空白字符终止，
-        //    写成 "@xxx>内容" 会把 ">" 并进路径里。
-        var mention = ccvDocMention(activeId)
-        // 多行选区每一行都要带 ">"，否则只有首行是引用块
-        var quoted = text.split('\n').map(function (l) { return '> ' + l }).join('\n')
-        var body = (mention ? mention + ' ' : '') + quoted
-        if (!input) return
-        if (input.tagName === 'TEXTAREA') {
-          var quote = body + '\n\n'
-          var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
-          nativeInputValueSetter.call(input, quote + input.value)
-          input.dispatchEvent(new Event('input', { bubbles: true }))
-          input.focus()
-          return
-        }
-
-        // ① 首选：请侧模块走官方「插入纯文字」事件 —— 零宽、只往末尾追加，
-        //    已插进去的胶囊一个都不动。
-        try {
-          if (window.__ccvSelRefText && window.__ccvSelRefText(body + '\n\n')) {
-            input.focus()
-            return
-          }
-        } catch (_) {}
-
-        // ② 整体重写只允许在没有胶囊时用（此时重写等于"填一份纯文字"，无害）
-        if (ccvInputChipCount() > 0) {
-          alert('这条引用没能插进输入框。\n\n输入框里已经有引用胶囊了，而唯一还能用的办法是'
-            + '把整段草稿按文字重写一遍 —— 那样会把已有的引用变成普通文字。'
-            + '所以这次没有插入，请再点一次「问AI」。')
-          return
-        }
-
-        // ③ 空草稿：整体重写（能保留换行）
-        var draftState = window.__ccvInputState
-        var curDraft = (draftState && draftState.draft) ? draftState.draft : ''
-        var newDraft = body + '\n\n' + curDraft
-        if (window.__ccvInputActions && window.__ccvInputActions.setDraft) {
-          window.__ccvInputActions.setDraft(newDraft)
-        } else {
-          // fallback: 直接写 DOM + 派发 input
-          var escTxt = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-          var escMention = mention ? String(mention).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + ' ' : ''
-          var quoteHtml = '<div>' + escMention + '&gt; ' + escTxt + '</div><div><br></div><div><br></div>'
-          input.innerHTML = quoteHtml + input.innerHTML
-          input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: body }))
-        }
-        input.focus()
-      }
-      function runCanvasCmd(cmd) {
-        restoreSelection()
-        var text
-        switch (cmd) {
-          case "highlight": {
-            text = selectionText()
-            if (!text) return true
-            document.execCommand("insertHTML", false, "<mark>" + escHtml(text) + "</mark>")
-            break
-          }
-          case "clearFormat": {
-            document.execCommand("removeFormat", false, null)
-            // removeFormat 管不到自定义的 <mark> 和 <a>：选区内的手动拆掉。
-            // 脚注引用 [1]（href="#fn-…"）是内容标记不是格式，保留
-            try {
-              var ed3 = editorRef.current
-              var s3 = document.getSelection()
-              if (ed3 && s3 && s3.rangeCount) {
-                var rg = s3.getRangeAt(0)
-                var marks = ed3.querySelectorAll("mark")
-                for (var mi = marks.length - 1; mi >= 0; mi--) {
-                  if (rg.intersectsNode(marks[mi])) {
-                    var pMark = marks[mi].parentNode
-                    while (marks[mi].firstChild) pMark.insertBefore(marks[mi].firstChild, marks[mi])
-                    pMark.removeChild(marks[mi])
-                  }
-                }
-                var links = ed3.querySelectorAll("a")
-                for (var ai = links.length - 1; ai >= 0; ai--) {
-                  var lh = links[ai].getAttribute("href") || ""
-                  if (lh.indexOf("#fn") === 0) continue
-                  if (rg.intersectsNode(links[ai])) {
-                    var pA = links[ai].parentNode
-                    while (links[ai].firstChild) pA.insertBefore(links[ai].firstChild, links[ai])
-                    pA.removeChild(links[ai])
-                  }
-                }
-              }
-            } catch (_) {}
-            break
-          }
-          case "inlineCode": {
-            text = selectionText() || "code"
-            document.execCommand("insertHTML", false, '<code style="background:rgba(136,136,136,.15);padding:1px 4px;border-radius:3px;font-family:monospace;font-size:.9em">' + escHtml(text) + '</code>')
-            break
-          }
-          case "codeBlock": {
-            text = selectionText() || "code"
-            document.execCommand("insertHTML", false, '<pre style="background:#f5f5f5;padding:12px 16px;border-radius:6px;font-family:monospace;font-size:13px;line-height:1.5;overflow-x:auto;white-space:pre"><code>' + escHtml(text) + '</code></pre><div><br></div>')
-            break
-          }
-          case "blockquote": {
-            text = selectionText() || "引用内容"
-            document.execCommand("insertHTML", false, '<blockquote style="border-left:3px solid #ccc;padding-left:12px;margin:8px 0;color:#666">' + escHtml(text) + '</blockquote><div><br></div>')
-            break
-          }
-          case "link": {
-            var url = prompt("请输入链接地址：", "https://")
-            if (url) {
-              text = selectionText().trim() || "链接文字"
-              document.execCommand("insertHTML", false, '<a href="' + escHtml(url) + '" style="color:#3b82f6;text-decoration:underline">' + escHtml(text) + '</a>')
-            }
-            break
-          }
-          case "footnote": {
-            // 脚注：自动生成编号，插入引用标记，并在文末添加定义
-            var label = prompt("脚注标签（如 1、2、a）：", "")
-            if (label) {
-              var html = '<a href="#fn-' + escHtml(label) + '" id="fnref-' + escHtml(label) + '" contenteditable="false" style="vertical-align:super;font-size:.75em;color:#3b82f6;cursor:pointer;text-decoration:none">[' + escHtml(label) + ']</a>'
-              document.execCommand("insertHTML", false, html)
-              var ed = editorRef.current
-              if (ed) {
-                var existing = ed.querySelector('#fn-' + label)
-                if (!existing) {
-                  var fnDiv = ed.querySelector('.footnotes')
-                  if (!fnDiv) {
-                    fnDiv = document.createElement('div')
-                    fnDiv.className = 'footnotes'
-                    fnDiv.innerHTML = '<hr/>'
-                    var ol = document.createElement('ol')
-                    fnDiv.appendChild(ol)
-                    ed.appendChild(fnDiv)
-                  }
-                  var ol2 = fnDiv.querySelector('ol')
-                  var li = document.createElement('li')
-                  li.id = 'fn-' + label
-                  li.innerHTML = '脚注 ' + escHtml(label) + ' 的内容 <a href="#fnref-' + escHtml(label) + '" contenteditable="false" style="color:#3b82f6;text-decoration:none">↩</a>'
-                  ol2.appendChild(li)
-                  li.scrollIntoView({ behavior: 'smooth', block: 'center' })
-                }
-              }
-            }
-            break
-          }
-          case "uploadImage": {
-            var rngImg = currentRange()
-            pickFile("image/*", function(f) {
-              uploadCanvasFile(f, function(p, name) {
-                insertHtmlAtRange('<img src="' + escHtml(assetDisplayUrl(p)) + '" alt="' + escHtml(name) + '" style="max-width:100%;height:auto;vertical-align:middle"/>', rngImg)
-              }, function(f2) {
-                fileToDataUrl(f2, function(u) {
-                  if (u) insertHtmlAtRange('<img src="' + u + '" alt="" style="max-width:100%;height:auto;vertical-align:middle"/>', rngImg)
-                  else alert("图片上传失败")
-                })
-              })
-            })
-            break
-          }
-          case "imageUrl": {
-            var iurl = prompt("请输入图片地址：", "https://")
-            if (iurl) document.execCommand("insertHTML", false, '<img src="' + escHtml(iurl) + '" alt="" style="max-width:100%;height:auto;vertical-align:middle"/>')
-            break
-          }
-          case "uploadFile": {
-            var rngFile = currentRange()
-            pickFile("", function(f) {
-              uploadCanvasFile(f, function(p, name) {
-                insertHtmlAtRange('<a href="' + escHtml(assetDisplayUrl(p)) + '">' + escHtml(name) + '</a>', rngFile)
-              }, function() { alert("文件上传失败") })
-            })
-            break
-          }
-          case "insertTable": {
-            var rc = prompt("表格行数×列数（如 3×4）：", "3×3")
-            if (rc) {
-              var mm = rc.match(/(\d+)\s*[×xX*]\s*(\d+)/)
-              if (mm) insertTableHtml(Math.max(1, Math.min(50, +mm[1])), Math.max(1, Math.min(20, +mm[2])))
-              else alert("格式不对，示例：3×4")
-            }
-            break
-          }
-          case "insertTaskList": {
-            document.execCommand("insertHTML", false, '<ul><li><input type="checkbox"> 任务事项</li></ul><div><br></div>')
-            break
-          }
-          case "highlightBlock": {
-            text = selectionText()
-            var inner = text ? escHtml(text) : "高亮内容"
-            document.execCommand("insertHTML", false, '<div class="ccv-hl"><p>' + inner + '</p></div><div><br></div>')
-            break
-          }
-          case "indent": document.execCommand("indent", false, null); break
-          case "outdent": document.execCommand("outdent", false, null); break
-          default: return false
-        }
-        if (editorRef.current) editorRef.current.focus()
-        return true
-      }
-      // ─── 右键菜单（桌面端插入入口）──────────────────────
-      function showContextMenu(x, y) {
-        var hasSel = selectionText().trim().length > 0
-        var items = [
-          { label: "问AI", cmd: "askAI", icon: ccvIcon("ask") },
-          { type: "sep" },
-          { type: "header", label: "常用" },
-          { label: "上传图片…", cmd: "uploadImage", icon: ccvIcon("uploadImage") },
-          { label: "网络图片…", cmd: "imageUrl", icon: ccvIcon("globe") },
-          { label: "上传文件…", cmd: "uploadFile", icon: ccvIcon("file") },
-          { label: "插入表格…", cmd: "insertTable", icon: ccvIcon("table") },
-          { label: "插入链接…", cmd: "link", icon: ccvIcon("link") },
-          { type: "row", items: [
-            { label: "无序列表", cmd: "insertUnorderedList", icon: ccvIcon("listUl") },
-            { label: "有序列表", cmd: "insertOrderedList", icon: ccvIcon("listOl") },
-            { label: "任务列表", cmd: "insertTaskList", icon: ccvIcon("task") },
-          ]},
-          { type: "sep" },
-          { type: "header", label: "块" },
-          { type: "row", items: [
-            { label: "代码块", cmd: "codeBlock", icon: ccvIcon("codeBlock") },
-            { label: "引用", cmd: "blockquote", icon: ccvIcon("quote") },
-            { label: "分割线", cmd: "insertHorizontalRule", icon: ccvIcon("hr") },
-            { label: "高亮块", cmd: "highlightBlock", icon: ccvIcon("hlBlock") },
-          ]},
-          { type: "sep" },
-          { label: "增加缩进", cmd: "indent", icon: ccvIcon("indent") },
-          { label: "减少缩进", cmd: "outdent", icon: ccvIcon("outdent") },
-        ]
-        if (hasSel) {
-          items.push(
-            { type: "sep" },
-            { type: "header", label: "转换为" },
-            { label: "代码块", cmd: "codeBlock", icon: ccvIcon("codeBlock") },
-            { label: "引用", cmd: "blockquote", icon: ccvIcon("quote") },
-            { label: "高亮", cmd: "highlight", icon: ccvIcon("highlight") },
-            { label: "链接", cmd: "link", icon: ccvIcon("link") }
-          )
-        }
-        openDropdownAt(x, y, items, function(item) {
-          if (item.cmd === "askAI") { askAiFromSelection(); return }
-          if (!runCanvasCmd(item.cmd)) document.execCommand(item.cmd, false, item.val)
-        })
-      }
-
-      // 标题下拉菜单
-      function showHeadingDropdown(anchor) {
-        var currentH = selectionFormats.heading
-        var items = [
-          { label: "正文", val: "<p>", active: !currentH },
-          { type: "sep" },
-          { label: "一级标题", val: "<h1>", active: currentH === 'h1', style: "font-size:18px;font-weight:700" },
-          { label: "二级标题", val: "<h2>", active: currentH === 'h2', style: "font-size:16px;font-weight:600" },
-          { label: "三级标题", val: "<h3>", active: currentH === 'h3', style: "font-size:14px;font-weight:600" },
-          { label: "四级标题", val: "<h4>", active: currentH === 'h4', style: "font-size:13px;font-weight:600" },
-          { label: "五级标题", val: "<h5>", active: currentH === 'h5', style: "font-size:12px;font-weight:500" },
-          { label: "六级标题", val: "<h6>", active: currentH === 'h6', style: "font-size:11px;font-weight:500" },
-        ]
-        showDropdown(anchor, items, function(item) {
-          restoreSelection()
-          document.execCommand('formatBlock', false, item.val)
-          if (editorRef.current) editorRef.current.focus()
-        })
-      }
-
-      // 对齐下拉菜单
-      function showAlignDropdown(anchor) {
-        var items = [
-          { label: "左对齐", cmd: "justifyLeft", active: false },
-          { label: "居中对齐", cmd: "justifyCenter", active: false },
-          { label: "右对齐", cmd: "justifyRight", active: false },
-        ]
-        showDropdown(anchor, items, function(item) {
-          restoreSelection()
-          document.execCommand(item.cmd, false, null)
-          if (editorRef.current) editorRef.current.focus()
-        })
-      }
-
-      // ↑ 已提到模块级：见文件上方「静态资源（模块级）」
-      // ─── 全功能菜单（⋮：移动端唯一入口，格式+插入都在）──────────────
-      function showFullMenu(anchor) {
-        var items = [
-          { type: "header", label: "格式" },
-          { label: "行内代码", cmd: "inlineCode", icon: ccvIcon("code") },
-          { label: "高亮", cmd: "highlight", icon: ccvIcon("highlight") },
-          { label: "清除格式", cmd: "clearFormat", icon: ccvIcon("clear") },
-          { label: "脚注", cmd: "footnote", icon: "¹" },
-          { type: "header", label: "插入" },
-          { label: "上传图片…", cmd: "uploadImage", icon: ccvIcon("uploadImage") },
-          { label: "网络图片…", cmd: "imageUrl", icon: ccvIcon("globe") },
-          { label: "上传文件…", cmd: "uploadFile", icon: ccvIcon("file") },
-          { label: "插入表格…", cmd: "insertTable", icon: ccvIcon("table") },
-          { label: "任务列表", cmd: "insertTaskList", icon: ccvIcon("task") },
-          { label: "无序列表", cmd: "insertUnorderedList", icon: ccvIcon("listUl") },
-          { label: "有序列表", cmd: "insertOrderedList", icon: ccvIcon("listOl") },
-          { label: "插入链接…", cmd: "link", icon: ccvIcon("link") },
-          { type: "header", label: "块" },
-          { type: "row", items: [
-            { label: "代码块", cmd: "codeBlock", icon: ccvIcon("codeBlock") },
-            { label: "引用", cmd: "blockquote", icon: ccvIcon("quote") },
-            { label: "分割线", cmd: "insertHorizontalRule", icon: ccvIcon("hr") },
-            { label: "高亮块", cmd: "highlightBlock", icon: ccvIcon("hlBlock") },
-          ]},
-          { type: "header", label: "缩进" },
-          { label: "增加缩进", cmd: "indent", icon: ccvIcon("indent") },
-          { label: "减少缩进", cmd: "outdent", icon: ccvIcon("outdent") },
-        ]
-        showDropdown(anchor, items, function(item) {
-          if (!runCanvasCmd(item.cmd)) document.execCommand(item.cmd, false, item.val)
-        })
-      }
-      var selectionFormats = { bold: false, italic: false, underline: false, heading: null }
-
-      function onEditorMouseUp() {
-        try {
-          ccvLogD("mouseup: enter")
-          var sel = document.getSelection()
-          if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
-            ccvLogD(function () { return "mouseup: 选区为空 -> hide (sel=" + (sel ? "collapsed" : "null") + ")" })
-            hideSelbar(); return
-          }
-          var rect = sel.getRangeAt(0).getBoundingClientRect()
-          ccvLogD(function () { return "mouseup: rect w=" + Math.round(rect.width) + " h=" + Math.round(rect.height) + " l=" + Math.round(rect.left) + " t=" + Math.round(rect.top) })
-          if (!rect || (!rect.width && !rect.height)) {
-            ccvLogD("mouseup: rect 空 -> hide")
-            hideSelbar(); return
-          }
-          updateSelFormats(sel)
-          showSelbar(rect)
-        } catch(err) { ccvLog("mouseup: 抛异常 " + (err && err.message)); hideSelbar() }
-      }
-
-      function updateSelFormats(sel) {
-        selectionFormats.bold = document.queryCommandState('bold')
-        selectionFormats.italic = document.queryCommandState('italic')
-        selectionFormats.underline = document.queryCommandState('underline')
-        selectionFormats.heading = null
-        try {
-          var node = sel.getRangeAt(0).startContainer
-          if (node.nodeType === 3) node = node.parentNode
-          while (node && node.nodeType === 1) {
-            var tag = node.tagName ? node.tagName.toLowerCase() : ''
-            if (['h1','h2','h3','h4','h5','h6'].indexOf(tag) >= 0) { selectionFormats.heading = tag; break }
-            if (node.classList && node.classList.contains('ccv-editor')) break
-            node = node.parentNode
-          }
-        } catch(_){}
-      }
-
-      function showSelbar(rect) {
-        var bar = document.getElementById('ccv-selbar')
-        if (!bar) { ccvLog('showSelbar: 找不到 #ccv-selbar 元素'); return }
-        // 先用「自然宽度」渲染（子项不收缩、文字不换行），渲染完再按实测尺寸定位。
-        // 顺序很关键：若先定位再渲染，栏会被 left 挤到只剩很窄的可用宽度，
-        // 按钮随之收缩，「💬 问AI」这类带文字的按钮内部就会折行。
-        bar.style.left = '0px'; bar.style.top = '0px'
-        bar.style.display = 'flex'
-        bar.innerHTML = ''
-        SELBAR_ITEMS.forEach(function(item) {
-          if (item.type === 'sep') {
-            var sep = document.createElement('span')
-            sep.style.cssText = 'width:1px;height:20px;background:rgba(128,128,128,.2);margin:0 2px;flex:0 0 auto'
-            bar.appendChild(sep)
-            return
-          }
-          var btn = document.createElement('button')
-          btn.innerHTML = item.label; btn.title = item.title
-          btn.style.cssText = 'padding:4px 8px;border:none;background:transparent;color:inherit;border-radius:6px;font-size:13px;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;min-width:28px;height:28px;transition:background .1s ease;flex:0 0 auto;white-space:nowrap;line-height:1'
-          btn.addEventListener('mouseenter', function() { if (!btn.dataset.active) btn.style.background = 'rgba(128,128,128,.12)' })
-          btn.addEventListener('mouseleave', function() { if (!btn.dataset.active) btn.style.background = 'transparent' })
-          var isActive = false
-          if (item.cmd === 'bold') isActive = selectionFormats.bold
-          else if (item.cmd === 'italic') isActive = selectionFormats.italic
-          else if (item.cmd === 'underline') isActive = selectionFormats.underline
-          else if (item.cmd === 'formatBlock' && item.val) isActive = selectionFormats.heading === item.val.replace('<','').replace('>','')
-          // 选中态：灰色胶囊（不遮字、深浅主题都可读），替代之前的黑白反色
-          if (isActive) { btn.dataset.active = '1'; btn.style.background = 'rgba(128,128,128,.18)'; btn.style.color = 'var(--dsw-alias-label-primary, #1a1a1a)' }
-          btn.addEventListener('mousedown', function(e) { e.preventDefault() })
-          btn.addEventListener('click', function(e) {
-            e.stopPropagation()
-            if (item.isAskAI) {
-              // 问 AI：选中文本以引用格式塞进输入框（右键菜单同款逻辑）
-              askAiFromSelection()
-            } else if (item.hasDropdown) {
-              if (item.isHeading) showHeadingDropdown(btn)
-              else if (item.showAlign) showAlignDropdown(btn)
-              else if (item.showFullMenu) showFullMenu(btn)
-            } else if (!runCanvasCmd(item.cmd)) {
-              document.execCommand(item.cmd, false, item.val)
-              if (editorRef.current) editorRef.current.focus()
-            }
-          })
-          bar.appendChild(btn)
-        })
-        // 渲染完再测量真实尺寸并定位：优先贴选区左侧，
-        // 右边放不下就整体左移（允许盖到会话区上方，即「超出话布」）。
-        var bw = bar.offsetWidth || 340
-        var bh = bar.offsetHeight || 40
-        var x = Math.max(8, Math.min(rect.left, window.innerWidth - bw - 8))
-        var y = rect.top - bh - 10
-        if (y < 8) y = Math.min(rect.bottom + 10, window.innerHeight - bh - 8)
-        bar.style.left = x + 'px'; bar.style.top = y + 'px'
-        // 落定后再量一次：位置/尺寸/裁剪祖先，任何一项不对都能从日志看出来
-        ccvLogD(function () {
-          var fin = bar.getBoundingClientRect()
-          return 'showSelbar: 完成 bw=' + bw + ' bh=' + bh + ' x=' + x + ' y=' + y +
-            ' | display=' + bar.style.display +
-            ' | 实际渲染 w=' + Math.round(fin.width) + ' h=' + Math.round(fin.height) +
-            ' l=' + Math.round(fin.left) + ' t=' + Math.round(fin.top) +
-            ' | offsetParent=' + ccvDesc(bar.offsetParent) +
-            ' | parent=' + ccvDesc(bar.parentElement)
-        })
-        // 沿祖先链找第一个会裁剪 fixed 子元素的容器（有 overflow 且非 visible）
-        // 这段纯粹是诊断用的（结果只进日志），且 getComputedStyle 会强制排版 —— 同样只在开关打开时跑
-        ccvLogD(function () {
-          var n = bar.parentElement, clip = 'none'
-          while (n && n !== document.documentElement) {
-            var ov = getComputedStyle(n).overflow
-            if (ov && ov !== 'visible') { clip = ccvDesc(n) + ' overflow=' + ov; break }
-            n = n.parentElement
-          }
-          return 'showSelbar: 裁剪祖先 ' + clip
-        })
-      }
-      function hideSelbar() {
-        var bar = document.getElementById('ccv-selbar');
-        if (bar) bar.style.display = 'none';
-        // 取调用栈很贵，且这里一次鼠标松开可能被调多次 —— 只有 CCV_DEBUG 打开时才做
-        ccvLogD(function () {
-          var st = ''
-          try { st = (new Error()).stack || '' } catch (e) {}
-          var line = st.split('\n')[2] || ''
-          return 'hideSelbar: 调用 bar=' + (bar ? 'yes' : 'MISSING') + ' 来自 ' + String(line).trim()
-        })
-      }
-
-      // ↑ 已提到模块级：见文件上方「静态资源（模块级）」
-      // 当前话布标题：canvases 里找 activeId 对应的那条
-      let curTitle = "";
-      for (let i = 0; i < canvases.length; i++) {
-        if (canvases[i].id === activeId) { curTitle = canvases[i].title; break; }
-      }
-
-      // ccv-docked 是个纯标记类（没有对应 CSS），用来在 DOM 上标明"停靠"这一种摆法
-      return h("div", { ref: panelRef, className: "ccv-panel ccv-docked", style: CCV_STYLE.panel },
-        h("div", {
-          className: "ccv-head",
-          // 读数平时透明，鼠标移进顶栏才浮现
-          onMouseEnter: () => { if (meterRef.current) meterRef.current.style.opacity = "0.45"; },
-          onMouseLeave: () => { if (meterRef.current) meterRef.current.style.opacity = "0"; }
-        },
-          // ─── 第一行：管话布（新建 / 切换 / 全屏）───
-          h("div", { className: "ccv-row ccv-row-top" },
-            h("button", {
-              className: "ccv-ibtn",
-              onClick: creating ? cancelCreate : startCreate,
-              title: creating ? "取消新建" : "新建话布"
-            }, creating ? "✕" : "＋"),
-            creating
-              ? h("input", {
-                  className: "ccv-ninput", autoFocus: true, value: newTitle,
-                  placeholder: "话布标题，回车创建",
-                  onChange: e => setNewTitle(e.target.value),
-                  onKeyDown: e => {
-                    if (e.key === "Enter") { e.preventDefault(); submitCreate(); }
-                    else if (e.key === "Escape") { e.preventDefault(); cancelCreate(); }
-                  }
-                })
-              : h("div", { className: "ccv-chipwrap" },
-                  h("div", { className: "ccv-chip", onClick: toggleDrop, title: "点击切换话布" },
-                    h("span", { className: "ccv-chip-title", title: curTitle || "未选话布" }, curTitle || "未选话布"),
-                    h("span", { className: "ccv-chip-caret" }, "▾")
-                  ),
-                  // 切换下拉：absolute 挂在胶囊正下方（left:0 对齐胶囊左缘），
-                  // 不是 fixed 浮层 —— 它属于顶栏的局部堆叠，不会脱离面板
-                  dropOpen ? h("div", { className: "ccv-drop" },
-                    canvases.length
-                      ? canvases.map(c => h("div", { key: c.id, className: "ccv-drop-row" },
-                          h("button", {
-                            className: "ccv-drop-item", "data-on": c.id === activeId ? "1" : "0",
-                            title: c.title,
-                            onClick: () => { loadCanvas(c.id); setDropOpen(false); }
-                          }, c.title),
-                          h("button", {
-                            className: "ccv-drop-x", title: "删除话布「" + c.title + "」（同时删除对应 md 文件）",
-                            onClick: (e) => { e.stopPropagation(); deleteCanvasById(c.id, c.title); }
-                          }, "×")
-                        ))
-                      : h("div", { className: "ccv-drop-empty" }, "还没有话布，点 ＋ 新建一个")
-                  ) : null
-                ),
-            h("div", { className: "ccv-spacer" }),
-            // 全屏、关闭都交给右侧栏标签栏自己做（官方那个 × 与我原来的 × 完全重复，
-            // 已于 2026-09-12 撤下），这里不再重复放按钮。
-            null
-          ),
-          // ─── 第二行：管当前文档（保存 / 重载）───
-          h("div", { className: "ccv-row ccv-row-doc" },
-            h("button", { className: "ccv-tbtn", onClick: saveCanvas, disabled: !activeId, title: "保存到服务端（停止输入 1.5 秒后也会自动存）" }, "保存"),
-            h("button", { className: "ccv-tbtn", onClick: () => { if (activeId) loadCanvas(activeId); }, disabled: !activeId, title: "从服务端拉取最新内容 —— AI 在对话里改过话布后用它同步。你还没提交的编辑会先替你保存，不会再被这一下清掉" }, "重载"),
-            h("button", { className: "ccv-ibtn", onClick: openFolder, title: "在文件管理器中打开本文档所在的文件夹",
-              dangerouslySetInnerHTML: { __html: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:auto"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>' } }),
-            h("button", { className: "ccv-tbtn", onClick: manageRegistry, title: "登记文件夹：之后把登记文件夹内的文件拖进 DSH 窗口时，按真实路径 @ 引用（不产生副本）" }, "登记"),
-            h("div", { className: "ccv-spacer" }),
-            // 恢复提示：切标签会拆掉画布，切回来时如果捞到一份没写盘的草稿就说明一下，
-            // 否则用户会以为"我明明打过的字怎么自己变回去了"
-            restored ? h("span", {
-              className: "ccv-meter",
-              title: "这是你上次没来得及保存的内容，已自动补存回服务端",
-              style: { opacity: 1, color: "var(--dsw-alias-label-secondary, #6b7280)" }
-            }, "已恢复未保存内容") : null,
-            h("span", {
-              ref: meterRef, className: "ccv-meter",
-              title: "本标签的宽度"
-            })
-          )
-        ),
-        h("div", {
-          ref: editorRef, className: "ccv-editor", contentEditable: true, suppressContentEditableWarning: true, style: compact ? CCV_STYLE.editorCompact : CCV_STYLE.editorWide,
-          dangerouslySetInnerHTML: { __html: mdToHtml(content) },
-          onInput: () => { scheduleDraft(); clearTimeout(saveTimer.current); saveTimer.current = setTimeout(saveCanvas, 1500); },
-          onMouseUp: onEditorMouseUp,
-          onContextMenu: (e) => { e.preventDefault(); showContextMenu(e.clientX, e.clientY) }
-        }),
-        // width:max-content + flexWrap:nowrap —— 让栏按内容取自然宽度，
-        // 绝不被 left 位置挤窄；放不下时由 showSelbar 整体左移，而不是内部折行。
-        h("div", { id: "ccv-selbar", style: { position: "fixed", zIndex: 100000, display: "none", alignItems: "center", gap: 1, width: "max-content", maxWidth: "none", flexWrap: "nowrap", flexShrink: 0, background: "var(--dsw-specific-menu, var(--dsw-alias-bg-overlay, #fff))", color: "var(--dsw-alias-label-primary, #1a1a1a)", border: "1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.3))", borderRadius: 8, boxShadow: "0 6px 20px rgba(0,0,0,.1)", padding: "3px 6px", userSelect: "none", WebkitUserSelect: "none", backdropFilter: "blur(12px) saturate(150%)", WebkitBackdropFilter: "blur(12px) saturate(150%)" } })
-      );
-    }
-
-    // ─── 输入桥组件：把官方 inputActions / draft 暴露给划词栏 ──
-    // 新版 DSH 输入框是 Lexical 编辑器，直接改 DOM 无法可靠同步；
-    // slot 组件能拿到 inputActions.setDraft（官方接口），存到全局供「问AI」调用。
-    function InputBridge(props) {
-      var inputState = null
-      try { inputState = props.useInput ? props.useInput(function(s) { return s }) : null } catch (e) { inputState = null }
-      React.useEffect(function() {
-        if (props.inputActions) window.__ccvInputActions = props.inputActions
-      }, [])
-      React.useEffect(function() {
-        window.__ccvInputState = inputState
-      }, [inputState])
-      // 选区引用（侧模块 lib/selref.js）要用它换"会话手柄"：
-      //   sessions.scope(sessionId) → 会话作用域 → inputTriggers.sessionOf(它) → 输入管线控制器
-      // 只有会话作用域的槽位才拿得到 sessionId，所以从这儿挂出去。
-      React.useEffect(function() {
-        if (props.sessionId) window.__ccvSessionId = props.sessionId
-      }, [props.sessionId])
-      return null
-    }
-
-    // ─── 门厅页（右侧栏「开始」）的入口图标 ────────────────
-    // 门厅页会给每个注册的标签类型画一个入口胶囊，图标没给就画个占位方块。
-    // 这里画一块"画布 + 两行字"的小图，和「工作区文件」的文件夹图标同尺寸。
-    // 只需 { size, className } 两个属性，跟随 currentColor，主题自动适配。
-    function CcvGuideGlyph(props) {
-      var size = props && props.size ? props.size : 16;
-      return h("svg", {
-        width: size, height: size, viewBox: "0 0 16 16", fill: "none",
-        className: props ? props.className : undefined, "aria-hidden": "true"
-      },
-        h("rect", {
-          x: 2.1, y: 2.7, width: 11.8, height: 10.6, rx: 2.2,
-          stroke: "currentColor", strokeWidth: 1.2
-        }),
-        h("path", {
-          d: "M5.1 6.1h5.8M5.1 9.1h3.5",
-          stroke: "currentColor", strokeWidth: 1.2, strokeLinecap: "round"
-        })
-      );
-    }
-
-    // ─── 插件注册 ──────────────────────────────────────
-    // ─── 停靠模式：右侧栏标签的正文 ────────────────────────
-    // 这里渲染的就是同一个 CanvasPanel，只是把它当"填满标签页的一块区域"，
-    // 而不再是一个自己拖宽度、自己挤对话列的悬浮层。
-    // 右侧栏标签正文会收到一组标准 props（useTabInfo / sessionId / actions …）。
-    // 将来若要加「关闭本标签」之类的入口，从 props.useTabInfo().tab.actions 取就行 ——
-    // 官方标签栏自带的 × 已经在做这件事，所以我方不再放重复的关闭按钮（2026-09-12 撤下）。
-    function CanvasDockBody() {
-      return h("div", {
-        style: {
-          display: "flex", flexDirection: "column",
-          height: "100%", minHeight: 0, minWidth: 0, overflow: "hidden",
-          background: "var(--dsw-alias-bg-layer-1, #fff)"
-        }
-      }, h(CanvasPanel, { ctx: ccvCtx }));
-    }
-
-    // sessions / inputTriggers 是「选区引用」（侧模块 lib/selref.js）要用的：
-    //   sessions       —— 由会话 id 取该会话的作用域，再拿输入框句柄
-    //   inputTriggers  —— 注册「话布选区」引用源（新方案的地基）
-    // ⚠️ 与 sidebarRightTabs 同理：**必须写进这里，不能运行时 ctx.get 现取** ——
-    //    未声明的服务取不到。2026-09-14 实测：不加这两项时 selref 自检报
-    //    「暂缺 sessions / inputTriggers」，复检仍缺；补进 inject 后才就绪。
-    //    提供方（镜像里都已启用，见 dsh --profile web --dump-config）：
-    //      sessions      ← @deepseek-ai/dsh-api-session-controller
-    //      inputTriggers ← @deepseek-ai/dsh-client-ui-input-trigger
-    const inject = ["slots", "conversation", "sidebarRightTabs", "sidebarRight", "sessions", "inputTriggers"];
+    // 面板专属的会话服务声明（slots 之外的那些）
+    //
+    // 🔴 每一项都要写清**谁在用** —— 2026-10-14 我"清理未用声明"时删掉了 conversation ✗，
+    //    而它是 **lib/selref.js 要的**：那个文件里 missingServices() 要
+    //    sessions / conversation / inputTriggers **三个齐了**才注册引用源 ✗
+    //    结果：引用源没注册 → 聊天里报
+    //      「slash: no serializer for reference source "话布选区"」✗
+    //    依赖在**另一个文件**里，从这个文件看不出来 ✗ —— 所以逐条注明 ✓
+    //    verify-all 里也加了守卫（那三项缺一不可 ✓）
+    //
+    //   slots            → 主模块：把查看器正文/工具栏注册进右侧栏（__ccvViewerBoot）
+    //   sessions         → lib/selref.js：由会话 id 取作用域、拿输入框句柄
+    //   conversation     → lib/selref.js：同上（missingServices 三个之一 ✗ 别删）
+    //   inputTriggers    → lib/selref.js：注册「话布选区」引用源
+    //   sidebarRightTabs → 主模块：声明右侧栏「话布」标签类型（两阶段注册之一）
+    //   sidebarRight     → **2026-10-22 起有调用点了** ✓
+    //                      用它打开文档：ctx.sidebarRight.openResource(地址) ✓
+    //                      契约来自官方 dsh-client-ui-sidebar-right 的 service.d.ts：
+    //                        openResource(address: string, options?): void
+    //                          address 必须是 `dsh-resource://<type>/…` ✓
+    //                          不接受的话**会抛**（官方注释：那是接线错误，不是用户错误 ✓）
+    //                      这就是主人要的"点一下跳到文档"✓
+    // ⚠️ **必须写进这里，不能运行时 ctx.get 现取** —— 未声明的服务取不到。
+    //    2026-09-14 实测：不加 sessions / inputTriggers 时 selref 自检报「暂缺」
+    const inject = ["slots", "sessions", "conversation", "inputTriggers", "sidebarRightTabs", "sidebarRight"];
 
     // 幂等注入一段 CSS：同一个 id 只插一次，重复调用是空操作。
     // apply 有可能被走多遍（宿主重挂插件），靠这里去重。
@@ -2246,6 +914,749 @@ window.__ModuleLoader__.load({
       el.textContent = cssText;
       document.head.appendChild(el);
     }
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  右侧栏「话布」标签页：整块（2026-10-27 重构 P4，第二次尝试）
+  //
+  //  第一次尝试（8c019f0）失败了 ✗ 原因记在这里，别重犯：
+  //    我把 405 行搬走时，**只核对了"引用了什么"，没核对"定义了什么"** ✗
+  //    这段里其实**定义了** ccvSessionsSnapshot / ccvSessionTitleOf /
+  //    ccvHashKeyMap / ccvBuildGroups / ccvFetchGroups / 缓存 … ✗
+  //    搬走之后 apply 里引用它们的地方全变成 undefined ✓
+  //    → "右侧「话布」标签页整个消失" ✓ 而当时的检查一条都没拦住 ✗
+  //
+  //  这次的做法：
+  //    · 先用客户端冒烟测试证明"现状是绿的"（tools/test-client-smoke.cjs）✓
+  //    · 精确算过：区段内**顶层定义 9 个**、apply 区段外**只用到 CcvFeatureTab** ✓
+  //    · 区段内用到、区段外定义的只有 7 个 → 由 D 传入 ✓
+  //    · 代码逐字搬运，一行未改 ✓
+  function ccvMakeCanvasTab(D) {
+    // 这 7 个是区段外定义的（在 apply 里），其余依赖都在模块级 ✓ 直接可见
+    var CCV_ROW_BASE = D.CCV_ROW_BASE, CCV_TAB_ID = D.CCV_TAB_ID
+    var CcvEntry = D.CcvEntry, CcvErrorBoundary = D.CcvErrorBoundary
+    var CcvRow = D.CcvRow, CcvTabGlyph = D.CcvTabGlyph
+    var ccvGuideColumn = D.ccvGuideColumn
+    var ctx = D.ctx   // ← apply 的参数，第一次搬漏了它：ctx.slots 直接抛错被 catch 吞掉 ✗
+
+      // ─── 右侧栏「话布」标签页（2026-10-24 改成两级）───────────────────
+      //   主人原话：「这一页是话布功能选页，清单应该放到话布文档二级菜单里」
+      //   → 一级页 = **功能入口**（话布文档 / 规划中的功能）
+      //     二级页 = **话布文档**（文档清单 ✓ 点一下跳到那篇 ✓ + 返回）
+      //   ⚠️ 用组件内一个 view 状态切页 ✓ 不需要路由 ✓ 简单可靠 ✓
+      //   ⚠️ **必须接 props** ✗ —— sessionId 就在这里 ✓（官方 FilesBody 同款 ✓）
+      //      我原来写成 CcvFeatureTab() 不带参数 → 永远拿不到 sessionId ✓
+      //
+      // ★ 2026-10-24 第二轮：清单**按会话分组** ★
+      //   主人原话：「清单页做分组，按会话名来分组，把当前会话的组置顶并展开，
+      //              别的会话默认收起」
+      //   数据：/api/canvas/list?scope=groups ✓（本轮新增的分支 ✓）
+      //         groups: [{ sid, activeId, ids }]  canvases: 全量元数据
+      //   会话名：ctx.sessions.list.getSnapshot().byId[sid].displayTitle ✓
+      //     —— 官方里就是这么命令式读的（client.js 里到处是
+      //        `ctx.sessions.list.getSnapshot().byId[...]`）✓
+      //     ⚠️ 不用 useSessions 那个 hook ✓ 免得在"可能不存在"的 prop 上
+      //        做条件式 hook 调用（那会违反 hook 规则 ✓ 上次就是这么白的 ✓）
+      //   默认展开：**只有当前会话**（s.open 里没有这个 sid 时，看它是不是当前会话 ✓）
+      //     → 这样不需要在数据到达时初始化状态 ✓ 少一处时序 bug ✓
+      // 把接口数据按会话分好组 ✓（当前会话置顶 ✓ 其余按最新更新倒序 ✓）
+      //
+      // ★ 2026-10-24：旧哈希键「反着撞一遍」★
+      //   老键 = "sess-" + hash(侧栏里那行会话名) ✓ 哈希虽单向，
+      //   但**名字我这儿有**（ctx.sessions.list 里就有 displayTitle）✓
+      //   → 对每个已知会话算一遍 hash(displayTitle)，撞上哪个旧键，那组就是它 ✓
+      //   算法与输入已被日志实证（hash("DeepSeek Harness") = qberq7 ✓
+      //   hash("默认会话") = 1nbvho8 ✓ 都对上了）✓
+      //   撞不上的（default、老命名 xxx-hash）→ 显示「旧记录」✓ 由拖动解决 ✓
+      function ccvSessionsSnapshot() {
+        try {
+          var snap = ctx.sessions && ctx.sessions.list && ctx.sessions.list.getSnapshot
+            ? ctx.sessions.list.getSnapshot() : null
+          return (snap && snap.byId) || null
+        } catch (_) { return null }
+      }
+      function ccvSessionTitleOf(byId, sid) {
+        try {
+          var row = byId ? byId[sid] : null
+          if (row) return row.displayTitle || row.title || ''
+        } catch (_) {}
+        return ''
+      }
+      // 旧哈希键 → 真 sessionId（用已知会话名反算）
+      //   ⚠️ 2026-10-26：算法已搬进 lib/ccv-logic.js ✓ 这里只做委托
+      function ccvHashKeyMap(byId) {
+        var L = ccvLogic()
+        return L ? L.hashKeyMap(byId) : {}
+      }
+      // 分组拼装（当前会话置顶 / 旧键反查合并 / 未归属垫底）
+      //   ⚠️ 同样是委托 ✓ 同一套规则有 60 条 Node 断言守着 ✓
+      function ccvBuildGroups(data, curSid, byId) {
+        var L = ccvLogic()
+        if (!L) return { groups: [], total: (data && data.canvases || []).length }
+        return L.buildGroups(data, curSid, byId, function (sid) { return ccvSessionTitleOf(byId, sid) })
+      }
+
+      // ★ 清单数据缓存 + 预取（2026-10-24 修「别的会话里要十多秒」）★
+      //   实测证据：
+      //     当前会话 清单加载耗时   11ms ✓
+      //     刚换会话 清单加载耗时 9288ms ✗（同样的 14 组 / 20 篇 ✓ 接口一样快 ✓）
+      //   机制：**换会话那一刻请求被排在队尾** ✓（宿主/浏览器主线程正忙 ✓）
+      //         —— 不是我们的接口慢 ✓ 也不是渲染慢 ✓
+      //   但有一个事实可以利用：`?scope=groups` 的返回**与会话无关** ✓
+      //     （主机端这个分支压根不看 sid ✓ 全部会话 + 全部文档 ✓）
+      //   → 于是：① 进标签页就【预取】✓ 不等点开二级页
+      //           ② 20 秒内再用【直接用缓存】✓ 不再发请求
+      //           ③ 缓存过期也先显示旧数据 ✓ 后台静默刷新 ✓（不让人对着"读取中"✓）
+      var CCV_GROUPS_TTL = 20000
+      var ccvGroupsCache = { at: 0, data: null, err: '' }
+      function ccvFetchGroups(force) {
+        var now = Date.now()
+        if (!force && ccvGroupsCache.data && (now - ccvGroupsCache.at) < CCV_GROUPS_TTL) {
+          return Promise.resolve({ data: ccvGroupsCache.data, err: '', ms: 0, cached: true })
+        }
+        var t0 = Date.now()
+        return fetch('/api/canvas/list?scope=groups', { cache: 'no-store' })
+          .then(function (r) { return r.json() })
+          .then(function (d) {
+            var data = { canvases: (d && d.canvases) || [], groups: (d && d.groups) || [] }
+            var err = (d && d.ok === false) ? (d.error || '读不到') : ''
+            ccvGroupsCache = { at: Date.now(), data: data, err: err }
+            return { data: data, err: err, ms: Date.now() - t0, cached: false }
+          })
+          .catch(function (e) {
+            return { data: null, err: (e && e.message) || '读不到', ms: Date.now() - t0, cached: false }
+          })
+      }
+      function CcvFeatureTab(props) {
+        var sessionId = (props && props.sessionId) || ''
+        // 初始就吃缓存 ✓（第二次进标签页 = 立刻有内容 ✓ 不用等 ✓）
+        var st = React.useState({
+          view: 'home', loading: !ccvGroupsCache.data, err: ccvGroupsCache.err,
+          data: ccvGroupsCache.data, open: {}, rev: 0,
+        })
+        var s = st[0], setS = st[1]
+        // ★ 把真 sessionId 挂到全局 ✓（2026-10-24）
+        //   为什么需要：sessionKey() 现在优先读它 ✓
+        //     写入这一侧（打开/新建文档记到哪个会话）才是真会话 ✓
+        //     —— 不挂的话，标签页里根本没打开过文档时，仍会退回哈希键 ✗
+        React.useEffect(function () {
+          try { if (sessionId) window.__ccvSessionId = sessionId } catch (_) {}
+        }, [sessionId])
+        // ★ 预取（进标签页就拉 ✓ 不等点进二级页 ✓）★
+        //   换会话那 10 秒里请求会排在队尾 ✗ 所以在【安静的时候】先把它拿下来 ✓
+        React.useEffect(function () {
+          var alive = true
+          ccvFetchGroups(false).then(function (r) {
+            if (!alive || r.cached) return
+            ccvLog('清单预取 ' + r.ms + 'ms' + (r.err ? (' ✗ ' + r.err) : ' ✓'))
+            setS(function (p) {
+              if (!r.data) return p
+              return Object.assign({}, p, { data: r.data, loading: false, err: r.err })
+            })
+          })
+          return function () { alive = false }
+        }, [sessionId])
+        // 切到二级页 + 拖动后刷新 ✓（有缓存就直接显示 ✓ 过期才真去拉 ✓）
+        React.useEffect(function () {
+          if (s.view !== 'docs') return
+          if (s.data && !s.rev) return            // 有缓存且不是拖动后 → 不用再拉 ✓
+          var alive = true
+          var force = !!s.rev                      // 拖动后必须真拉 ✓
+          ccvFetchGroups(force).then(function (r) {
+            if (!alive) return
+            ccvLog('清单加载耗时 ' + r.ms + 'ms' + (r.cached ? '（缓存）' : '')
+              + ' ｜ 组 ' + ((r.data && r.data.groups) || []).length
+              + ' 个 ｜ 文档 ' + ((r.data && r.data.canvases) || []).length + ' 篇'
+              + (r.err ? (' ✗ ' + r.err) : ''))
+            setS(function (p) {
+              if (!r.data) return Object.assign({}, p, { loading: false, err: r.err })
+              return Object.assign({}, p, { data: r.data, loading: false, err: r.err })
+            })
+          })
+          return function () { alive = false }
+        }, [s.view, s.rev])
+        // ★ 拖动改分组（2026-10-24 主人要求「我要能自由拖动改分组」）★
+        //   只调一个主机端点 ✓ 主机端只改 .sessions/*.json 的 id 数组 ✓
+        //   **文件、路径、内容一律不碰** ✓（主人已确认这条 ✓）
+        var moveTo = function (docId, toSid) {
+          if (!docId) return
+          ccvLog('拖动分组：' + docId + ' → ' + (toSid || '（移出所有组）'))
+          fetch('/api/canvas/move-group', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: docId, toSid: toSid || '' }),
+            cache: 'no-store',
+          })
+            .then(function (r) { return r.json() })
+            .then(function (d) {
+              if (d && d.ok === false) ccvLog('拖动失败 ✗ ' + (d.error || ''))
+              else ccvLog('拖动完成 ✓ 从 ' + ((d && d.removed) || 0) + ' 个组移出')
+              setS(function (p) { return Object.assign({}, p, { rev: (p.rev || 0) + 1 }) })
+            })
+            .catch(function (e) {
+              ccvLog('拖动请求失败 ✗ ' + (e && e.message))
+              setS(function (p) { return Object.assign({}, p, { rev: (p.rev || 0) + 1 }) })
+            })
+        }
+        var card = { border: '1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3))', borderRadius: '8px', padding: '10px 12px', marginBottom: '8px' }
+        var dim = { color: 'var(--dsw-alias-label-secondary,#6b7280)', fontSize: '12px', lineHeight: 1.6 }
+        var go = function (view) {
+          setS(function (p) { return Object.assign({}, p, { view: view }) })
+        }
+        // ── 二级页：话布文档（清单）──
+        //   ★ 骨架照官方文件树（FilesBody）★（2026-10-24 主人要求"按这个文件列表的显示风格"）
+        //     root   height:100%; min-height:0; display:flex; flex-direction:column;
+        //            font-size: var(--dsh-content-font-size-secondary, 13px); line-height:1.5
+        //     header height:38px; border-bottom:.5px solid border-l3;
+        //            align-items:center; gap:4px; padding:0 6px 0 16px; flex:none
+        //     body   flex:auto; min-height:0; overflow:auto;
+        //            padding:8px 0 8px 8px; margin-right:2px;
+        //            scrollbar-gutter:stable   ← 滚动条出现时不跳
+        //   ⚠️ 不是居中卡片列 ✗ —— 文件树是**贴左、通栏**的 ✓
+        if (s.view === 'docs') {
+          // 按会话分组 ✓（当前会话置顶 ✓ 其余默认收起 ✓）
+          // ★ 构建计时（只记慢的 ✓ 不刷屏）★
+          var tb0 = Date.now()
+          var model = ccvBuildGroups(s.data, sessionId, ccvSessionsSnapshot())
+          var buildMs = Date.now() - tb0
+          if (buildMs >= 30) ccvLog('清单构建耗时 ' + buildMs + 'ms ｜ 组 ' + model.groups.length + ' 个')
+          var isOpen = function (sid) {
+            if (Object.prototype.hasOwnProperty.call(s.open || {}, sid)) return !!s.open[sid]
+            return sid === sessionId          // 默认只展开当前会话 ✓
+          }
+          var toggleGroup = function (sid) {
+            setS(function (p) {
+              var nx = Object.assign({}, p.open || {})
+              nx[sid] = !isOpen(sid)
+              return Object.assign({}, p, { open: nx })
+            })
+          }
+          var rows = model.groups.map(function (g) {
+            var open = isOpen(g.sid)
+            var isCur = (g.sid === sessionId)
+            var isOrphan = (g.sid === '__orphan__')
+            // 名字：真会话名 ✓；旧键反查成功的也用真名 ✓；
+            //      认不出的 → 「旧记录 · <键>」✓ 不再截断成 _Harness 那种碎片 ✗
+            var title = g.title
+              || (isOrphan ? '未归属' : ('旧记录 · ' + g.sid))
+            // 组头：chevron + 会话名 + 篇数（当前会话那组给个标记 ✓ 一眼能认出来 ✓）
+            var head = h('div', {
+              key: 'h:' + g.sid,
+              onClick: function () { toggleGroup(g.sid) },
+              title: isOrphan ? '不属于任何会话的文档' : (g.legacy ? ('旧键：' + g.sid + '（把文档拖到别的组即可）') : ('会话：' + (g.title || g.sid))),
+              role: 'button',
+              // ★ 拖到这里 = 归到这一组 ✓（未归属 = 移出所有组 ✓）
+              onDragOver: function (e) {
+                try {
+                  e.preventDefault()
+                  e.dataTransfer.dropEffect = 'move'
+                  e.currentTarget.style.background = 'var(--dsw-alias-brand-primary,rgba(59,130,246,.18))'
+                  e.currentTarget.style.outline = '.5px dashed var(--dsw-alias-brand-primary,#3b82f6)'
+                } catch (_) {}
+              },
+              onDragLeave: function (e) {
+                try {
+                  e.currentTarget.style.background = '0 0'
+                  e.currentTarget.style.outline = 'none'
+                } catch (_) {}
+              },
+              onDrop: function (e) {
+                try {
+                  e.preventDefault()
+                  e.currentTarget.style.background = '0 0'
+                  e.currentTarget.style.outline = 'none'
+                  var id = e.dataTransfer.getData('text/plain')
+                  if (!id) return
+                  // ⚠️ 落盘目标优先用【真会话 id】✓（2026-10-24）
+                  //   旧哈希组若已反查出真会话（g.matched），就写到真会话名下 ✓
+                  //   —— 否则拖进去的文档还挂在老哈希键里 ✗ 名字永远救不回来 ✗
+                  var dest
+                  if (isOrphan) dest = ''                                    // 移出所有组 ✓
+                  else if (g.matched || (g.sid && String(g.sid).indexOf('session-') === 0)) dest = g.sid
+                  else dest = (g.key || g.sid)                               // 认不出的旧组：按原键写 ✓
+                  moveTo(id, dest)
+                } catch (_) {}
+              },
+              style: Object.assign({}, CCV_ROW_BASE, { cursor: 'pointer' }),
+              onMouseEnter: function (e) {
+                try { e.currentTarget.style.background = 'var(--dsw-alias-interactive-bg-hover,var(--dsw-alias-bg-layer-2,rgba(128,128,128,.12)))' } catch (_) {}
+              },
+              onMouseLeave: function (e) {
+                try { e.currentTarget.style.background = '0 0' } catch (_) {}
+              },
+            },
+              // chevron（收起 ▸ / 展开 ▾）—— 用文字三角，跟随主题色 ✓
+              h('span', {
+                style: {
+                  flex: 'none', width: '12px', textAlign: 'center',
+                  fontSize: '10px', lineHeight: 1,
+                  color: 'var(--dsw-alias-label-tertiary,#6b7280)',
+                },
+              }, open ? '▾' : '▸'),
+              h('span', {
+                style: {
+                  minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  fontWeight: isCur ? 600 : 400,
+                  color: g.legacy ? 'var(--dsw-alias-label-secondary,#8b8b8b)' : undefined,
+                },
+              }, title),
+              h('span', {
+                style: {
+                  marginLeft: 'auto', flex: 'none', paddingLeft: '8px',
+                  fontSize: '12px', color: 'var(--dsw-alias-label-tertiary,#6b7280)',
+                },
+              }, String(g.items.length)))
+            if (!open) return head
+            // 展开：组内文档（官方嵌套缩进 18px ✓）
+            return h('div', { key: g.sid },
+              head,
+              h('div', { style: { paddingLeft: '18px' } },
+                g.items.map(function (c) {
+                  return h(CcvRow, { key: c.id, canvas: c, sessionId: sessionId })   // ← 组件调用 ✓
+                })))
+          })
+          return h('div', {
+            style: {
+              boxSizing: 'border-box', height: '100%', minHeight: 0,
+              display: 'flex', flexDirection: 'column',
+              color: 'var(--dsw-alias-label-primary,#1a1a1a)',
+              fontSize: 'var(--dsh-content-font-size-secondary,13px)',
+              lineHeight: 1.5,
+            },
+          },
+            // ── 表头（官方 .header ✓ 38px + 半像素下边线）──
+            h('div', {
+              style: {
+                boxSizing: 'border-box', flex: 'none',
+                display: 'flex', alignItems: 'center', gap: '4px',
+                height: '38px', padding: '0 6px 0 16px',
+                borderBottom: '.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28))',
+              },
+            },
+              h('button', {
+                type: 'button',
+                onClick: function () { go('home') },
+                title: '返回功能页',
+                // 官方 .tool：28×28 / 圆角 sm / 悬停才有底色 ✓
+                style: {
+                  width: '28px', height: '28px', flex: 'none',
+                  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                  padding: '6px', lineHeight: 1,
+                  background: '0 0', border: 'none', cursor: 'pointer',
+                  borderRadius: 'var(--dsw-radius-sm,4px)',
+                  color: 'var(--dsw-alias-label-secondary,#8b8b8b)',
+                  fontSize: '15px',
+                },
+                onMouseEnter: function (e) {
+                  try {
+                    e.currentTarget.style.color = 'var(--dsw-alias-label-primary,#1a1a1a)'
+                    e.currentTarget.style.background = 'var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.12))'
+                  } catch (_) {}
+                },
+                onMouseLeave: function (e) {
+                  try {
+                    e.currentTarget.style.color = 'var(--dsw-alias-label-secondary,#8b8b8b)'
+                    e.currentTarget.style.background = '0 0'
+                  } catch (_) {}
+                },
+              }, '‹'),
+              h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, '话布文档'),
+              h('span', {
+                style: {
+                  marginLeft: 'auto', paddingRight: '4px', flex: 'none',
+                  fontSize: '12px', color: 'var(--dsw-alias-label-tertiary,#6b7280)',
+                },
+              }, (s.loading ? '读取中…' : (model.total + ' 篇')))),
+            // ── 正文（官方 .body ✓ 内缩 8px，行自己带 5px 10px 内距）──
+            h('div', {
+              style: {
+                flex: 'auto', minHeight: 0, overflow: 'auto',
+                marginRight: '2px', padding: '8px 0 8px 8px',
+                scrollbarGutter: 'stable',
+              },
+            },
+              !sessionId ? h('div', {
+                style: { padding: '3px 10px', fontSize: '12px', color: 'var(--dsw-alias-state-error-primary,#d33)' },
+              }, '⚠ 这个标签页没拿到 sessionId，点了会打不开（已记日志）') : null,
+              s.err ? h('div', {
+                style: { padding: '3px 10px', fontSize: '12px', color: 'var(--dsw-alias-state-error-primary,#d33)' },
+              }, '读清单失败：' + s.err) : null,
+              // 官方 .note：没有内容时的说明行 ✓
+              !s.loading && !model.total ? h('div', {
+                style: { padding: '3px 10px', fontSize: '12px', color: 'var(--dsw-alias-label-tertiary,#6b7280)' },
+              }, '还没有话布文档') : null,
+              rows))
+        }
+        // ── 一级页：功能选页（照官方「开始」页的居中卡片布局）──
+        var entries = [
+          {
+            icon: '📄',
+            title: '话布文档',
+            desc: 'markdown：可编辑 · 自动保存 · 撤销重做 · 划词问 AI',
+            onClick: function () { go('docs') },
+          },
+          { icon: '🌐', title: '网页实时可视编辑', desc: '还没做', disabled: true },
+        ]
+        return ccvGuideColumn([
+          // 英雄图标（官方 .hero 是那个罗盘 ✓ 这里用话布自己的图标 ✓）
+          h('div', {
+            style: {
+              display: 'flex', marginBottom: '16px',
+              color: 'var(--dsw-alias-label-secondary,#8b8b8b)',
+            },
+          }, h(CcvTabGlyph, { size: 26 })),
+          // ⚠️ 2026-10-24 主人：「选一个功能这几个字不要」→ 那行说明删掉 ✗
+          //   官方「开始」页本来也没有这行字 ✓ 删了反而更像 ✓
+        ].concat(entries.map(function (e, i) {
+          return h(CcvEntry, { key: 'e' + i, entry: e })
+        })))
+      }
+
+      // ★ 注册用的包装组件：一律套错误边界 ✓（崩了也看得见原因 ✓）
+      function CcvCanvasTab(props) {
+        var body = h(CcvFeatureTab, props)
+        return CcvErrorBoundary ? h(CcvErrorBoundary, null, body) : body
+      }
+
+      try {
+        ctx.effect(function () {
+          return ctx.sidebarRightTabs.register({
+            id: CCV_TAB_ID,
+            kind: CCV_TAB_ID,
+            priority: 'extension',
+            title: function () { return '话布' },
+            // 门厅页（右侧栏「开始」）的入口胶囊 —— 官方「工作区文件」是 order 10
+            guide: [{
+              order: 20,
+              title: function () { return '话布' },
+              description: function () { return '话布：文档与将来的可视编辑功能，都从这里进'; },
+              icon: CcvTabGlyph,
+            }],
+          })
+        }, 'collab-canvas: 右侧栏 tab 类型')
+        ccvLog('右侧栏「话布」标签类型已注册（id=' + CCV_TAB_ID + '）')
+      } catch (e) { ccvLog('右侧栏 tab 类型注册失败: ' + (e && e.message)) }
+
+      try {
+        ctx.slots.inject('sidebar.right.pane.tab', function () {
+          return ctx.slots.register({ name: 'sidebar.right.pane.tab', key: CCV_TAB_ID }, CcvCanvasTab)
+        })
+        ccvLog('右侧栏「话布」标签正文已注册')
+      } catch (e) { ccvLog('右侧栏 tab 正文注册失败: ' + (e && e.message)) }
+
+
+    // 区段内定义了 9 个顶层名字 ✓ apply 区段外只用到这一个 ✓
+    return { CcvFeatureTab: CcvFeatureTab }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  画布小工具集：地址拼装 / 打开文档 / 文件树行 / 入口卡片 / 错误边界
+  //  （2026-10-27 重构 P4b，逐字搬运）
+  //
+  //  机器核对过（不是目测）：
+  //    区段顶层定义 17 个；apply 区段外只用到其中 6 个 → 由返回值交回 ✓
+  //    区段内只依赖 ctx（+ 模块级的 h / React / ccvLog / ccvLogic）✓
+  //
+  //  为什么放这里而不是拆成四个文件：
+  //    侧模块不能 require ✗ 拆文件就得靠 window 交接 ✓ 反而更绕 ✓
+  //    一个"无状态工具集"工厂已经足够清楚 ✓
+  function ccvMakeCanvasKit(D) {
+    var ctx = D.ctx
+
+      // ─── 文件路径 → dsh-resource 地址（2026-10-24 重写，照官方算法）───────
+      //   ⚠️ 上一版的做法是"等查看器打开过文档后把地址模板登记到 window"✗
+      //     → **先有鸡还是先有蛋** ✗ 没打开过文档就永远点不动 ✓
+      //       （日志实测：反复报"还没拿到 dsh-resource 地址模板"✓）
+      //
+      //   ★ 正路：地址可以**自己拼** ✓ 官方源码里就有现成的算法 ★
+      //     出处：@deepseek-ai/dsh-client-ui-sidebar-files/lib/client.js
+      //       FILE_ADDRESS_PREFIX = "dsh-resource://file/"
+      //       encodeSegment(s) = encodeURIComponent(s).replace(/%3A/gi, ":")   ← 盘符冒号保留
+      //       encodePath(p)    = p.split("/").map(encodeSegment).join("/")
+      //       sessionFileAddress(sid, p) =
+      //         PREFIX + "session/" + encodeSegment(sid) + "/" + encodePath(p)
+      //       fileAddressFor(sid, cwd, path)：
+      //         绝对路径且**在 workspace 根之内** → 转成【相对根】的路径 ✓
+      //         否则（根未知 / 在根之外）→ **保留绝对路径** ✓
+      //
+      //   ★ sessionId 从哪来：不用猜 ✓
+      //     官方 FilesBody 的 props 就是 { useTabInfo, sessionId, useStore, actions, … }
+      //     —— 也就是说 `sidebar.right.pane.tab` 这个槽**本来就把 sessionId 传给组件** ✓
+      //     我原来的 CcvFeatureTab 没接 props ✗ 所以拿不到 ✓（这是第二处疏漏 ✓）
+      //
+      //   ⚠️ 反斜杠一律用 split/join ✓ 不用正则字面量 ✗（2026-10-22 就是这么崩的 ✓）
+      //   ⚠️ 2026-10-26：编码/拼装本体已搬进 lib/ccv-logic.js ✓ 这里只做委托
+      //      好处：同一套算法有 60 条 Node 断言守着 ✓ 不再靠"看着像对的" ✓
+      var CCV_FILE_PREFIX = 'dsh-resource://file/'
+      function ccvSessionFileAddress(sessionId, absPath) {
+        var L = ccvLogic()
+        if (L) return L.sessionFileAddress(sessionId, absPath)
+        // 逻辑层没到（极早期）→ 明确报错并返回空 ✓ 不静默拼错 ✗
+        ccvLog('拼地址失败：逻辑层未加载 ✗')
+        return ''
+      }
+      // 打开一篇话布文档 ✓（主人要的"点一下跳过去"✓）
+      //   ⚠️ 失败必须**说出来** ✗ 不能静默 ✓（这一轮就是静默才查了半天 ✓）
+      function ccvOpenDoc(absPath, title, sessionId) {
+        var t0 = Date.now()
+        var p = String(absPath || '').trim()
+        if (!p) { ccvLog('打开失败：这篇没有磁盘路径（还没落盘）✗'); return }
+        var addr = ''
+        try {
+          addr = ccvSessionFileAddress(sessionId, p)
+        } catch (e) { ccvLog('拼地址出错: ' + (e && e.message)) }
+        if (!addr) {
+          ccvLog('打开失败：拿不到 sessionId ✗（这个标签页的 props.sessionId 是空的 ✓）')
+          return
+        }
+        // ★ 先把真实地址打出来 ✓ 出问题一眼能对照官方的编码形式 ★
+        ccvLog('准备打开：' + (title || '') + ' ｜ session=' + String(sessionId).slice(0, 14)
+          + '… ｜ 地址=' + addr)
+        try {
+          ctx.sidebarRight.openResource(addr)
+          ccvLog('已请求打开文档 ✓ ' + (title || '') + ' ｜ 调用耗时 ' + (Date.now() - t0) + 'ms')
+        } catch (e) {
+          // 官方注释：地址不合法 / 没人认领 → 抛异常（那是接线错误）
+          ccvLog('打开文档失败 ✗ ' + ((e && e.message) || e) + ' ｜ 地址=' + addr)
+          try {
+            if (window.__ccvKit && window.__ccvKit.toast) {
+              window.__ccvKit.toast('打开失败：' + ((e && e.message) || '地址没被认领'), 'ccv-open-doc')
+            }
+          } catch (_) {}
+        }
+      }
+      function CcvTabGlyph(props) {
+        var size = (props && props.size) ? props.size : 16
+        return h('svg', {
+          width: size, height: size, viewBox: '0 0 24 24', fill: 'none',
+          stroke: 'currentColor', strokeWidth: 1.6,
+          strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true',
+        },
+          h('rect', { x: 3, y: 4, width: 18, height: 16, rx: 3 }),
+          h('path', { d: 'M7.5 9.5h9M7.5 13h6' }))
+      }
+      // ★ 清单每一行 = **独立子组件** ✓（2026-10-23 修空白）★
+      //   ⚠️ 原来把 React.useState 写在了 .map() 回调里 ✗✗
+      //     React 铁律：**Hooks 只能在组件顶层调用** ✗ 不能在循环/回调/条件里 ✓
+      //     → 清单条数一变，hook 数量就变 ✗
+      //     → 报「Rendered more hooks than during the previous render」✗
+      //     → **这个标签页整个崩掉 → 只剩空白** ✓✓
+      //   做法：抽成子组件 → 每个子组件自己管自己的 hover ✓
+      //     它也是官方 dsh-client-ui-sidebar-files 的做法 ✓（树节点都是独立组件 ✓）
+      // ★ 文件图标（16px，照官方文件树用 FileTypeIcon 的尺寸/颜色）★
+      //   官方行里是 primitives 的 FileTypeIcon(size 16) + className fileIcon ✓
+      //   我们的侧模块拿不到 primitives ✗ 所以画一个同风格的"文档纸"图标 ✓
+      function CcvFileGlyph(props) {
+        var size = (props && props.size) || 16
+        return h('svg', {
+          width: size, height: size, viewBox: '0 0 24 24', fill: 'none',
+          stroke: 'currentColor', strokeWidth: 1.6,
+          strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true',
+        },
+          h('path', { d: 'M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z' }),
+          h('path', { d: 'M14 3v5h5' }))
+      }
+      // ★ 清单每一行 = 官方文件树的行样式（2026-10-24 主人要求）★
+      //   出处：sidebar-files/lib/client.js 的 FilesBody.module.css ✓ 逐条照抄：
+      //     .row  width:100%; min-width:0; color:inherit; font:inherit; text-align:left;
+      //           border-radius:var(--dsw-radius-md); cursor:pointer;
+      //           background:0 0; border:0; align-items:center; gap:6px;
+      //           padding:5px 10px; display:flex
+      //     .row:hover  background:var(--dsw-alias-interactive-bg-hover)
+      //     .icon  color:var(--dsw-alias-label-tertiary); flex:none   ← 16px svg
+      //     .name  white-space:nowrap; text-overflow:ellipsis; min-width:0; overflow:hidden
+      //   ⚠️ **不是卡片** ✗ —— 没有边框、没有圆角边框、没有第二行路径 ✓
+      //      路径挪到 title（悬停才看）✓ 与文件树一致 ✓
+      var CCV_ROW_BASE = {
+        width: '100%', minWidth: 0,
+        display: 'flex', alignItems: 'center', gap: '6px',
+        padding: '5px 10px', textAlign: 'left',
+        font: 'inherit',
+        color: 'inherit',
+        background: '0 0', border: 0,
+        borderRadius: 'var(--dsw-radius-md,6px)',
+        boxSizing: 'border-box',
+      }
+      function CcvRow(props) {
+        var c = props.canvas || {}
+        var sessionId = props.sessionId || ''
+        // ⚠️ 清单里那个字段叫 **filePath** ✓ 不是 path ✗
+        //   （host 的 canvas.list 原来只回 hasFile ✗ → 前端根本拿不到路径 ✓
+        //     2026-10-22 一并补上了 filePath ✓ 见 src/host/06-rpc.js ✓）
+        var fp = c.filePath || c.path || ''
+        var canOpen = !!String(fp).trim()
+        var hover = React.useState(false)      // ← 组件顶层 ✓ 合法 ✓
+        var hv = hover[0], setHv = hover[1]
+        return h('div', {
+          onClick: canOpen ? function () { ccvOpenDoc(fp, c.title, sessionId) } : undefined,
+          onMouseEnter: canOpen ? function () { setHv(true) } : undefined,
+          onMouseLeave: canOpen ? function () { setHv(false) } : undefined,
+          title: canOpen ? ('打开：' + fp + '\n（可以拖到别的分组里）') : '（还没落盘，打不开）',
+          role: 'button',
+          // ★ 可拖动（2026-10-24 主人要「自由拖动改分组」）★
+          //   只带 id ✓ 主机端按 id 改 .sessions/*.json 的 id 数组 ✓ 文件不动 ✓
+          draggable: canOpen ? 'true' : 'false',
+          onDragStart: canOpen ? function (e) {
+            try {
+              e.dataTransfer.setData('text/plain', c.id)
+              e.dataTransfer.effectAllowed = 'move'
+              e.currentTarget.style.opacity = '0.5'
+            } catch (_) {}
+          } : undefined,
+          onDragEnd: canOpen ? function (e) {
+            try { e.currentTarget.style.opacity = '1' } catch (_) {}
+          } : undefined,
+          style: Object.assign({}, CCV_ROW_BASE, {
+            cursor: canOpen ? 'pointer' : 'default',
+            opacity: canOpen ? 1 : 0.55,
+            background: (canOpen && hv) ? 'var(--dsw-alias-interactive-bg-hover,var(--dsw-alias-bg-layer-2,rgba(128,128,128,.12)))' : '0 0',
+          }),
+        },
+          h('span', { style: { display: 'flex', flex: 'none', color: 'var(--dsw-alias-label-tertiary,#6b7280)' } },
+            h(CcvFileGlyph, { size: 16 })),
+          h('span', {
+            style: {
+              whiteSpace: 'nowrap', textOverflow: 'ellipsis',
+              minWidth: 0, overflow: 'hidden',
+            },
+          }, c.title || c.id))
+      }
+      // ★ 视觉风格 = 照抄官方「开始」页（2026-10-24 主人要求）★
+      //   主人原话：「话布选功能的页面风格跟开始页保持一致」
+      //   出处：@deepseek-ai/dsh-client-ui-sidebar-right/lib/client.js 里的
+      //         GuideBody.module.css —— 我把它的关键值原样搬过来 ✓
+      //     · 容器：flex 纵向 **居中**（justify-content:center / align-items:center）
+      //             gap 14px / min-height 100% / padding 0 24px
+      //             末尾再来一个 **flex:0 10% 的占位**（官方 .guide:after ✓ 视觉重心略上）
+      //     · 卡片：宽 **380px**（max-width 100%）/ min-height 56px / padding 14px 20px
+      //             display:flex / align-items:center / gap:14px / text-align:left
+      //             background: var(--dsw-alias-bg-layer-1)
+      //             border: **.5px** solid var(--dsw-alias-border-l3)  ← 半像素是官方的做法
+      //             border-radius: var(--dsw-radius-xl)
+      //             hover → var(--dsw-alias-interactive-bg-hover)
+      //     · 图标：26×26 / flex:none / color var(--dsw-alias-label-secondary)
+      //     · 标题：**14px** / line-height 1.4 / 不换行 + 省略号
+      //     · 描述：**11px** / 不换行 + 省略号 / color var(--dsw-alias-label-tertiary)
+      //   ⚠️ 这几个 token（border-l3 / label-tertiary / interactive-bg-hover /
+      //      radius-xl / static-neutral-*）**不在主题目录**里 ✓
+      //      但官方自己就在用 ✓ 截图里也渲染正常 ✓
+      //      → 照用，但都带兜底值 ✓（拿不到也不会变成透明/黑色 ✗）
+      var CCV_GUIDE_MAXW = 380
+      var CCV_ENTRY_BASE = {
+        boxSizing: 'border-box',
+        width: CCV_GUIDE_MAXW + 'px',
+        maxWidth: '100%',
+        minHeight: '56px',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '14px',
+        padding: '14px 20px',
+        textAlign: 'left',
+        // font: inherit（官方写法）→ 这里显式给一遍，免得被默认 UA 字体覆盖
+        fontFamily: 'inherit',
+        color: 'var(--dsw-alias-label-primary,#1a1a1a)',
+        background: 'var(--dsw-alias-bg-layer-1,rgba(255,255,255,.04))',
+        border: '.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.28))',
+        borderRadius: 'var(--dsw-radius-xl,12px)',
+      }
+      var CCV_ENTRY_ICON = {
+        width: '26px', height: '26px', flex: 'none',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        color: 'var(--dsw-alias-label-secondary,#8b8b8b)',
+      }
+      var CCV_ENTRY_TEXT = {
+        display: 'flex', flexDirection: 'column', flex: '1 1 auto',
+        gap: '3px', minWidth: 0,
+      }
+      var CCV_ENTRY_TITLE = {
+        fontSize: '14px', lineHeight: 1.4,
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+      }
+      var CCV_ENTRY_DESC = {
+        fontSize: '11px', lineHeight: 1.4,
+        color: 'var(--dsw-alias-label-tertiary,#6b7280)',
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+      }
+      // 官方 hover 底色（拿不到就退回 bg-layer-2 ✓）
+      var CCV_ENTRY_HOVER_BG = 'var(--dsw-alias-interactive-bg-hover,var(--dsw-alias-bg-layer-2,rgba(128,128,128,.12)))'
+      // 居中的纵向容器（照官方 .guide ✓）
+      function ccvGuideColumn(children) {
+        return h('div', {
+          style: {
+            boxSizing: 'border-box',
+            display: 'flex', flexDirection: 'column',
+            justifyContent: 'center', alignItems: 'center',
+            gap: '14px', minHeight: '100%', height: '100%',
+            padding: '0 24px', overflow: 'auto',
+          },
+        },
+          children,
+          // 官方 .guide:after { flex: 0 10% } ✓ 视觉重心略上（照抄 ✓）
+          h('div', { style: { flex: '0 10%', minHeight: 0 } }))
+      }
+
+      // ★ 功能入口卡（一级页用）—— 结构照官方 guide 的 entry ★
+      function CcvEntry(props) {
+        var hover = React.useState(false)      // ← 组件顶层 ✓
+        var hv = hover[0], setHv = hover[1]
+        var e = props.entry || {}
+        return h('div', {
+          onClick: e.disabled ? undefined : e.onClick,
+          onMouseEnter: e.disabled ? undefined : function () { setHv(true) },
+          onMouseLeave: e.disabled ? undefined : function () { setHv(false) },
+          title: e.hint || '',
+          role: 'button',
+          style: Object.assign({}, CCV_ENTRY_BASE, {
+            cursor: e.disabled ? 'default' : 'pointer',
+            opacity: e.disabled ? 0.55 : 1,
+            background: (!e.disabled && hv) ? CCV_ENTRY_HOVER_BG : CCV_ENTRY_BASE.background,
+          }),
+        },
+          h('div', { style: CCV_ENTRY_ICON }, e.icon || '·'),
+          h('div', { style: CCV_ENTRY_TEXT },
+            h('div', { style: CCV_ENTRY_TITLE }, e.title || ''),
+            h('div', { style: CCV_ENTRY_DESC }, e.desc || '')),
+          // 官方 entry 右侧没有箭头 ✗ —— 但"能点进去"这件事要有提示 ✓
+          //   用小号 chevron，颜色跟描述同级 ✓ 不抢眼 ✓
+          e.disabled
+            ? h('div', { style: { fontSize: '11px', flex: 'none', color: 'var(--dsw-alias-label-tertiary,#6b7280)' } }, '规划中')
+            : h('div', { style: { fontSize: '15px', flex: 'none', color: 'var(--dsw-alias-label-secondary,#8b8b8b)' } }, '›'))
+      }
+
+      // ★ 错误边界（2026-10-23 加，10-24 挪到外面）★
+      //   上一次标签页纯空白 ✗ —— 里面一点线索都没有 ✓ 查了半天 ✓
+      //   有了它：组件崩了会显示"这里出错了：<原因>"✗ 而不是空白 ✓
+      //   ⚠️ React 里**只有 class 组件能做错误边界** ✗ 函数组件做不了 ✓
+      //      （要 static getDerivedStateFromError / componentDidCatch ✓）
+      //   ⚠️ 拿不到 React.Component → 跳过边界 ✓（不能因此再崩一次 ✗）
+      var CcvErrorBoundary = null
+      try {
+        if (React.Component) {
+          CcvErrorBoundary = class extends React.Component {
+            constructor(p) { super(p); this.state = { err: null } }
+            static getDerivedStateFromError(e) { return { err: e } }
+            componentDidCatch(e) {
+              try { ccvLog('话布标签页渲染出错: ' + ((e && e.message) || e)) } catch (_) {}
+            }
+            render() {
+              if (this.state && this.state.err) {
+                return h('div', { style: { padding: '14px', fontSize: '13px', color: 'var(--dsw-alias-state-error-primary,#d33)', wordBreak: 'break-word' } },
+                  '话布标签页出错了：' + ((this.state.err && this.state.err.message) || String(this.state.err)),
+                  h('div', { style: { marginTop: '6px', fontSize: '12px', color: 'var(--dsw-alias-label-secondary,#6b7280)' } },
+                    '（详情见 %TEMP%\\ccv-selbar.log）'))
+              }
+              return this.props.children
+            }
+          }
+        }
+      } catch (e) { ccvLog('错误边界创建失败（跳过）: ' + (e && e.message)); CcvErrorBoundary = null }
+
+
+    return {
+      CcvTabGlyph: CcvTabGlyph, CCV_ROW_BASE: CCV_ROW_BASE, CcvRow: CcvRow,
+      ccvGuideColumn: ccvGuideColumn, CcvEntry: CcvEntry,
+      CcvErrorBoundary: CcvErrorBoundary,
+    }
+  }
 
     function apply(ctx) {
       ccvCtx = ctx;   // tab 正文是另一个组件，用的就是这个引用
@@ -2260,6 +1671,8 @@ window.__ModuleLoader__.load({
       try {
         window.__ccvCtx = ctx;
         if (typeof window.__ccvSelRefBoot === 'function') window.__ccvSelRefBoot(ctx);
+        // 接管 DSH 自带查看器里的 .md（侧模块 lib/viewer-md.js）：先只读，验契约
+        if (typeof window.__ccvViewerBoot === 'function') window.__ccvViewerBoot(ctx);
       } catch (e) { ccvLog('侧模块桥接失败: ' + (e && e.message)); }
       // ─── 会话内容限流 ──────────────────────────────
       // DSH 的会话消息不主动给 <img> 设 max-width，AI 生成的大图 / 截图会撑破
@@ -2343,8 +1756,13 @@ window.__ModuleLoader__.load({
         ].join('\n')
       );
       // ─── Markdown 渲染样式（新 editor 用 .ccv-editor；旧 03-styles.js 的 .ccv-wysiwyg 已弃用）
-      ensureStyle('ccv-md-style',
-         [
+      // ⚠️ 这份 CSS 文本要**借给查看器**用（见 lib/viewer-md.js）：
+      //   面板的 markdown 样式作用域是 `.ccv-panel .ccv-editor`，而查看器的正文
+      //   是 `[data-ccv-md-body]` —— 两处渲染用的是**同一个 mdToHtml**，
+      //   所以差别只在样式：同一份 <table>，有边框就是表格，没边框就看起来像纯文本。
+      //   2026-10-04 主人正是拿两张截图问"为什么两边显示不一样"。
+      //   做法：**一份规则两处用**（换掉作用域前缀），不复制、不会漂移。
+      var ccvMdCss = [
           '.ccv-panel .ccv-editor > *:first-child{margin-top:0}',
           '.ccv-panel .ccv-editor > *:last-child{margin-bottom:0}',
           '.ccv-panel .ccv-editor h1{font-size:1.6em;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));padding-bottom:.2em;margin:.6em 0 .4em;font-weight:600;line-height:1.3}',
@@ -2354,6 +1772,15 @@ window.__ModuleLoader__.load({
           '.ccv-panel .ccv-editor h5{font-size:1em;margin:.7em 0 .45em;font-weight:600;line-height:1.35}',
           '.ccv-panel .ccv-editor h6{font-size:.95em;margin:.7em 0 .45em;font-weight:600;line-height:1.35;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.65))}',
           '.ccv-panel .ccv-editor p{margin:.5em 0}',
+          // 空段落不显示。2026-10-11 主人报「查看器里引用块行距很大」：
+          //   引用块原文是带空行的（`> **依据**…` / `> ` / `> **本文件回答一件事**…`），
+          //   块渲染器**每一行都变成一个 <p>**（见 renderBlocks 末尾），空行就变成空段落
+          //   → 每处多出一整行 + 边距 ≈ 52px，而正常行距只有 24.5px。
+          //   面板里看不出来，是因为编辑区是 contentEditable —— 浏览器会把空段落吃掉/合并；
+          //   查看器是纯静态 HTML，空段落原样保留，于是全暴露出来。
+          //   两条都写上：`:empty` 管 `<p></p>`，`:has(> br:only-child)` 管 `<p><br></p>`。
+          '.ccv-panel .ccv-editor p:empty{display:none}',
+          '.ccv-panel .ccv-editor p:has(> br:only-child){display:none}',
           '.ccv-panel .ccv-editor blockquote{border-left:3px solid var(--dsw-alias-border-l2,rgba(128,128,128,.4));margin:.6em 0;padding:4px 12px;opacity:.9;color:var(--dsw-alias-label-secondary,rgba(0,0,0,.7))}',
           '.ccv-panel .ccv-editor blockquote > *:first-child{margin-top:0}',
           '.ccv-panel .ccv-editor blockquote > *:last-child{margin-bottom:0}',
@@ -2361,6 +1788,17 @@ window.__ModuleLoader__.load({
           '.ccv-panel .ccv-editor .ccv-hl{background:rgba(250,204,21,.16);border-left:3px solid rgba(234,179,8,.55);border-radius:6px;padding:8px 14px;margin:.6em 0}',
           '.ccv-panel .ccv-editor .ccv-hl > *:first-child{margin-top:0}',
           '.ccv-panel .ccv-editor .ccv-hl > *:last-child{margin-bottom:0}',
+          // ⚠️ 2026-10-29 主人：「现在高亮块有问题」
+          //   高亮块在**查看器**里没有任何样式 ✗
+          //   上面那三条规则写在"面板样式表"（ccvStyle）里 ✗
+          //   而查看器拿的是 mdCss（mdCssFor → 作用域替换）✗ → .ccv-hl 变成普通 div ✓
+          //   → 高亮块在右侧文档里"没底色、没左边线"，看起来就是普通段落 ✓
+          //   所以这里在 **mdCss** 里再写一份（面板与查看器共用同一条规则 ✓）
+          '.ccv-panel .ccv-editor .ccv-hl{background:rgba(250,204,21,.16);border-left:3px solid rgba(234,179,8,.55);border-radius:6px;padding:8px 14px;margin:.6em 0}',
+          '.ccv-panel .ccv-editor .ccv-hl p{margin:.2em 0}',
+          // 行内高亮（==文字== ↔ <mark>）：查看器同样没有这条规则 ✗ → 浏览器默认的
+          // 纯黄底 + 黑字，在深色主题里像一块"荧光砖" ✓ 一并收进来 ✓
+          '.ccv-panel .ccv-editor mark{background:rgba(250,204,21,.28);color:inherit;padding:0 3px;border-radius:3px}',
           '.ccv-panel .ccv-editor input[type="checkbox"]{cursor:pointer}',
           '.ccv-panel .ccv-editor pre{background:var(--dsw-alias-markdown-code-block,rgba(128,128,128,.12));padding:10px 12px;border-radius:6px;overflow-x:auto;white-space:pre-wrap;margin:.6em 0;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
           '.ccv-panel .ccv-editor code{background:var(--dsw-alias-markdown-inline-code,rgba(128,128,128,.16));padding:1px 4px;border-radius:3px;font-family:var(--font-mono,ui-monospace,Menlo,monospace);font-size:.95em}',
@@ -2373,6 +1811,11 @@ window.__ModuleLoader__.load({
           '.ccv-panel .ccv-editor table{border-collapse:separate;border-spacing:0;margin:.8em 0;width:100%;max-width:100%;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));border-radius:6px;overflow:hidden}',
           '.ccv-panel .ccv-editor th,.ccv-panel .ccv-editor td{border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.55));padding:8px 12px;text-align:left;vertical-align:top}',
           '.ccv-panel .ccv-editor th{background:var(--dsw-alias-interactive-bg-active,rgba(128,128,128,.18));font-weight:600}',
+          // ⚠️ 2026-10-29 主人（截图）：插入表格后**正文行高度塌成一条线**、表头却很高
+          //   原因：空的 <td></td> 在 contentEditable 里没有行高 ✗（有文字的 <th> 有 ✓）
+          //   双重保险：① 插入时给单元格放 <br>（viewer 的 insertTableHtml 已改）
+          //            ② 这里给 :empty 补一条零宽字符 —— 就算 <br> 被删掉也不会塌 ✓
+          '.ccv-panel .ccv-editor td:empty::after,.ccv-panel .ccv-editor th:empty::after{content:"\\200b"}',
           '.ccv-panel .ccv-editor tr:nth-child(even){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08))}',
           '.ccv-panel .ccv-editor tr:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(59,130,246,.08))}',
           '.ccv-panel .ccv-editor hr{border:none;border-top:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3));margin:1em 0}',
@@ -2384,7 +1827,15 @@ window.__ModuleLoader__.load({
           '.ccv-panel .ccv-editor em{font-style:italic}',
           '.ccv-panel .ccv-editor del{text-decoration:line-through;opacity:.75}'
         ].join('\n')
-      );
+      ensureStyle('ccv-md-style', ccvMdCss);
+      // 借给查看器：把作用域前缀换成它正文的标记，同一份规则直接复用
+      try {
+        if (window.__ccvKit) {
+          window.__ccvKit.mdCssFor = function (scope) {
+            return ccvMdCss.split('.ccv-panel .ccv-editor').join(scope);
+          };
+        }
+      } catch (_) {}
       // ─── JS 终极兜底 ──────────────────────────────
       // 即使 CSS 选择器漏、即使 inline style 用了 !important (CSS 覆盖不了
       // inline !important) 都能压住。
@@ -2467,71 +1918,45 @@ window.__ModuleLoader__.load({
         } catch (e) {}
       }
 
-      // ─── 对外桥接（原先由顶栏按钮组件注册，现改由插件自己提供）──────
-      // 对话里的文档名链接、上传卡片链接（lib/doclink.js）靠这两个全局量打开
-      // 话布、并判断画布是否已打开。撤掉顶栏按钮后若不补上，那些链接会点不动
-      // （doclink 日志里会出现「话布桥接未就绪」）。
-      // __ccvPanelOpen 必须做成"取值即判断"的 getter：doclink 是在点击那一刻读它的，
-      // 要反映此刻有没有画布，而不是某个组件的挂载状态。
-      window.__ccvCanvasToggle = function () {
-        var svc = null;
-        try { svc = ctx.sidebarRight; } catch (_) {}
-        if (!svc || typeof svc.openTab !== "function") {
-          ccvLog("打开话布失败：拿不到右侧栏接口");
-          return false;
-        }
-        try { svc.openTab(CCV_DOCK_KIND); return true; }
-        catch (e) { ccvLog("打开话布失败: " + (e && e.message)); return false; }
-      };
-      try {
-        Object.defineProperty(window, "__ccvPanelOpen", {
-          configurable: true,
-          get: function () {
-            try { return !!document.querySelector(".ccv-panel"); } catch (_) { return false; }
-          }
-        });
-      } catch (e) { ccvLog("注册画布状态桥接失败: " + (e && e.message)); }
-      // 注册输入桥（隐藏组件，暴露 inputActions.setDraft 给划词栏）
-      ctx.slots.inject("conversation.input.dock", () =>
-        ctx.slots.register({
-          name: "conversation.input.dock",
-          id: "collab-canvas-input-bridge",
-          order: 999,
-          label: () => "画布输入桥"
-        }, InputBridge)
-      );
-
-      // ─── 停靠模式：把真画布挂进 DSH 内置右侧栏 ─────────────────
-      // 两阶段注册，和官方 sidebar-files 完全同款：
-      //   ① 声明一个「页面型」标签类型（不认地址，靠 openTab 打开）
-      //   ② 把正文注册到 sidebar.right.pane.tab 槽位，key = 上面那个 id
-      // 注意：这两个服务必须写进 inject（声明依赖），不能运行时 ctx.xxx 现取 ——
-      // 现取拿不到，而且失败会被静默吞掉，按钮出来了却点不开。
-      try {
-        ctx.effect(function () {
-          return ctx.sidebarRightTabs.register({
-            id: CCV_DOCK_KIND,
-            kind: CCV_DOCK_KIND,
-            priority: "extension",
-            title: function () { return "话布"; },
-            // 门厅页（右侧栏「开始」）的入口胶囊。给了 guide 就出现在那一页，
-            // 点它 = 在本标签的位置打开话布，所以门厅是"门"而不是"常驻页"。
-            // order 越小越靠前（官方的「工作区文件」是 10）。
-            guide: [{
-              order: 20,
-              title: function () { return "话布"; },
-              description: function () { return "画布式文档：随手记与整理，可存进工作区"; },
-              icon: CcvGuideGlyph
-            }]
-          });
-        }, "collab-canvas: 右侧栏 tab 类型");
-      } catch (e) { ccvLog("右侧栏 tab 类型注册失败: " + (e && e.message)); }
-
-      try {
-        ctx.slots.inject("sidebar.right.pane.tab", function () {
-          return ctx.slots.register({ name: "sidebar.right.pane.tab", key: CCV_DOCK_KIND }, CanvasDockBody);
-        });
-      } catch (e) { ccvLog("右侧栏 tab 正文注册失败: " + (e && e.message)); }
+      // ─── 右侧栏「话布」标签页：**功能入口**（2026-10-11 恢复）────────────
+      // 定位（主人原话）：话布插件不止编辑 markdown，以后会有 UI 实时可视编辑网页等功能，
+      //   所以需要一个**话布标签页**，打开可以**选功能** ✓
+      //   —— 所以这里是"功能清单"，**不是某个编辑器的宿主** ✗
+      //
+      // ⚠️ 历史（2026-10-11 ~ 10-22）：那时查过这个槽（sidebar.right.pane.tab）的
+      //    ownerProps 是**空的** ✗ → 结论是"没法从这里打开某个文件"✗
+      //    于是清单只列文字，写着"打开它们请走文件树"✗
+      //    —— **那个结论是错的** ✗ 漏看了一个服务 ✓
+      //
+      // ★ 2026-10-22 主人报：「这里点击跳转到文档选择」★
+      //   查官方包（dsh-client-ui-sidebar-right/lib/types/client/service.d.ts）找到：
+      //     ctx.sidebarRight.openResource(address, options?)  ✓✓
+      //       · address 必须是 `dsh-resource://<type>/…` 形式 ✓
+      //       · 它会 claim 资源 / 放置标签 / **展开右栏** / 记录导航，一次做完 ✓
+      //       · 地址不合法或没人认领 → **抛异常** ✓（官方注释：那是接线错误 ✓）
+      //   → 所以**点清单里的一行就能跳到那篇文档** ✓ 不用再走文件树 ✓
+      //
+      // 两阶段注册（照官方 sidebar-files）：
+      //   ① sidebarRightTabs.register —— 声明一个"页面型"标签类型
+      //   ② slots.register 到 sidebar.right.pane.tab，key 与上面 id 一致
+      //   ⚠️ 这两个服务必须写回 inject 声明（不能运行时 ctx.get 现取 ✗）
+      var CCV_TAB_ID = 'collab-canvas'
+      // ═══ 画布小工具集（地址 / 打开文档 / 文件树行 / 入口卡片）═══
+      //   17 个定义里，apply 只用得到这 6 个 ✓（机器核对）
+      var __kit = ccvMakeCanvasKit({ ctx: ctx })
+      var CcvTabGlyph = __kit.CcvTabGlyph, CCV_ROW_BASE = __kit.CCV_ROW_BASE
+      var CcvRow = __kit.CcvRow, ccvGuideColumn = __kit.ccvGuideColumn
+      var CcvEntry = __kit.CcvEntry, CcvErrorBoundary = __kit.CcvErrorBoundary
+      // ═══ 右侧栏「话布」标签页（整块 UI 在模块级 ccvMakeCanvasTab ✓）═══
+      //   依赖只有 7 个 ✓ 返回也只有 CcvFeatureTab ✓（都是机器算过、非目测）
+      var CcvFeatureTab = ccvMakeCanvasTab({
+        CCV_ROW_BASE: CCV_ROW_BASE, CCV_TAB_ID: CCV_TAB_ID,
+        CcvEntry: CcvEntry, CcvErrorBoundary: CcvErrorBoundary,
+        CcvRow: CcvRow, CcvTabGlyph: CcvTabGlyph,
+        ccvGuideColumn: ccvGuideColumn,
+        ctx: ctx,
+      }).CcvFeatureTab
+      // ─── 以后加功能：入口就在上面那个 CcvFeatureTab 里 ──────────────
     }
 
     exports.apply = apply;

@@ -741,9 +741,11 @@ async function main() {
   {
     withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
     const r = capture()
-    // 现场还原：草稿里已经有一条胶囊了（正是主人点第二条时的状态）
+    // 现场还原：草稿里已经有一条胶囊，而且末尾是主人**刚打的字**（不是换行）——
+    // 这正是主人 2026-10-04 反出来的那个现场（第二条引用粘在前一句屁股上）。
     const seenChip = "@话布优化 > 前一段"
-    const seen = seenChip + " "
+    const typed = " 测试1"
+    const seen = seenChip + typed
     sandbox.window.__ccvInputState = {
       draft: seen, draftRev: 21,
       occurrences: [{ ref: "1", length: seenChip.length }]
@@ -754,25 +756,53 @@ async function main() {
 
     const okVal = await auto(r)
     eq("插入成功", okVal, true)
-    eq("只派发了一次事件", scope.calls.length, 1)
-    eq("派发的是官方的「插入胶囊」事件", scope.calls[0].ev, "slash/input-insert-reference")
-    eq("派发主体是会话作用域自己（官方 execute 也是这么传的）", scope.calls[0].self, scope)
 
-    const req = scope.calls[0].req
+    // ★ 2026-10-04 起：末尾不在行首时，先派发一次「插入换行」，再派发胶囊（共两次）。
+    //   为什么必须两次：insertReference 一次只能插一颗胶囊，带不了换行。
+    //   为什么不能只补换行不等：补换行会推进 draftRev，紧接着拿旧 rev 派发会被
+    //   官方的版本校验（CAS）拒掉 —— 那正是「第二条引用插不进去」的老病根。
+    eq("派发了两次事件（先补换行、再插胶囊）", scope.calls.length, 2)
+    eq("第一次是「插入纯文字」", scope.calls[0].ev, "slash/input-insert-text")
+    eq("补的就是一个换行", scope.calls[0].req.text, "\n")
+    eq("第二次才是「插入胶囊」", scope.calls[1].ev, "slash/input-insert-reference")
+    eq("派发主体是会话作用域自己（官方 execute 也是这么传的）", scope.calls[1].self, scope)
+
+    const req = scope.calls[1].req
     eq("归属本源（发送时靠它找回翻译规则）", req.reference.source, "话布选区")
     eq("引用值 = 记录编号", req.reference.ref, String(r.code))
     eq("胶囊文字 = 选中文字前 12 字", req.reference.label, "写入方基于哪一版")
     eq("图标用官方允许的 file", req.reference.appearance, "file")
     eq("退化形态是「@文档 > 原文」", req.reference.clipboardText, "@话布优化 > 写入方基于哪一版")
 
-    // 🔴 坐标必须是**探测投影**的末尾，不是 draft 长度（draft 里胶囊是展开的）
-    eq("span 起点 = 探测坐标的末尾（不是草稿字符串长度）", req.span.start, 2)
+    // 🔴 坐标必须是**探测投影**的末尾，不是 draft 长度（draft 里胶囊是展开的）。
+    //    草稿变成 seen + "\n"，所以末尾也跟着 +1。
+    const expectStart = (seen.length + 1) - (seenChip.length - 1)
+    eq("span 起点 = 探测坐标的末尾（含刚补的那个换行）", req.span.start, expectStart)
     eq("span 终点 = 起点（零宽）", req.span.end, req.span.start)
-    eq("带上**现读**的草稿版本号（官方靠它做比对）", req.span.draftRev, 21)
+    eq("带上**补换行之后现读**的版本号（官方靠它做比对）", req.span.draftRev, 22)
 
     const after = sandbox.window.__ccvInputState
     eq("已有胶囊还在（1 → 2）", after.occurrences.length, 2)
     eq("原来那段草稿一个字没动", after.draft.indexOf(seen), 0)
+    eq("★ 第二条确实另起了一行（末尾补了换行）", after.draft.indexOf(seen + "\n"), 0)
+  }
+
+  console.log("\n【29b】草稿已经在行首时**不补**换行（不多派发、不多空行）")
+  {
+    withBridge(null, root, fakeRange(tP1, 0, "写入方基于哪一版"))
+    const r = capture()
+    const seen = "@话布优化 > 前一段\n"          // 末尾已是换行 = 已经在行首
+    sandbox.window.__ccvInputState = {
+      draft: seen, draftRev: 50,
+      occurrences: [{ ref: "1", length: "@话布优化 > 前一段".length }]
+    }
+    noSessionScope()
+    const scope = makeScope()
+    scopeResult.current = scope
+    eq("插入成功", await auto(r), true)
+    eq("★ 只派发一次（不用补换行）", scope.calls.length, 1)
+    eq("派发的就是插入胶囊", scope.calls[0].ev, "slash/input-insert-reference")
+    eq("版本号 = 现读的那个（没有被换行顶掉）", scope.calls[0].req.span.draftRev, 50)
   }
 
   console.log("\n【30】🔴 失败时绝不许破坏已有内容（这才是主人的损失）")
@@ -844,25 +874,16 @@ async function main() {
     eq("读不到草稿 → false", textInsert("> 一段引用\n\n"), false)
   }
 
-  // 主模块那半没法在这里跑（要 React），但它有一条**结构**规矩必须钉住：
-  // 整体重写草稿 = 把已有胶囊拍平。所以它必须被"没有胶囊"挡住。
-  // 这里读源码做结构守卫 —— 以后谁把顺序改回去，这条会立刻红。
-  console.log("\n【32】🔴 结构守卫：主模块的整体重写必须被「没有胶囊」挡住")
-  {
-    const client = fs.readFileSync(path.join(__dirname, "..", "lib", "client.js"), "utf8")
-    const iFn = client.indexOf("function insertQuoteBlock")
-    ok("找得到 insertQuoteBlock", iFn >= 0)
-    const iNext = client.indexOf("function runCanvasCmd", iFn)
-    const body = (iFn >= 0 && iNext > iFn) ? client.slice(iFn, iNext) : ""
-    ok("取到了它的函数体", body.length > 200)
-    const iEvent = body.indexOf("__ccvSelRefText")
-    const iGuard = body.indexOf("ccvInputChipCount() > 0")
-    const iWrite = body.indexOf("setDraft(newDraft)")
-    ok("兜底先试官方的「追加纯文字」事件", iEvent >= 0)
-    ok("整体重写前有「输入框里没有胶囊」的把关", iGuard >= 0)
-    ok("顺序必须是：先试事件 → 再过把关 → 最后才整体重写",
-      iEvent >= 0 && iGuard > iEvent && iWrite > iGuard)
-  }
+  // 【32】原本在这里：结构守卫「主模块的整体重写必须被『没有胶囊』挡住」
+  //
+  // ⚠️ 2026-10-11 删除 —— 画布面板（CanvasPanel）整体删除后，insertQuoteBlock
+  //    这条**兜底链**随面板一起没了（它挂在面板的「问AI」上）：
+  //      先试官方的 __ccvSelRefText 事件 → 没有胶囊才整体重写草稿 → setDraft
+  //    查看器那版「问AI」目前**没有等价兜底** ✗ —— 也就是说：
+  //      selref 侧模块万一没加载成功，查看器点「问AI」会**没有反应**（不插引用）。
+  //    这是**已知取舍**（面板那条兜底本身也很脆：靠整体重写草稿，把已有胶囊拍平 ✗）。
+  //    真要做的话：在 lib/viewer-md.js 的 askAi 里补一条"胶囊插不进去就退化成纯文字引用"。
+  //    在那之前，这里不留假守卫（查一个已经删掉的函数 = 永远报缺失 ✗ 假警报比没有守卫更糟）。
 
   // ═══ 两套坐标的换算 ═══════════════════════════════════════════════
   // 主人 2026-09-15 的现场线索：「插入第二条失败，但是我手动 @ 可以引用第二条」。
